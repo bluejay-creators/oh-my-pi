@@ -12,12 +12,14 @@ import { type AnySetting, lookup } from "../config/registry";
 import { Settings, settings } from "../config/settings";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { initXdg } from "./commands/init-xdg";
+import { resolveApproval } from "../tools/approval";
+import { BashTool, findBashApprovalPatternRule, getBashApprovalPatternRules } from "../tools/bash";
 
 // =============================================================================
 // Types
 // =============================================================================
 
-export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "init-xdg";
+export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "init-xdg" | "bash-check";
 
 /** Layer `list --scope` reads as written: the agent dir's `config.yml`, or the project's settings files. */
 export type ConfigScope = "global" | "project";
@@ -68,7 +70,7 @@ function findSettingDef(path: string): CliSettingDef | undefined {
 // Argument Parser
 // =============================================================================
 
-const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "init-xdg"];
+const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "init-xdg", "bash-check"];
 
 /**
  * Parse config subcommand arguments.
@@ -169,6 +171,42 @@ export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
 	if (cmd.flags.scope !== undefined && cmd.action !== "list") {
 		console.error(chalk.red("--scope applies to `config list` only"));
 		process.exit(1);
+	}
+
+	// Native capability/decision probe: never load or migrate the user's settings.
+	if (cmd.action === "bash-check") {
+		try {
+			if (cmd.value !== undefined) throw new Error("bash-check expects one JSON request");
+			const request: unknown = JSON.parse(cmd.key ?? "");
+			if (
+				!isRecord(request) ||
+				Object.keys(request).some(key => !["command", "patterns", "approvalMode", "userPolicies", "allowCompoundCommands"].includes(key)) ||
+				typeof request.command !== "string" ||
+				!Array.isArray(request.patterns) ||
+				(request.approvalMode !== undefined &&
+					(typeof request.approvalMode !== "string" || !["yolo", "write", "always-ask"].includes(request.approvalMode))) ||
+				(request.userPolicies !== undefined && !isRecord(request.userPolicies)) ||
+				(request.allowCompoundCommands !== undefined && typeof request.allowCompoundCommands !== "boolean")
+			) throw new Error("Invalid Bash approval request");
+			const rules = getBashApprovalPatternRules(request.patterns);
+			if (rules.length !== request.patterns.length) throw new Error("Invalid Bash approval patterns");
+			const isolated = Settings.isolated({
+				"bash.patterns": rules,
+				"bash.allowCompoundCommands": request.allowCompoundCommands ?? false,
+			});
+			const tool = new BashTool({ settings: isolated, cwd: process.cwd() } as ConstructorParameters<typeof BashTool>[0]);
+			const approvalMode = (request.approvalMode ?? "yolo") as "yolo" | "write" | "always-ask";
+			const verdict = resolveApproval(tool, { command: request.command }, approvalMode, request.userPolicies ?? {});
+			const matches: number[] = [];
+			for (let index = 0; index < rules.length; index++) {
+				if (findBashApprovalPatternRule(request.command, [rules[index]], process.cwd())) matches.push(index);
+			}
+			console.log(JSON.stringify({ interface: "bash-argv-v1", policy: verdict.policy, approvalMode, reason: verdict.reason, rules, matches }));
+		} catch (error) {
+			console.error(String(error));
+			process.exit(1);
+		}
+		return;
 	}
 	await Settings.init();
 
@@ -338,7 +376,12 @@ async function handleSet(key: string | undefined, value: string | undefined, fla
 	}
 
 	try {
-		def.setting.set(settings, def.setting.parse(value));
+		const parsed = def.setting.parse(value);
+		if (key === "bash.patterns") {
+			const rules = getBashApprovalPatternRules(parsed);
+			if (!Array.isArray(parsed) || rules.length !== parsed.length) throw new Error("Invalid Bash approval patterns");
+		}
+		def.setting.set(settings, parsed);
 		await settings.flush();
 	} catch (err) {
 		console.error(chalk.red(String(err)));
@@ -456,6 +499,7 @@ ${chalk.bold("Commands:")}
   reset <key>        Remove a setting from config.yml so its default applies
   path               Print the config directory path
   init-xdg           Initialize XDG Base Directory structure
+  bash-check <json>  Evaluate supplied Bash patterns without executing commands or loading settings
 
 ${chalk.bold("Options:")}
   --json             Output as JSON

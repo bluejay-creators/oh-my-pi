@@ -6,6 +6,7 @@ import {
 	WALL_TIME_NOTICE_MIN_MS,
 } from "@oh-my-pi/pi-tui/tools/bash";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -17,7 +18,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { PipeStreams } from "@oh-my-pi/pi-natives";
-import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { $which, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import type { Settings } from "../config/settings";
@@ -235,8 +236,15 @@ export const CRITICAL_BASH_PATTERNS = [
 
 type BashPatternApproval = "allow" | "deny" | "prompt";
 
-interface BashApprovalPatternRule {
-	match: string;
+export interface BashArgvPattern {
+	/** Command prefix; each glob matches one shell word, never adjoining argv. */
+	argv: string[];
+	/** Explicit value-options allowed between prefix words. No positional gaps. */
+	optionsWithValue?: string[];
+}
+
+export interface BashApprovalPatternRule {
+	match: string | BashArgvPattern;
 	approval: BashPatternApproval;
 }
 
@@ -258,21 +266,104 @@ function normalizeBashPatternApproval(value: unknown): BashPatternApproval | und
 	return BASH_PATTERN_APPROVAL_VALUES.has(normalized) ? (normalized as BashPatternApproval) : undefined;
 }
 
-function getBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[] {
+export function getBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[] {
 	if (!Array.isArray(value)) return [];
 	return value
 		.map(item => {
 			if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
 			const record = item as Record<string, unknown>;
-			if (typeof record.match !== "string") return undefined;
-			const match = normalizeBashApprovalPattern(record.match);
 			const approval = normalizeBashPatternApproval(record.approval);
-			return match.length > 0 && approval ? { match, approval } : undefined;
+			if (typeof record.match === "string") {
+				const match = normalizeBashApprovalPattern(record.match);
+				return match.length > 0 && approval ? { match, approval } : undefined;
+			}
+			// An object rule must never silently disappear on a typo or a newer
+			// unsupported interface. Invalid policy aborts approval, not execution.
+			const match = record.match;
+			if (!match || typeof match !== "object" || Array.isArray(match)) {
+				throw new Error("Invalid Bash argv approval rule");
+			}
+			const spec = match as Record<string, unknown>;
+			if (
+				!approval ||
+				Object.keys(record).some(key => key !== "match" && key !== "approval") ||
+				Object.keys(spec).some(key => key !== "argv" && key !== "optionsWithValue") ||
+				!Array.isArray(spec.argv) ||
+				spec.argv.length === 0 ||
+				!spec.argv.every(word => typeof word === "string" && word.length > 0 && !word.includes("\0")) ||
+				!/^[A-Za-z0-9_.+-]+$/u.test(spec.argv[0]) ||
+				(spec.optionsWithValue !== undefined &&
+					(!Array.isArray(spec.optionsWithValue) ||
+						!spec.optionsWithValue.every(option => typeof option === "string" && /^(?:--[A-Za-z][\w-]*|-[A-Za-z])$/u.test(option))))
+			) {
+				throw new Error("Invalid or unsupported Bash argv approval rule");
+			}
+			return {
+				match: {
+					argv: spec.argv as string[],
+					...(spec.optionsWithValue === undefined ? {} : { optionsWithValue: spec.optionsWithValue as string[] }),
+				},
+				approval,
+			};
 		})
 		.filter((rule): rule is BashApprovalPatternRule => !!rule);
 }
 
-function commandMatchesBashApprovalPattern(command: string, pattern: string): boolean {
+function argvMatchesBashApprovalPattern(argv: readonly string[], pattern: BashArgvPattern, cwd: string): boolean {
+	let index = 0;
+	while (argv[index] === "time") {
+		index++;
+		if (argv[index] === "-p") index++;
+	}
+	const program = argv[index++];
+	if (!program) return false;
+	if (program !== pattern.argv[0]) {
+		if (!program.includes("/") || path.basename(program) !== pattern.argv[0]) return false;
+		const onPath = $which(pattern.argv[0], { cwd });
+		if (!onPath) return false;
+		try {
+			if (fs.realpathSync(resolveToCwd(program, cwd)) !== fs.realpathSync(onPath)) return false;
+		} catch {
+			return false;
+		}
+	}
+	let endedOptions = false;
+	for (let expected = 1; expected < pattern.argv.length;) {
+		const word = argv[index];
+		if (word === undefined) return false;
+		if (bashApprovalPatternToRegExp(pattern.argv[expected]).test(normalizeBashApprovalPattern(word))) {
+			expected++;
+			index++;
+			continue;
+		}
+		if (!endedOptions && word === "--") {
+			endedOptions = true;
+			index++;
+			continue;
+		}
+		const option = !endedOptions && pattern.optionsWithValue?.find(name =>
+			word === name || (name.startsWith("--")
+				? word.startsWith(`${name}=`) && word.length > name.length + 1
+				: word.startsWith(name)),
+		);
+		if (!option) return false;
+		if (word === option) {
+			if (argv[index + 1] === undefined || argv[index + 1] === "--") return false;
+			index += 2;
+		} else index++;
+	}
+	return true;
+}
+
+function commandMatchesBashApprovalPattern(
+	command: string,
+	pattern: string | BashArgvPattern,
+	cwd = process.cwd(),
+): boolean {
+	if (typeof pattern !== "string") {
+		const segments = tokenizeShellSegments(command);
+		return segments.length === 1 && argvMatchesBashApprovalPattern(segments[0], pattern, cwd);
+	}
 	const normalizedCommand = normalizeBashApprovalPattern(command);
 	if (normalizedCommand.length === 0) return false;
 	return bashApprovalPatternToRegExp(pattern).test(normalizedCommand);
@@ -290,7 +381,10 @@ function bashCommandSegments(command: string): string[] {
 
 // `deny`/`prompt` matching: the rule fires when its glob matches the whole
 // command or any single segment of a compound command.
-function commandSegmentMatchesBashApprovalPattern(command: string, pattern: string): boolean {
+function commandSegmentMatchesBashApprovalPattern(command: string, pattern: string | BashArgvPattern, cwd: string): boolean {
+	if (typeof pattern !== "string") {
+		return tokenizeShellSegments(command).some(argv => argvMatchesBashApprovalPattern(argv, pattern, cwd));
+	}
 	const regex = bashApprovalPatternToRegExp(pattern);
 	const normalizedCommand = normalizeBashApprovalPattern(command);
 	if (normalizedCommand.length === 0) return false;
@@ -302,19 +396,24 @@ function commandSegmentMatchesBashApprovalPattern(command: string, pattern: stri
 // vouch for the ENTIRE command and never rides a compound line (shell control
 // syntax could smuggle an unsafe segment past a narrow allow), while `deny` and
 // `prompt` fire on any matching segment so they mean what they appear to.
-function bashApprovalRuleMatches(command: string, rule: BashApprovalPatternRule): boolean {
+function bashApprovalRuleMatches(command: string, rule: BashApprovalPatternRule, cwd: string): boolean {
 	if (rule.approval === "allow") {
 		if (hasBashApprovalShellControl(command)) return false;
-		return commandMatchesBashApprovalPattern(command, rule.match);
+		return commandMatchesBashApprovalPattern(command, rule.match, cwd);
 	}
-	return commandSegmentMatchesBashApprovalPattern(command, rule.match);
+	return commandSegmentMatchesBashApprovalPattern(command, rule.match, cwd);
 }
 
-function findBashApprovalPatternRule(
+export function findBashApprovalPatternRule(
 	command: string,
 	rules: readonly BashApprovalPatternRule[],
+	cwd = process.cwd(),
 ): BashApprovalPatternRule | undefined {
-	return rules.find(rule => bashApprovalRuleMatches(command, rule));
+	return rules.find(rule => bashApprovalRuleMatches(command, rule, cwd));
+}
+
+function bashApprovalPatternLabel(match: string | BashArgvPattern): string {
+	return typeof match === "string" ? match : JSON.stringify(match);
 }
 
 async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
@@ -512,8 +611,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	/** Bash reads `skill://` paths through its shell filesystem, including as a working directory. */
 	readonly readsSkillUris = true;
 	readonly approval = (args: unknown): ToolApprovalDecision => {
-		const rawCommand = (args as Partial<BashToolInput>).command;
-		const command = typeof rawCommand === "string" ? rawCommand : "";
+		const input = args as Partial<BashToolInput>;
+		const command = typeof input.command === "string" ? input.command : "";
+		const cwd = typeof input.cwd === "string"
+			? resolveToCwd(input.cwd, this.session.cwd)
+			: this.session.cwd || process.cwd();
 		const patternRules = getBashApprovalPatternRules(cfgBashPatterns.get(this.session.settings));
 		const shell = cfgBashAllowCompoundCommands.get(this.session.settings)
 			? this.session.settings.getShellConfig().shell
@@ -527,8 +629,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			for (const rule of patternRules) {
 				if (
 					rule.approval !== "allow" &&
-					commandMatchesBashApprovalPattern(command, rule.match) &&
-					!compoundSegments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match))
+					commandMatchesBashApprovalPattern(command, rule.match, cwd) &&
+					!compoundSegments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match, cwd))
 				) {
 					if (rule.approval === "deny") {
 						patternRule = rule;
@@ -538,14 +640,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				}
 			}
 		} else {
-			patternRule = findBashApprovalPatternRule(command, patternRules);
+			patternRule = findBashApprovalPatternRule(command, patternRules, cwd);
 		}
 		if (patternRule?.approval === "deny") {
 			return {
 				tier: "exec",
 				override: true,
 				policy: "deny",
-				reason: `Blocked by bash pattern: ${patternRule.match}`,
+				reason: `Blocked by bash pattern: ${bashApprovalPatternLabel(patternRule.match)}`,
 			};
 		}
 		const criticalCommand = command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command));
@@ -556,13 +658,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			let promptRule: BashApprovalPatternRule | undefined = patternRule;
 			let hasUnmatchedSegment = false;
 			for (const segment of compoundSegments) {
-				const segmentRule = findBashApprovalPatternRule(segment.text, patternRules);
+				const segmentRule = findBashApprovalPatternRule(segment.text, patternRules, cwd);
 				if (segmentRule?.approval === "deny") {
 					return {
 						tier: "exec",
 						override: true,
 						policy: "deny",
-						reason: `Blocked by bash pattern: ${segmentRule.match}`,
+						reason: `Blocked by bash pattern: ${bashApprovalPatternLabel(segmentRule.match)}`,
 					};
 				}
 				if (segmentRule?.approval === "prompt") promptRule ??= segmentRule;
@@ -573,7 +675,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					tier: "exec",
 					override: true,
 					policy: "prompt",
-					reason: `Prompt required by bash pattern: ${promptRule.match}`,
+					reason: `Prompt required by bash pattern: ${bashApprovalPatternLabel(promptRule.match)}`,
 				};
 			}
 			for (const segment of compoundSegments) {
@@ -591,7 +693,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				tier: "exec",
 				override: true,
 				policy: "prompt",
-				reason: `Prompt required by bash pattern: ${patternRule.match}`,
+				reason: `Prompt required by bash pattern: ${bashApprovalPatternLabel(patternRule.match)}`,
 			};
 		}
 		return "exec";
