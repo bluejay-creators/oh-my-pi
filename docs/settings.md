@@ -222,12 +222,14 @@ existing ordered approval and compound-command decision path.
 `omp config bash-check '<JSON request>'` returns a native dry decision without
 executing the command or loading/migrating settings. A request contains
 `command` and `patterns`, with optional `approvalMode` (`yolo`, `write`,
-`always-ask`), `userPolicies` and `allowCompoundCommands`. JSON output contains
+`always-ask`, `always-ask-cached`), `userPolicies` and `allowCompoundCommands`. JSON output contains
 `interface: "bash-argv-v1"`, `policy`, `approvalMode`, optional `reason`,
 normalized `rules`, and zero-based `matches` for diagnostic rules that match
 individually. The effective policy still obeys ordered precedence. This allows
 installers to probe the **actual target executable**, not guess support from a
 version or an imported source checkout. Invalid requests/rules exit nonzero.
+An explicit matching `prompt` rule remains a prompt in every approval mode,
+including remote-fetch pipelines that the built-in classifier marks critical.
 
 Do not install object rules into an old runtime that ignores them. A successful
 probe of a new executable does not upgrade any already-running process:

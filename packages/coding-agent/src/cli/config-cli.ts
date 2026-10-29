@@ -12,7 +12,7 @@ import { type AnySetting, lookup } from "../config/registry";
 import { Settings, settings } from "../config/settings";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { initXdg } from "./commands/init-xdg";
-import { resolveApproval } from "../tools/approval";
+import { isApprovalMode, resolveApproval } from "../tools/approval";
 import { BashTool, findBashApprovalPatternRule, getBashApprovalPatternRules } from "../tools/bash";
 
 // =============================================================================
@@ -183,8 +183,7 @@ export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
 				Object.keys(request).some(key => !["command", "patterns", "approvalMode", "userPolicies", "allowCompoundCommands"].includes(key)) ||
 				typeof request.command !== "string" ||
 				!Array.isArray(request.patterns) ||
-				(request.approvalMode !== undefined &&
-					(typeof request.approvalMode !== "string" || !["yolo", "write", "always-ask"].includes(request.approvalMode))) ||
+				(request.approvalMode !== undefined && !isApprovalMode(request.approvalMode)) ||
 				(request.userPolicies !== undefined && !isRecord(request.userPolicies)) ||
 				(request.allowCompoundCommands !== undefined && typeof request.allowCompoundCommands !== "boolean")
 			) throw new Error("Invalid Bash approval request");
@@ -195,7 +194,7 @@ export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
 				"bash.allowCompoundCommands": request.allowCompoundCommands ?? false,
 			});
 			const tool = new BashTool({ settings: isolated, cwd: process.cwd() } as ConstructorParameters<typeof BashTool>[0]);
-			const approvalMode = (request.approvalMode ?? "yolo") as "yolo" | "write" | "always-ask";
+			const approvalMode = request.approvalMode ?? "yolo";
 			const verdict = resolveApproval(tool, { command: request.command }, approvalMode, request.userPolicies ?? {});
 			const matches: number[] = [];
 			for (let index = 0; index < rules.length; index++) {

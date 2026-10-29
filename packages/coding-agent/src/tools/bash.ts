@@ -651,7 +651,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 		}
 		const criticalCommand = command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command));
-		if (!compoundSegments && criticalCommand) {
+		if (!compoundSegments && criticalCommand && patternRule?.approval !== "prompt") {
 			return { tier: "exec", override: true, reason: "Critical pattern detected" };
 		}
 		if (compoundSegments) {
