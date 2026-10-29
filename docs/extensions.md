@@ -593,6 +593,15 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 - `tool_result` (post-exec, may patch content/details/isError or return passive `additionalContext`; result context is delivered outside the tool output even when `event.isError` is true, so a failure-specific handler can guide the next model step)
 - `tool_execution_start` / `tool_execution_update` / `tool_execution_end` (observability)
 - `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
+- `tool_approval_prompt_ready` observes the final `prompt.full` / `prompt.compact` and optional session/grant choices, after tool-specific formatting, directory coverage and provider safety checks. It carries the same session/tool-call identity as requested/resolved and cannot approve a call. Select-only hosts report `compact: full`.
+
+Ready means formatted for the host, not physically visible: concurrent pending
+calls can each emit this event. Track them by `sessionId` and `toolCallId`, and
+retire only the matching resolved call; do not guess which queued dialog is on
+screen. No prompt-ready event is emitted when interactive approval is unavailable.
+Full prompt content can be sensitive. Persistence and forwarding require an
+appropriate destination and explicit redaction policy; the event is not a claim
+that its contents are safe to publish.
 
 `tool_result` is middleware-style: handlers run in extension order and each sees prior modifications. Distinct non-blank `additionalContext` from every handler is preserved in registration order (repeats, compared ignoring surrounding whitespace, are dropped) and delivered before that call's `tool_call` context.
 

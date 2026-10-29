@@ -403,7 +403,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
 			}
 
+			const hasPromptReadyHandlers = this.runner.hasHandlers("tool_approval_prompt_ready");
 			const hasApprovalHandlers =
+				hasPromptReadyHandlers ||
 				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
 			const sessionId = context?.sessionManager?.getSessionId() ?? "";
 			if (hasApprovalHandlers) {
@@ -466,6 +468,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					appendix: safetyAppendix,
 					sessionSubject: sessionScope?.subject,
 					grants: cacheTargets,
+					onPrompt: hasPromptReadyHandlers
+						? async prompt => {
+								await this.runner.emit({
+									type: "tool_approval_prompt_ready",
+									sessionId,
+									toolName: this.tool.name,
+									toolCallId,
+									prompt,
+								});
+							}
+						: undefined,
 				});
 				approved = answer !== "deny";
 				if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);

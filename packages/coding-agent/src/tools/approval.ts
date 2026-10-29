@@ -840,7 +840,13 @@ export async function requestApproval(
 	ui: Pick<ExtensionUIContext, "select" | "approve">,
 	tool: ApprovalSubject,
 	args: unknown,
-	options: { reason?: string; appendix?: readonly string[]; sessionSubject?: string; grants?: boolean } = {},
+	options: {
+		reason?: string;
+		appendix?: readonly string[];
+		sessionSubject?: string;
+		grants?: boolean;
+		onPrompt?: (prompt: Readonly<ExtensionApprovalPrompt>) => void | Promise<void>;
+	} = {},
 ): Promise<ExtensionApprovalAnswer> {
 	const { reason, appendix = [], sessionSubject } = options;
 	const header = approvalHeader(tool, reason);
@@ -861,12 +867,14 @@ export async function requestApproval(
 			...(compactBlock ? [compactBlock] : []),
 			...appendix,
 		].join("\n");
-		const answer = await ui.approve({
+		const rendered = {
 			full,
 			compact,
 			...(session ? { session } : {}),
 			...(grants.length > 0 ? { grants } : {}),
-		});
+		};
+		if (options.onPrompt) await options.onPrompt(rendered);
+		const answer = await ui.approve(rendered);
 		if (answer === "once" || (answer === "session" && session)) return answer;
 		if (typeof answer === "object" && answer !== null && grants.some(grant => grant.scope === answer.grant)) {
 			return { grant: answer.grant, always: answer.always === true };
@@ -874,6 +882,7 @@ export async function requestApproval(
 		return "deny";
 	}
 	const choices = { ...(session ? { session } : {}), ...(grants.length > 0 ? { grants } : {}) };
+	if (options.onPrompt) await options.onPrompt({ full, compact: full, ...choices });
 	return approvalAnswerForChoice(choices, await ui.select(full, approvalChoiceLabels(choices)));
 }
 

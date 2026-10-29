@@ -1392,6 +1392,20 @@ export interface ToolApprovalRequestedEvent {
 	approvalMode: ApprovalMode;
 }
 
+/**
+ * Final formatted approval content, ready for the host dialog or select.
+ * Observation only: returning from a handler cannot approve a tool call.
+ * Prompt content may be sensitive; do not persist or forward it without an
+ * appropriate destination and a redaction policy.
+ */
+export interface ToolApprovalPromptReadyEvent {
+	type: "tool_approval_prompt_ready";
+	sessionId: string;
+	toolCallId: string;
+	toolName: string;
+	prompt: Readonly<ExtensionApprovalPrompt>;
+}
+
 export interface ToolApprovalResolvedEvent {
 	type: "tool_approval_resolved";
 	sessionId: string;
@@ -1674,6 +1688,7 @@ export type ExtensionEvent =
 	| ToolCallEvent
 	| ToolResultEvent
 	| ToolApprovalRequestedEvent
+	| ToolApprovalPromptReadyEvent
 	| ToolApprovalResolvedEvent
 	| PlanReviewRequestedEvent
 	| PlanReviewResolvedEvent
@@ -1879,6 +1894,7 @@ export interface ExtensionAPI {
 	on(event: "credential_disabled", handler: ExtensionHandler<CredentialDisabledEvent>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
 	on(event: "tool_approval_requested", handler: ExtensionHandler<ToolApprovalRequestedEvent>): void;
+	on(event: "tool_approval_prompt_ready", handler: ExtensionHandler<ToolApprovalPromptReadyEvent>): void;
 	on(event: "tool_approval_resolved", handler: ExtensionHandler<ToolApprovalResolvedEvent>): void;
 	on(event: "plan_review_requested", handler: ExtensionHandler<PlanReviewRequestedEvent>): void;
 	on(event: "plan_review_resolved", handler: ExtensionHandler<PlanReviewResolvedEvent>): void;
