@@ -18,17 +18,24 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
+import { cfgTerminalShowProgress } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	disposeProgramStatus,
+	initProgramStatus,
+	setProgramStatusEnabled,
+	setRunStatus,
+} from "@oh-my-pi/pi-coding-agent/utils/run-status";
 import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { setTerminalHeadless, TempDir } from "@oh-my-pi/pi-utils";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 type AgentEnd = Extract<AgentSessionEvent, { type: "agent_end" }>;
@@ -110,6 +117,50 @@ async function nextMacrotask(): Promise<void> {
 }
 
 describe("EventController — run waiting only on background jobs", () => {
+	it("reports background waiting as idle, not complete, and restores busy status when foreground work resumes", async () => {
+		const { ctx, drain } = makeWaitingContext(["bg_1"]);
+		cfgTerminalShowProgress.set(settings, true);
+		const progress = vi.spyOn(ctx.ui.terminal, "setProgress");
+		const notify = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		const previousHeadless = setTerminalHeadless(false);
+		const reports: string[] = [];
+		const controller = new EventController(ctx);
+		let output: { mockRestore(): void } | undefined;
+		try {
+			Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+			output = vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+				if (typeof chunk === "string") {
+					for (const match of chunk.matchAll(/\x1b\]7501;state=(\w+)/g)) reports.push(match[1]);
+				}
+				return true;
+			});
+			initProgramStatus();
+			setProgramStatusEnabled(true);
+			setRunStatus({ state: "idle" });
+			reports.length = 0;
+
+			await controller.handleEvent({ type: "agent_start" });
+			await controller.handleEvent(asyncWaitEnd());
+			expect(reports).toEqual(["working", "idle"]);
+			expect(progress.mock.calls.map(call => call[0])).toEqual([true, false]);
+			expect(ctx.session.hasPendingAsyncWork()).toBe(true);
+			expect(notify).not.toHaveBeenCalled();
+
+			await controller.handleEvent({ type: "agent_start" });
+			expect(reports).toEqual(["working", "idle", "working"]);
+			expect(progress.mock.calls.map(call => call[0])).toEqual([true, false, true]);
+		} finally {
+			drain();
+			controller.dispose();
+			disposeProgramStatus();
+			output?.mockRestore();
+			if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+			else Reflect.deleteProperty(process.stdout, "isTTY");
+			setTerminalHeadless(previousHeadless);
+		}
+	});
+
 	it("names the waited-on jobs on the working row, then hands the row back to a woken run", async () => {
 		const { ctx } = makeWaitingContext(["bg_1", "bg_2"]);
 		const setWorkingMessage = vi.spyOn(ctx, "setWorkingMessage");
