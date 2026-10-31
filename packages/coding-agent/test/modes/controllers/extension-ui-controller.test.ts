@@ -3,7 +3,12 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { stripVTControlCharacters } from "node:util";
 import { type Component, Container, isFocusable, type OverlayOptions, setKeybindings } from "@oh-my-pi/pi-tui";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
-import type { ExtensionAskDialogQuestion, ExtensionUIContext } from "../../../src/extensibility/extensions";
+import type {
+	ApprovalPromptRequestedEvent,
+	ApprovalPromptResolvedEvent,
+	ExtensionAskDialogQuestion,
+	ExtensionUIContext,
+} from "../../../src/extensibility/extensions";
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
@@ -88,6 +93,7 @@ function makeHarness() {
 		showOverlay,
 		fakeHandle,
 		controller,
+		ctx,
 		inputController: (readText: () => Promise<string>) =>
 			new InputController(ctx, { readImage: async () => null, readText }),
 		agent,
@@ -715,5 +721,141 @@ describe("ExtensionUiController tool approval", () => {
 		expect(body()).not.toContain("rm-rf~");
 		harness.handleInput("\x0f");
 		expect(body()).toContain("rm-rf~");
+	});
+});
+
+describe("native approval prompt observations", () => {
+	type ApprovalEvent = ApprovalPromptRequestedEvent | ApprovalPromptResolvedEvent;
+
+	function observe(harness: ReturnType<typeof makeHarness>) {
+		const events: ApprovalEvent[] = [];
+		let sessionId = "approval-session";
+		Object.defineProperty(harness.ctx.session, "extensionRunner", {
+			configurable: true,
+			value: {
+				hasHandlers: () => true,
+				emit: async (event: ApprovalEvent) => {
+					events.push(event);
+				},
+			},
+		});
+		harness.ctx.sessionManager = {
+			getSessionId: () => sessionId,
+			getCwd: () => "/workspace",
+		} as unknown as InteractiveModeContext["sessionManager"];
+		return {
+			events,
+			switchSession: () => {
+				sessionId = "replacement-session";
+			},
+		};
+	}
+
+	async function presented(harness: ReturnType<typeof makeHarness>) {
+		for (let i = 0; i < 20 && harness.getFocused() === harness.editor; i++) await Promise.resolve();
+		expect(harness.getFocused()).not.toBe(harness.editor);
+	}
+
+	it("keeps repeated same-call dialogs distinct and binds each real selection to its own prompt", async () => {
+		const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+		try {
+			const harness = makeHarness();
+			const { events } = observe(harness);
+			const prompt = {
+				full: "Allow tool: bash\nCommand: printf reviewed",
+				compact: "Allow tool: bash",
+				source: { toolName: "bash", toolCallId: "same-call", command: "printf reviewed" },
+			};
+			const first = harness.controller.showCollabAwareApproval(prompt);
+			const second = harness.controller.showCollabAwareApproval(prompt);
+			await presented(harness);
+			const requested = events.filter(
+				(event): event is ApprovalPromptRequestedEvent => event.type === "approval_prompt_requested",
+			);
+			expect(requested).toHaveLength(2);
+			expect(requested[0]!.approval.id).not.toBe(requested[1]!.approval.id);
+			// An observer must not change what a later card consumer sees as the offered choices.
+			Reflect.set(requested[0]!.approval.choices, "0", "observer-injected choice");
+			harness.handleInput("\x1b");
+			expect(await first).toBe("deny");
+			await presented(harness);
+			now.mockReturnValue(3_000);
+			harness.handleInput("\r");
+			expect(await second).toBe("once");
+			const resolved = events.filter(
+				(event): event is ApprovalPromptResolvedEvent => event.type === "approval_prompt_resolved",
+			);
+			expect(resolved.map(event => [event.approval.id, event.outcome, event.choice])).toEqual([
+				[requested[0]!.approval.id, "denied", requested[0]!.approval.choices.at(-1)],
+				[requested[1]!.approval.id, "approved", requested[1]!.approval.choices[0]],
+			]);
+			expect(requested[0]!.approval.choices[0]).toBe(requested[1]!.approval.choices[0]);
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	it("does not report a settings selector's automatic highlighted choice as permission on timeout", async () => {
+		const harness = makeHarness();
+		const { events } = observe(harness);
+		await harness.controller.showApprovalSelector(
+			"settings",
+			"Change a session setting?",
+			["Allow once", "Deny"],
+			"Deny",
+			{ initialIndex: 0, timeout: 1 },
+		);
+		const resolved = events.find(
+			(event): event is ApprovalPromptResolvedEvent => event.type === "approval_prompt_resolved",
+		);
+		expect(resolved?.outcome).toBe("timeout");
+		expect(resolved).not.toHaveProperty("choice");
+	});
+
+	it("does not dress a tool dialog timeout up as an explicit denial", async () => {
+		const harness = makeHarness();
+		const { events } = observe(harness);
+		expect(
+			await harness.controller.showCollabAwareApproval(
+				{ full: "Allow tool: test", compact: "Allow tool: test" },
+				{ timeout: 1 },
+			),
+		).toBe("deny");
+		const resolved = events.find(
+			(event): event is ApprovalPromptResolvedEvent => event.type === "approval_prompt_resolved",
+		);
+		expect(resolved?.outcome).toBe("timeout");
+		expect(resolved).not.toHaveProperty("choice");
+	});
+
+	it("delivers source cancellation to the original session, not the replacement", async () => {
+		const harness = makeHarness();
+		const { events, switchSession } = observe(harness);
+		const abort = new AbortController();
+		const pending = harness.controller.showApprovalSelector("consent", "Send the report?", ["Yes", "No"], "No", {
+			signal: abort.signal,
+		});
+		await presented(harness);
+		const first = events[0] as ApprovalPromptRequestedEvent;
+		switchSession();
+		const replacement: ApprovalEvent[] = [];
+		Object.defineProperty(harness.ctx.session, "extensionRunner", {
+			value: {
+				hasHandlers: () => true,
+				emit: async (event: ApprovalEvent) => {
+					replacement.push(event);
+				},
+			},
+		});
+		abort.abort();
+		expect(await pending).toBeUndefined();
+		const last = events.at(-1) as ApprovalPromptResolvedEvent;
+		expect([last.sessionId, last.approval.id, last.outcome]).toEqual([
+			first.sessionId,
+			first.approval.id,
+			"cancelled",
+		]);
+		expect(last).not.toHaveProperty("choice");
+		expect(replacement).toEqual([]);
 	});
 });

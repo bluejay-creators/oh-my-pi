@@ -5,6 +5,8 @@ import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire
 import type { CollabHost } from "../../collab/host";
 import { formatKeyHint, formatKeyHints, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type {
+	ApprovalPromptOutcome,
+	ApprovalPromptSnapshot,
 	CompactOptions,
 	ExtensionActions,
 	ExtensionApprovalAnswer,
@@ -663,6 +665,85 @@ export class ExtensionUiController {
 		this.ctx.ui.requestRender();
 	}
 
+	/** Observe the actual native dialog without changing its policy, answers, or lifetime. */
+	async #observeApprovalPrompt(
+		details: Omit<ApprovalPromptSnapshot, "id" | "requestedAt" | "cwd"> & { sessionId?: string; cwd?: string },
+		show: () => Promise<string | undefined>,
+		isApproved: (choice: string) => boolean,
+		timedOut?: () => boolean,
+	): Promise<string | undefined> {
+		const runner = this.ctx.session.extensionRunner;
+		if (
+			!runner ||
+			(!runner.hasHandlers("approval_prompt_requested") && !runner.hasHandlers("approval_prompt_resolved"))
+		) {
+			return show();
+		}
+		const sessionId = details.sessionId || this.ctx.sessionManager.getSessionId();
+		const approval: ApprovalPromptSnapshot = Object.freeze({
+			id: crypto.randomUUID(),
+			kind: details.kind,
+			requestedAt: new Date().toISOString(),
+			cwd: details.cwd || this.ctx.sessionManager.getCwd(),
+			prompt: details.prompt,
+			choices: Object.freeze([...details.choices]),
+			toolName: details.toolName,
+			toolCallId: details.toolCallId,
+			command: details.command,
+			commandCwd: details.commandCwd,
+			reason: details.reason,
+		});
+		await runner.emit({ type: "approval_prompt_requested", sessionId, approval });
+		let choice: string | undefined;
+		try {
+			choice = await show();
+		} catch (error) {
+			await runner.emit({ type: "approval_prompt_resolved", sessionId, approval, outcome: "unavailable" });
+			throw error;
+		}
+		const outcome: ApprovalPromptOutcome = timedOut?.()
+			? "timeout"
+			: choice === undefined
+				? "cancelled"
+				: !details.choices.includes(choice)
+					? "unavailable"
+					: isApproved(choice)
+						? "approved"
+						: "denied";
+		await runner.emit({
+			type: "approval_prompt_resolved",
+			sessionId,
+			approval,
+			outcome,
+			...(choice !== undefined && outcome !== "timeout" && outcome !== "unavailable" ? { choice } : {}),
+		});
+		return choice;
+	}
+
+	/** Settings and consent use the same native snapshot lifecycle as tool permission dialogs. */
+	async showApprovalSelector(
+		kind: "settings" | "consent",
+		title: string,
+		options: string[],
+		denyChoice: string,
+		dialogOptions?: InteractiveSelectorDialogOptions,
+	): Promise<string | undefined> {
+		let timedOut = false;
+		return this.#observeApprovalPrompt(
+			{ kind, prompt: title, choices: options },
+			() =>
+				this.showCollabAwareSelector(title, options, {
+					...dialogOptions,
+					onTimeout: () => {
+						timedOut = true;
+						dialogOptions?.onTimeout?.();
+					},
+				}),
+			choice => choice !== denyChoice,
+			() => timedOut,
+		);
+	}
+
 	async showCollabAwareSelector(
 		title: string,
 		options: ExtensionUISelectItem[],
@@ -714,10 +795,11 @@ export class ExtensionUiController {
 	): Promise<ExtensionApprovalAnswer> {
 		const sessionLabel = prompt.session;
 		const onceLabel = approvalOnceLabel(prompt);
+		const choices = approvalChoiceLabels(prompt);
 		const request: CollabUiRequestDraft = {
 			kind: "select",
 			title: prompt.full,
-			options: approvalChoiceLabels(prompt),
+			options: choices,
 		};
 		const session = this.ctx.session;
 		const agent = session.agent;
@@ -743,56 +825,70 @@ export class ExtensionUiController {
 			}
 		});
 		const signal = dialogOptions?.signal ? AbortSignal.any([dialogOptions.signal, steered.signal]) : steered.signal;
+		let timedOut = false;
+		let answer: ExtensionApprovalAnswer | undefined;
 		try {
-			const choice = await this.#raceCollabDialog(request, signal, localSignal =>
-				this.#presentDialog(localSignal, settle => {
-					const editor = this.ctx.editor;
-					const dialog = new ApprovalDialogComponent(
-						prompt.compact,
-						{ onApprove: () => settle(onceLabel), onDeny: () => settle("Deny") },
-						{
-							tui: this.ctx.ui,
-							fullPrompt: prompt.full,
-							timeout: dialogOptions?.timeout,
-							onTimeout: dialogOptions?.onTimeout,
-							onTimeoutStart: dialogOptions?.onTimeoutStart,
-							onTimeoutReset: dialogOptions?.onTimeoutReset,
-							...(sessionLabel
-								? { session: { label: sessionLabel, onApprove: () => settle(sessionLabel) } }
-								: {}),
-							...(prompt.grants?.length
-								? {
-										grants: prompt.grants,
-										onGrant: (grant, always) => settle(always ? grant.alwaysLabel : grant.label),
-									}
-								: {}),
-							draft: {
-								hasDraft: () =>
-									editor.getText().length > 0 || editor.pendingImages.length > 0 || editor.pasteInFlight,
-								handleInput: keyData => editor.handleDraftEdit(keyData),
-							},
-						},
-					);
-					this.ctx.editorContainer.clear();
-					this.ctx.editorContainer.addChild(dialog);
-					this.ctx.editorContainer.addChild(editor);
-					this.ctx.ui.setFocus(dialog);
-					// The dialog owns focus but forwards typing: keep the composer's cursor visible.
-					editor.focused = true;
-					// Its submissions steer this (main) session, even from a focused agent's view.
-					this.ctx.approvalOwnsComposer = true;
-					this.ctx.ui.requestRender();
-					return () => {
-						this.ctx.approvalOwnsComposer = false;
-						dialog.dispose();
-						this.ctx.editorContainer.clear();
-						this.ctx.editorContainer.addChild(editor);
-						this.ctx.ui.setFocus(editor);
-						this.ctx.ui.requestRender();
-					};
-				}),
+			const choice = await this.#observeApprovalPrompt(
+				{ ...prompt.source, kind: "tool", prompt: prompt.full, choices },
+				() =>
+					this.#raceCollabDialog(request, signal, localSignal =>
+						this.#presentDialog(localSignal, settle => {
+							const editor = this.ctx.editor;
+							const dialog = new ApprovalDialogComponent(
+								prompt.compact,
+								{ onApprove: () => settle(onceLabel), onDeny: () => settle("Deny") },
+								{
+									tui: this.ctx.ui,
+									fullPrompt: prompt.full,
+									timeout: dialogOptions?.timeout,
+									onTimeout: () => {
+										timedOut = true;
+										dialogOptions?.onTimeout?.();
+									},
+									onTimeoutStart: dialogOptions?.onTimeoutStart,
+									onTimeoutReset: dialogOptions?.onTimeoutReset,
+									...(sessionLabel
+										? { session: { label: sessionLabel, onApprove: () => settle(sessionLabel) } }
+										: {}),
+									...(prompt.grants?.length
+										? {
+												grants: prompt.grants,
+												onGrant: (grant, always) => settle(always ? grant.alwaysLabel : grant.label),
+											}
+										: {}),
+									draft: {
+										hasDraft: () =>
+											editor.getText().length > 0 || editor.pendingImages.length > 0 || editor.pasteInFlight,
+										handleInput: keyData => editor.handleDraftEdit(keyData),
+									},
+								},
+							);
+							this.ctx.editorContainer.clear();
+							this.ctx.editorContainer.addChild(dialog);
+							this.ctx.editorContainer.addChild(editor);
+							this.ctx.ui.setFocus(dialog);
+							// The dialog owns focus but forwards typing: keep the composer's cursor visible.
+							editor.focused = true;
+							// Its submissions steer this (main) session, even from a focused agent's view.
+							this.ctx.approvalOwnsComposer = true;
+							this.ctx.ui.requestRender();
+							return () => {
+								this.ctx.approvalOwnsComposer = false;
+								dialog.dispose();
+								this.ctx.editorContainer.clear();
+								this.ctx.editorContainer.addChild(editor);
+								this.ctx.ui.setFocus(editor);
+								this.ctx.ui.requestRender();
+							};
+						}),
+					),
+				choice => {
+					answer = approvalAnswerForChoice(prompt, choice);
+					return answer !== "deny";
+				},
+				() => timedOut,
 			);
-			return approvalAnswerForChoice(prompt, choice);
+			return answer ?? approvalAnswerForChoice(prompt, choice);
 		} finally {
 			unsubscribe();
 		}

@@ -271,6 +271,19 @@ export interface ExtensionCustomOptions {
 /** Wrap the current autocomplete provider with additional behavior (pi-compatible). */
 export type AutocompleteProviderFactory = (current: AutocompleteProvider) => AutocompleteProvider;
 
+/** Origin details supplied by the native approval builder, after tool-call input revisions. */
+export interface ApprovalPromptSource {
+	toolName: string;
+	sessionId?: string;
+	toolCallId?: string;
+	/** Calling session directory, before any explicit Bash cwd override. */
+	cwd?: string;
+	command?: string;
+	/** Explicit Bash cwd argument, which may be relative or a virtual directory. */
+	commandCwd?: string;
+	reason?: string;
+}
+
 /** The renderings of a tool-approval prompt passed to `ExtensionUIContext.approve()`. */
 export interface ExtensionApprovalPrompt {
 	full: string;
@@ -282,6 +295,8 @@ export interface ExtensionApprovalPrompt {
 	 * that does not render them still answers `once`/`session`/`deny`.
 	 */
 	grants?: readonly ExtensionApprovalGrant[];
+	/** Observability only; never changes approval policy or the choices the host offers. */
+	source?: ApprovalPromptSource;
 }
 
 /** One remembered-approval choice of an `always-ask-cached` prompt. */
@@ -1401,6 +1416,41 @@ export interface ToolApprovalResolvedEvent {
 	reason?: string;
 }
 
+/** Immutable display snapshot of one native permission dialog, not raw tool arguments. */
+export interface ApprovalPromptSnapshot {
+	readonly id: string;
+	readonly kind: "tool" | "settings" | "consent";
+	readonly requestedAt: string;
+	/** Session working directory; commandCwd is the explicit Bash override, if any. */
+	readonly cwd: string;
+	readonly prompt: string;
+	readonly choices: readonly string[];
+	readonly toolName?: string;
+	readonly toolCallId?: string;
+	readonly command?: string;
+	readonly commandCwd?: string;
+	readonly reason?: string;
+}
+
+export type ApprovalPromptOutcome = "approved" | "denied" | "cancelled" | "timeout" | "unavailable";
+
+/** A native permission dialog is pending. Do not await remote work from this handler. */
+export interface ApprovalPromptRequestedEvent {
+	type: "approval_prompt_requested";
+	sessionId: string;
+	approval: ApprovalPromptSnapshot;
+}
+
+/** The same dialog ended; permission resolution does not report tool execution. */
+export interface ApprovalPromptResolvedEvent {
+	type: "approval_prompt_resolved";
+	sessionId: string;
+	approval: ApprovalPromptSnapshot;
+	outcome: ApprovalPromptOutcome;
+	/** Actual offered label, absent for dismissal, timeout, or an unavailable dialog. */
+	choice?: string;
+}
+
 /** Stable ids for the interactive plan review's choices; labels may change (keep's label carries a token count). */
 export type PlanReviewChoice = "execute" | "compact" | "keep" | "refine" | "save";
 /** A choice as displayed in the interactive plan review, delivered in display order by `plan_review_requested`. */
@@ -1675,6 +1725,8 @@ export type ExtensionEvent =
 	| ToolResultEvent
 	| ToolApprovalRequestedEvent
 	| ToolApprovalResolvedEvent
+	| ApprovalPromptRequestedEvent
+	| ApprovalPromptResolvedEvent
 	| PlanReviewRequestedEvent
 	| PlanReviewResolvedEvent
 	| ModeChangedEvent;
@@ -1880,6 +1932,8 @@ export interface ExtensionAPI {
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
 	on(event: "tool_approval_requested", handler: ExtensionHandler<ToolApprovalRequestedEvent>): void;
 	on(event: "tool_approval_resolved", handler: ExtensionHandler<ToolApprovalResolvedEvent>): void;
+	on(event: "approval_prompt_requested", handler: ExtensionHandler<ApprovalPromptRequestedEvent>): void;
+	on(event: "approval_prompt_resolved", handler: ExtensionHandler<ApprovalPromptResolvedEvent>): void;
 	on(event: "plan_review_requested", handler: ExtensionHandler<PlanReviewRequestedEvent>): void;
 	on(event: "plan_review_resolved", handler: ExtensionHandler<PlanReviewResolvedEvent>): void;
 	on(event: "mode_changed", handler: ExtensionHandler<ModeChangedEvent>): void;

@@ -466,6 +466,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					appendix: safetyAppendix,
 					sessionSubject: sessionScope?.subject,
 					grants: cacheTargets,
+					sessionId,
+					toolCallId,
+					cwd: context?.sessionManager?.getCwd?.(),
 				});
 				approved = answer !== "deny";
 				if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
