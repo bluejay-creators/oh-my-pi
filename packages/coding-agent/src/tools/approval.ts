@@ -840,7 +840,15 @@ export async function requestApproval(
 	ui: Pick<ExtensionUIContext, "select" | "approve">,
 	tool: ApprovalSubject,
 	args: unknown,
-	options: { reason?: string; appendix?: readonly string[]; sessionSubject?: string; grants?: boolean } = {},
+	options: {
+		reason?: string;
+		appendix?: readonly string[];
+		sessionSubject?: string;
+		grants?: boolean;
+		sessionId?: string;
+		toolCallId?: string;
+		cwd?: string;
+	} = {},
 ): Promise<ExtensionApprovalAnswer> {
 	const { reason, appendix = [], sessionSubject } = options;
 	const header = approvalHeader(tool, reason);
@@ -866,6 +874,19 @@ export async function requestApproval(
 			compact,
 			...(session ? { session } : {}),
 			...(grants.length > 0 ? { grants } : {}),
+			source: {
+				toolName: tool.name,
+				...(options.sessionId ? { sessionId: options.sessionId } : {}),
+				...(options.toolCallId ? { toolCallId: options.toolCallId } : {}),
+				...(options.cwd ? { cwd: options.cwd } : {}),
+				...(reason ? { reason } : {}),
+				...(tool.name === "bash" && isRecord(args)
+					? {
+							...(typeof args.command === "string" ? { command: args.command } : {}),
+							...(typeof args.cwd === "string" ? { commandCwd: args.cwd } : {}),
+						}
+					: {}),
+			},
 		});
 		if (answer === "once" || (answer === "session" && session)) return answer;
 		if (typeof answer === "object" && answer !== null && grants.some(grant => grant.scope === answer.grant)) {

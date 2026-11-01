@@ -596,6 +596,30 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 
 `tool_result` is middleware-style: handlers run in extension order and each sees prior modifications. Distinct non-blank `additionalContext` from every handler is preserved in registration order (repeats, compared ignoring surrounding whitespace, are dropped) and delivered before that call's `tool_call` context.
 
+### Native permission UI snapshots
+
+`approval_prompt_requested` and `approval_prompt_resolved` observe the actual interactive
+permission UI, not an earlier tool-call event. They cover tool dialogs (including
+eval prelude requests), native settings changes, and report consent. Each carries
+`sessionId` and an immutable `approval` snapshot: a fresh dialog `id`, `kind`
+(`tool`, `settings`, or `consent`), `requestedAt`, `cwd`, the final full `prompt`,
+and offered `choices`. Tool callers may add `toolName`, `toolCallId`, `command`,
+`commandCwd`, and `reason` through `ExtensionApprovalPrompt.source`; the standard
+tool wrapper supplies these from the final, revised arguments.
+
+The resolved event repeats that same snapshot and adds `outcome`: `approved`,
+`denied`, `cancelled`, `timeout`, or `unavailable`. `choice` is the actual selected
+offered label; it is absent for cancellation, timeout, or unavailable UI. In
+particular, an automated timeout's highlighted default is not a human decision.
+Repeated dialogs for one tool call have distinct ids. Session changes do not
+redirect a pending dialog's resolution to the replacement session's runner.
+
+These events neither answer the dialog nor prove that a tool executed. A
+notification consumer should persist its snapshot and defer network/board work
+instead of keeping the event handler open. Noninteractive modes do not synthesize
+native dialogs. The existing `tool_approval_*` events keep their prior contract.
+
+
 ### Plan review lifecycle
 
 - `plan_review_requested` reports an interactive plan review with its `reviewId`, session, title, plan path and content, plus the choices in display order. Choice ids are stable (`execute`, `compact`, `keep`, `refine`, `save`); labels may change, and `keep` carries the current token count. An extension can answer it with `ctx.resolvePlanReview(...)` while the terminal picker stays live; the first answer wins. `save` uses the default file name without opening the path prompt.

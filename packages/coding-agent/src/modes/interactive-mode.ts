@@ -7767,7 +7767,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #promptAutoQaConsent(): Promise<boolean | null> {
 		const pool = InteractiveMode.#AUTOQA_CONSENT_PROMPTS;
 		const [headline, body] = pool[Math.floor(Math.random() * pool.length)];
-		const choice = await this.#extensionUiController.showCollabAwareSelector(`${headline}\n${body}`, ["Yes", "No"]);
+		const choice = await this.#extensionUiController.showApprovalSelector(
+			"consent",
+			`${headline}\n${body}`,
+			["Yes", "No"],
+			"No",
+		);
 		return choice === "Yes";
 	}
 
@@ -7793,9 +7798,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			callerSignal === undefined
 				? this.#dialogLifetime.signal
 				: AbortSignal.any([callerSignal, this.#dialogLifetime.signal]);
-		const choice = await this.#extensionUiController.showCollabAwareSelector(
+		const choice = await this.#extensionUiController.showApprovalSelector(
+			"settings",
 			`${headline}\n${request.previous} → ${request.value}${warning}`,
 			[CFG_APPROVE_SESSION, CFG_APPROVE_ONCE, CFG_DENY],
+			CFG_DENY,
 			{
 				// A reflexive Enter approves this change only, never the whole session.
 				initialIndex: 1,
