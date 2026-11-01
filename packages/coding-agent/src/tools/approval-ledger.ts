@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { constants, watch } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, realpathSync, watch } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import { serialize } from "node:v8";
@@ -94,6 +94,28 @@ async function readOwned(filename: string, secret: boolean): Promise<Buffer> {
 	}
 }
 
+// Final admission cannot await: resolution handlers have already run, and the
+// current context must remain checked through the synchronous mutation boundary.
+function readOwnedSync(filename: string, secret: boolean): Buffer {
+	if (!path.isAbsolute(filename) || process.getuid === undefined)
+		throw new Error("Absolute POSIX consent path required");
+	const file = openSync(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		const info = fstatSync(file);
+		if (
+			!info.isFile() ||
+			info.uid !== process.getuid() ||
+			(info.mode & (secret ? 0o077 : 0o022)) !== 0 ||
+			info.size > MAX_BYTES
+		) {
+			throw new Error("Unsafe native consent file ownership, mode, or size");
+		}
+		return readFileSync(file);
+	} finally {
+		closeSync(file);
+	}
+}
+
 async function readConfig(): Promise<BridgeConfig> {
 	const filename = process.env[CONFIG_ENV];
 	if (!filename) throw new Error("Native consent bridge is not configured");
@@ -141,9 +163,9 @@ export function bindNativeApproval(owner: object, facts: NativeApprovalFacts): v
 		factsByOwner.set(owner, facts.execution ? facts : { ...facts, execution: execution.getStore() });
 }
 
-/** Recheck the exact mutation inputs synchronously immediately before applying a ledger-supplied choice. */
+/** Recheck the bound execution context synchronously before applying a ledger-supplied choice. */
 export function nativeLedgerChoiceIsCurrent(owner: object): boolean {
-	return ledgerResolutions.get(owner)?.argumentsCurrent() ?? true;
+	return ledgerResolutions.get(owner)?.contextCurrent() ?? true;
 }
 
 async function invoke(
@@ -227,12 +249,31 @@ function verifiedGrant(value: unknown): VerifiedNativeGrant | undefined {
 /** Tracks observed native tool returns/throws, not success or external side effects. */
 export class NativeExecutionScope {
 	#approved:
-		| Map<string, { config: BridgeConfig; request: NativeApprovalRequest; report: (message: string) => void }>
+		| Map<
+				string,
+				{
+					config: BridgeConfig;
+					request: NativeApprovalRequest;
+					report: (message: string) => void;
+					isCurrent?: () => boolean;
+				}
+		  >
 		| undefined;
-	observe(config: BridgeConfig, request: NativeApprovalRequest, report: (message: string) => void): void {
-		(this.#approved ??= new Map()).set(hash(canonical(request)), { config, request, report });
+	observe(
+		config: BridgeConfig,
+		request: NativeApprovalRequest,
+		report: (message: string) => void,
+		isCurrent?: () => boolean,
+	): void {
+		(this.#approved ??= new Map()).set(hash(canonical(request)), { config, request, report, isCurrent });
 	}
 	run<T>(callback: () => Promise<T>): Promise<T> {
+		if (this.#approved) {
+			for (const admission of this.#approved.values()) {
+				if (admission.isCurrent?.() === false)
+					throw new Error("Native consent context changed or became unavailable before tool execution");
+			}
+		}
 		return execution.run(this, callback);
 	}
 	async result(outcome: "returned" | "threw"): Promise<void> {
@@ -337,8 +378,19 @@ export class NativeApprovalLease {
 		this.#hash = hash(canonical(request));
 	}
 
-	argumentsCurrent(): boolean {
-		return hash(serialize(this.#facts.getArguments())) === this.request.argumentsSha256;
+	contextCurrent(): boolean {
+		try {
+			return (
+				this.#facts.isCurrent?.() !== false &&
+				realpathSync(this.#facts.getCwd()) === this.request.cwd &&
+				hash(readOwnedSync(this.#config.filename, true)) === this.#config.digest &&
+				hash(readOwnedSync(this.#config.program, false)) === this.#config.programSha256 &&
+				hash(serialize(this.#facts.getArguments())) === this.request.argumentsSha256 &&
+				environment(this.#facts.settings, this.#config) === this.request.environmentSha256
+			);
+		} catch {
+			return false;
+		}
 	}
 
 	async #current(): Promise<boolean> {
@@ -509,7 +561,12 @@ export class NativeApprovalLease {
 		if (this.#remoteChoice || (result.phase === "denied" && outcome === "approved"))
 			ledgerResolutions.set(this.#options.owner, this);
 		if (result.phase === "approved")
-			this.#facts.execution?.observe(this.#config, this.request, this.#options.reportUnavailable);
+			this.#facts.execution?.observe(
+				this.#config,
+				this.request,
+				this.#options.reportUnavailable,
+				this.#remoteChoice ? () => this.contextCurrent() : undefined,
+			);
 		return result.phase;
 	}
 }

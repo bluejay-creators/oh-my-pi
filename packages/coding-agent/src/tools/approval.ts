@@ -27,7 +27,7 @@ import {
 	approvalCacheKeyForPath,
 	approvalGrantKey,
 } from "./approval-cache";
-import { bindNativeApproval, type NativeApprovalFacts } from "./approval-ledger";
+import { bindNativeApproval, nativeLedgerChoiceIsCurrent, type NativeApprovalFacts } from "./approval-ledger";
 import { cfgToolsApproval, cfgToolsApprovalMode, cfgToolsRestrictedFolders } from "./settings";
 import {
 	approvalFolderListing,
@@ -894,6 +894,8 @@ export async function requestApproval(
 		};
 		if (options.ledgerFacts) bindNativeApproval(approvalPrompt, options.ledgerFacts);
 		const answer = await ui.approve(approvalPrompt, options.signal ? { signal: options.signal } : undefined);
+		if (answer !== "deny" && options.ledgerFacts && !nativeLedgerChoiceIsCurrent(approvalPrompt))
+			throw new Error("Native consent context changed or became unavailable before tool execution");
 		if (answer === "once" || (answer === "session" && session)) return answer;
 		if (typeof answer === "object" && answer !== null && grants.some(grant => grant.scope === answer.grant)) {
 			return { grant: answer.grant, always: answer.always === true };
