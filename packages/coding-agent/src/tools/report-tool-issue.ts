@@ -41,6 +41,7 @@ import type { Settings } from "..";
 import type { ToolSession } from "./index";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { XdevDispatch } from "./xdev";
+import { nativeLedgerChoiceIsCurrent, nativeLedgerConfigured } from "./approval-ledger";
 
 import { REPORT_ISSUE_DEVICE_NAME, REPORT_ISSUE_DEVICE_PATH } from "@oh-my-pi/pi-tui/tools/report-tool-issue";
 import { truncateHeadBytes } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -182,7 +183,7 @@ export function isAutoQaEnabled(settings?: Settings): boolean {
  * tests, non-interactive runs) consent defaults to `false` — the explicit
  * "don't collect by default" stance.
  */
-export type AutoQaConsentHandler = () => Promise<boolean | null>;
+export type AutoQaConsentHandler = (approvalOwner?: object) => Promise<boolean | null>;
 
 let consentHandler: AutoQaConsentHandler | null = null;
 /**
@@ -264,8 +265,13 @@ export async function resolveAutoQaConsent(settings: Settings | undefined): Prom
 	if (consentInFlight) return consentInFlight;
 	consentInFlight = (async () => {
 		try {
-			const result = await consentHandler!();
+			const owner = nativeLedgerConfigured() ? {} : undefined;
+			const result = await consentHandler!(owner);
 			if (result === null) return false;
+			if (owner && !nativeLedgerChoiceIsCurrent(owner)) {
+				logger.warn("Auto-QA consent changed after the phone choice; the stale preference was not saved");
+				return false;
+			}
 			persistConsent(settings, result);
 			return result;
 		} catch {

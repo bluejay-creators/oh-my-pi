@@ -1,3 +1,5 @@
+import { realpath } from "node:fs/promises";
+import * as path from "node:path";
 // Deep import: the pi-utils barrel loads the host native addon, which is
 // absent on cross-compiling release runners.
 import { USER_AGENT } from "@oh-my-pi/pi-utils/dirs";
@@ -44,11 +46,25 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 		Bun.env.BUN_NO_CODESIGN_MACHO_BINARY = "1";
 	}
 	try {
+		// The package's nodejs entry reads Wasm from its source directory at runtime.
+		// Embed the web binding's bytes through the existing in-memory asset mechanism
+		// instead: released binaries must not depend on build-machine node_modules.
+		const cedarEntry = Bun.resolveSync(
+			"@cedar-policy/cedar-wasm/web",
+			path.join(options.repoRoot, "packages/coding-agent"),
+		);
+		const cedarWasm = path.join(path.dirname(cedarEntry), "cedar_wasm_bg.wasm");
+		const cedarManifest = await realpath(
+			path.join(options.repoRoot, "packages/coding-agent/src/tools/approval-ledger-assets.ts"),
+		);
 		const output = await Bun.build({
 			entrypoints: [options.entrypoint],
 			root: options.repoRoot,
 			external: [...COMPILED_EXTERNAL_DEPENDENCIES],
-			files: options.native ? await embeddedAddonFiles(options.native) : {},
+			files: {
+				...(options.native ? await embeddedAddonFiles(options.native) : {}),
+				[cedarManifest]: `import wasmPath from ${JSON.stringify(cedarWasm)} with { type: "file" };\nexport const embeddedCedarWasmPath = wasmPath;\n`,
+			},
 			define: {
 				"process.env.PI_COMPILED": JSON.stringify("true"),
 				"process.env.PI_TINY_TRANSFORMERS_VERSION": JSON.stringify(options.transformersVersion),

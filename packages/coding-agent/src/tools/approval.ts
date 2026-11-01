@@ -27,6 +27,7 @@ import {
 	approvalCacheKeyForPath,
 	approvalGrantKey,
 } from "./approval-cache";
+import { bindNativeApproval, type NativeApprovalFacts } from "./approval-ledger";
 import { cfgToolsApproval, cfgToolsApprovalMode, cfgToolsRestrictedFolders } from "./settings";
 import {
 	approvalFolderListing,
@@ -848,6 +849,9 @@ export async function requestApproval(
 		sessionId?: string;
 		toolCallId?: string;
 		cwd?: string;
+		signal?: AbortSignal;
+		/** Kernel-owned final execution facts; never inferred from display source metadata. */
+		ledgerFacts?: NativeApprovalFacts;
 	} = {},
 ): Promise<ExtensionApprovalAnswer> {
 	const { reason, appendix = [], sessionSubject } = options;
@@ -869,7 +873,7 @@ export async function requestApproval(
 			...(compactBlock ? [compactBlock] : []),
 			...appendix,
 		].join("\n");
-		const answer = await ui.approve({
+		const approvalPrompt: ExtensionApprovalPrompt = {
 			full,
 			compact,
 			...(session ? { session } : {}),
@@ -887,7 +891,9 @@ export async function requestApproval(
 						}
 					: {}),
 			},
-		});
+		};
+		if (options.ledgerFacts) bindNativeApproval(approvalPrompt, options.ledgerFacts);
+		const answer = await ui.approve(approvalPrompt, options.signal ? { signal: options.signal } : undefined);
 		if (answer === "once" || (answer === "session" && session)) return answer;
 		if (typeof answer === "object" && answer !== null && grants.some(grant => grant.scope === answer.grant)) {
 			return { grant: answer.grant, always: answer.always === true };
@@ -895,7 +901,10 @@ export async function requestApproval(
 		return "deny";
 	}
 	const choices = { ...(session ? { session } : {}), ...(grants.length > 0 ? { grants } : {}) };
-	return approvalAnswerForChoice(choices, await ui.select(full, approvalChoiceLabels(choices)));
+	return approvalAnswerForChoice(
+		choices,
+		await ui.select(full, approvalChoiceLabels(choices), options.signal ? { signal: options.signal } : undefined),
+	);
 }
 
 /** The approve-this-call-only label: "Approve", or "Approve Once" beside grants that remember more. */

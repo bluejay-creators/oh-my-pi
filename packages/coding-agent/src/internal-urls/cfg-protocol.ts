@@ -28,6 +28,7 @@ import cfgEnvShadowedTemplate from "../prompts/tools/cfg-env-shadowed.md" with {
 import cfgApprovalTimeoutTemplate from "../prompts/tools/cfg-approval-timeout.md" with { type: "text" };
 import cfgWriteResultTemplate from "../prompts/tools/cfg-write-result.md" with { type: "text" };
 import type { ToolSession } from "../tools";
+import { bindNativeApproval, nativeLedgerChoiceIsCurrent, nativeLedgerConfigured } from "../tools/approval-ledger";
 import type {
 	InternalResource,
 	InternalUrl,
@@ -430,6 +431,22 @@ export class CfgProtocolHandler implements ProtocolHandler {
 			}
 		}
 		const sessionId = callerSession(context).getSessionId?.() ?? undefined;
+		if (sessionId && nativeLedgerConfigured()) {
+			bindNativeApproval(request, {
+				sessionId,
+				toolName: "cfg.write",
+				settings,
+				getArguments: () => ({
+					path: leaf.id,
+					previous: leaf.get(settings),
+					value,
+					save,
+					...(save ? { persistentPrevious: leaf.get(host.persistentSettings) } : {}),
+				}),
+				getCwd: () => callerSession(context).cwd,
+				isCurrent: () => !context?.signal?.aborted && callerSession(context).getSessionId?.() === sessionId,
+			});
+		}
 		const decision = approvalQueue.then(() => decide(host, request, sessionId, context?.signal));
 		approvalQueue = decision.catch(() => undefined);
 		const answer = await decision;
@@ -439,6 +456,9 @@ export class CfgProtocolHandler implements ProtocolHandler {
 			);
 		}
 		if (answer === "deny") return finish("declined");
+		if (!nativeLedgerChoiceIsCurrent(request)) {
+			throw new Error("Settings changed after the phone authorization; the stale change was not applied.");
+		}
 
 		if (!save) {
 			leaf.override(settings, value);

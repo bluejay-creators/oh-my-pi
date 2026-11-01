@@ -537,6 +537,7 @@
 	},
 	"dependencies": {
 		"@babel/parser": "catalog:",
+		"@cedar-policy/cedar-wasm": "catalog:",
 		"@oh-my-pi/omp-stats": "catalog:",
 		"@oh-my-pi/omptype": "catalog:",
 		"@oh-my-pi/pi-agent-core": "catalog:",

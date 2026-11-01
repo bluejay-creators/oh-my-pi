@@ -8,6 +8,7 @@ import {
 	resolveApproval,
 	resolveApprovalFromContext,
 } from "../tools/approval";
+import { nativeLedgerConfigured } from "../tools/approval-ledger";
 
 /** Host context supplied when an eval prelude calls back out of its language VM. */
 export interface EvalPreludeContext {
@@ -120,8 +121,27 @@ async function approvePreludeInvocation(
 				`Set tools.approval.${definition.name}: allow or use an interactive UI to approve the call.`,
 		);
 	}
+	const sessionId = context.session.getSessionId?.() ?? "";
 	const answer = await untilAborted(context.signal, () =>
-		requestApproval(ui, subject, parameters, { reason: resolved.reason }),
+		requestApproval(ui, subject, parameters, {
+			reason: resolved.reason,
+			sessionId,
+			toolCallId: context.toolCallId,
+			cwd: context.session.cwd,
+			signal: context.signal,
+			ledgerFacts:
+				nativeLedgerConfigured() && settings && sessionId
+					? {
+							sessionId,
+							toolName: definition.name,
+							toolCallId: context.toolCallId,
+							settings,
+							getArguments: () => parameters,
+							getCwd: () => context.session.cwd,
+							isCurrent: () => !context.signal?.aborted && context.session.getSessionId?.() === sessionId,
+						}
+					: undefined,
+		}),
 	);
 	if (answer === "deny") throw new Error(`Eval prelude call denied by user: ${definition.name}`);
 }

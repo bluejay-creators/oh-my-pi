@@ -10,7 +10,7 @@ import {
 	type ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
-import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import { isRecord, prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import {
@@ -24,6 +24,9 @@ import {
 	truncateForPrompt,
 } from "../../tools/approval";
 import { getApprovalGrants } from "../../tools/approval-cache";
+import { createNativeExecutionScope } from "../../tools/approval-ledger";
+import { resolveToCwd } from "../../tools/path-utils";
+import { extractLeadingCdTarget } from "../../tools/shell-tokenize";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
@@ -164,6 +167,15 @@ function computerSafetyChecks(context: AgentToolContext | undefined): ComputerSa
 function approvalArgs(params: unknown, context: AgentToolContext | undefined): unknown {
 	const metadata = context?.toolCall?.providerMetadata;
 	return metadata?.type === "computer" ? { actions: metadata.actions } : params;
+}
+
+/** Match Bash's existing structured/leading-cd normalization, without inventing another shell parser. */
+function nativeApprovalCwd(toolName: string, parameters: unknown, cwd: string): string {
+	if (toolName !== "bash" || !isRecord(parameters)) return cwd;
+	const supplied = typeof parameters.cwd === "string" ? parameters.cwd : undefined;
+	const leading =
+		!supplied && typeof parameters.command === "string" ? extractLeadingCdTarget(parameters.command) : null;
+	return resolveToCwd(supplied || leading?.path || cwd, cwd);
 }
 
 function toolEventArgs(params: unknown, context: AgentToolContext | undefined): Record<string, unknown> {
@@ -358,6 +370,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			cancelPreflight();
 			throw denyError(resolved, this.tool.name);
 		}
+		const nativeExecution = createNativeExecutionScope();
 		const pendingSafetyChecks = computerSafetyChecks(context);
 		// Outer approvals only cover the original input. `xd://` approval skips
 		// tier-only prompts, and an explicit prompt under the policy key the outer
@@ -469,6 +482,32 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					sessionId,
 					toolCallId,
 					cwd: context?.sessionManager?.getCwd?.(),
+					signal,
+					ledgerFacts:
+						nativeExecution &&
+						approvalSettings &&
+						sessionId &&
+						context?.toolCall?.providerMetadata?.type !== "computer"
+							? {
+									sessionId,
+									toolName: this.tool.name,
+									toolCallId,
+									settings: approvalSettings,
+									getArguments: () => effectiveParams,
+									getCwd: () => nativeApprovalCwd(this.tool.name, effectiveParams, this.runner.cwd),
+									getCommand: () =>
+										this.tool.name === "bash" &&
+										isRecord(effectiveParams) &&
+										typeof effectiveParams.command === "string"
+											? effectiveParams.command
+											: undefined,
+									isCurrent: () =>
+										!signal?.aborted &&
+										this.runner.sessionId === sessionId &&
+										(context?.sessionManager?.getSessionId() ?? sessionId) === sessionId,
+									execution: nativeExecution,
+								}
+							: undefined,
 				});
 				approved = answer !== "deny";
 				if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
@@ -504,9 +543,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// trigger. `sdk.ts` wraps the whole tool registry with this class whenever
 			// a runner exists.
 			result = await this.runner.runScoped(() =>
-				withFileMutationSession(this.runner.sessionId, () =>
-					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
-				),
+				withFileMutationSession(this.runner.sessionId, () => {
+					const invoke = () => this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context);
+					return nativeExecution ? nativeExecution.run(invoke) : invoke();
+				}),
 			);
 		} catch (err) {
 			executionError = err instanceof Error ? err : new Error(String(err));
@@ -515,6 +555,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				details: undefined as TDetails,
 			};
 		}
+		if (nativeExecution) await nativeExecution.result(executionError ? "threw" : "returned");
 		if (!loopDispatchedToolCall) {
 			const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);
 			if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;

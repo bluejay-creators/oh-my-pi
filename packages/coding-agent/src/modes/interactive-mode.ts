@@ -202,6 +202,7 @@ import {
 	truncateToWidth,
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
+import { bindNativeApproval, nativeLedgerConfigured } from "../tools/approval-ledger";
 import { type CfgApproval, type CfgChangeRequest, setCfgApprovalHost } from "../internal-urls/cfg-protocol";
 import {
 	createTodoHudStateData,
@@ -430,7 +431,7 @@ import {
 	cfgTuiVimMode,
 	cfgTuiVimModeDisplay,
 } from "./settings";
-import { cfgTasksTodoClearDelay } from "../tools/settings";
+import { cfgDevAutoqaConsent, cfgDevAutoqaPushEndpoint, cfgTasksTodoClearDelay } from "../tools/settings";
 import { cfgWorktreeOnExit, cfgWorktreeOnStart } from "../task/settings";
 import { cfgExpandThinkingBlocks, cfgProseOnlyThinking } from "../session/settings";
 import { cfgHideThinkingBlock } from "../session/settings";
@@ -2411,7 +2412,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// `Settings.instance` is the disk-backed singleton; passing it explicitly
 		// guarantees the decision persists even when the prompt is triggered
 		// from a subagent whose own `Settings` is an in-memory snapshot.
-		setAutoQaConsentHandler(() => this.session.waitForUser(() => this.#promptAutoQaConsent()), Settings.instance);
+		setAutoQaConsentHandler(
+			owner => this.session.waitForUser(() => this.#promptAutoQaConsent(owner)),
+			Settings.instance,
+		);
 		// Same wiring for cfg:// writes: every settings change the agent makes is
 		// confirmed here, and `/save` persists to disk. Subagents and headless
 		// sessions are refused by the handler before reaching this host. Changes
@@ -7764,16 +7768,41 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * Invoked by the process-global consent handler the tool dispatches to;
 	 * subagent invocations bubble up here through the shared module state.
 	 */
-	async #promptAutoQaConsent(): Promise<boolean | null> {
+	async #promptAutoQaConsent(owner?: object): Promise<boolean | null> {
 		const pool = InteractiveMode.#AUTOQA_CONSENT_PROMPTS;
 		const [headline, body] = pool[Math.floor(Math.random() * pool.length)];
+		if (owner) {
+			const sessionId = this.sessionManager.getSessionId();
+			bindNativeApproval(owner, {
+				sessionId,
+				toolName: "report_issue.consent",
+				settings: this.session.settings,
+				getArguments: () => ({
+					setting: cfgDevAutoqaConsent.id,
+					previous: cfgDevAutoqaConsent.get(this.session.settings),
+					persistentPrevious: cfgDevAutoqaConsent.get(Settings.instance),
+					onYes: "granted",
+					onNo: "denied",
+					save: true,
+					endpoint: cfgDevAutoqaPushEndpoint.get(this.session.settings),
+					persistentEndpoint: cfgDevAutoqaPushEndpoint.get(Settings.instance),
+				}),
+				getCwd: () => this.sessionManager.getCwd(),
+				isCurrent: () => !this.#dialogLifetime.signal.aborted && this.sessionManager.getSessionId() === sessionId,
+			});
+		}
+		const scope = owner
+			? "\nYes saves dev.autoqaConsent=granted globally and enables automatic future reports to the configured Auto-QA collector. No saves denied. This is not approval for only one report."
+			: "";
 		const choice = await this.#extensionUiController.showApprovalSelector(
 			"consent",
-			`${headline}\n${body}`,
+			`${headline}\n${body}${scope}`,
 			["Yes", "No"],
 			"No",
+			{ signal: this.#dialogLifetime.signal },
+			owner ? { owner, onceChoice: "Yes" } : undefined,
 		);
-		return choice === "Yes";
+		return choice === undefined ? null : choice === "Yes";
 	}
 
 	/**
@@ -7814,6 +7843,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					timedOut = true;
 				},
 			},
+			nativeLedgerConfigured() ? { owner: request, onceChoice: CFG_APPROVE_ONCE } : undefined,
 		);
 		if (timedOut) return "timeout";
 		if (choice === CFG_APPROVE_SESSION) return "session";
