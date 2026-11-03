@@ -58,7 +58,6 @@ import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import { type RunStatus, setRunStatus } from "../../utils/run-status";
-import { setTerminalTitleState } from "../../utils/title-generator";
 import {
 	assistantMessageLinkTargets,
 	createAssistantMessageComponent,
@@ -2350,13 +2349,13 @@ export class EventController {
 		// its only flush site, so the automatic continuation would otherwise run
 		// on the old model/thinking level until the terminal settle.
 		if (event.isTerminal === false) {
-			// `awaitingAsyncWork`: the model handed control back and only a
-			// background-job result can resume it. The title tracks the model, so it
-			// goes idle now — before any await, so a wake landing mid-flush keeps the
-			// `working` its `agent_start` sets. The OSC 7501 record stays `working`:
-			// the run is not over, it resumes or settles without the user.
+			// Only background work can resume this pause: publish idle to both
+			// the title and OSC 7501, not done (there is no completed result yet).
+			// Do this before any await so a wake keeps its agent_start's working
+			// status and terminal progress.
 			if (event.awaitingAsyncWork === true) {
-				setTerminalTitleState("idle");
+				setRunStatus({ state: "idle" });
+				this.#setTerminalProgress(false);
 				this.#showAsyncWait(event);
 			}
 			void this.#finishWhenRunSettles(event);
