@@ -53,6 +53,7 @@ import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { launchTerminal } from "../../subprocess/terminal-launch";
 import { approvalAnswerForChoice, approvalChoiceLabels, approvalOnceLabel } from "../../tools/approval";
+import { nativeLedgerConfigured, prepareNativeApproval, type NativeApprovalLease } from "../../tools/approval-ledger";
 
 const MAX_WIDGET_LINES = 10;
 
@@ -668,17 +669,15 @@ export class ExtensionUiController {
 	/** Observe the actual native dialog without changing its policy, answers, or lifetime. */
 	async #observeApprovalPrompt(
 		details: Omit<ApprovalPromptSnapshot, "id" | "requestedAt" | "cwd"> & { sessionId?: string; cwd?: string },
-		show: () => Promise<string | undefined>,
+		show: (ledgerSignal?: AbortSignal) => Promise<string | undefined>,
 		isApproved: (choice: string) => boolean,
 		timedOut?: () => boolean,
+		ledger?: { owner: object; onceChoice: string; denyChoice: string; isCurrent: () => boolean },
 	): Promise<string | undefined> {
 		const runner = this.ctx.session.extensionRunner;
-		if (
-			!runner ||
-			(!runner.hasHandlers("approval_prompt_requested") && !runner.hasHandlers("approval_prompt_resolved"))
-		) {
-			return show();
-		}
+		const observed =
+			runner?.hasHandlers("approval_prompt_requested") || runner?.hasHandlers("approval_prompt_resolved");
+		if (!observed && (!ledger || !nativeLedgerConfigured())) return show();
 		const sessionId = details.sessionId || this.ctx.sessionManager.getSessionId();
 		const approval: ApprovalPromptSnapshot = Object.freeze({
 			id: crypto.randomUUID(),
@@ -693,15 +692,43 @@ export class ExtensionUiController {
 			commandCwd: details.commandCwd,
 			reason: details.reason,
 		});
-		await runner.emit({ type: "approval_prompt_requested", sessionId, approval });
+		let lease: NativeApprovalLease | undefined;
+		if (ledger) {
+			try {
+				lease = await prepareNativeApproval({
+					...ledger,
+					id: approval.id,
+					sessionId: this.ctx.sessionManager.getSessionId(),
+					settings: this.ctx.session.settings,
+					kind: details.kind,
+					prompt: details.prompt,
+					choices: details.choices,
+					reportUnavailable: message => this.ctx.showWarning(message),
+				});
+			} catch (error) {
+				this.ctx.showWarning(
+					`Native consent unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+				);
+			}
+		}
 		let choice: string | undefined;
 		try {
-			choice = await show();
+			await runner?.emit({ type: "approval_prompt_requested", sessionId, approval });
+			choice = await (lease ? lease.show(show) : show());
 		} catch (error) {
-			await runner.emit({ type: "approval_prompt_resolved", sessionId, approval, outcome: "unavailable" });
+			if (lease) {
+				try {
+					await lease.close("unavailable");
+				} catch (closeError) {
+					this.ctx.showWarning(
+						`Native consent closure failed: ${closeError instanceof Error ? closeError.message : "unknown error"}`,
+					);
+				}
+			}
+			await runner?.emit({ type: "approval_prompt_resolved", sessionId, approval, outcome: "unavailable" });
 			throw error;
 		}
-		const outcome: ApprovalPromptOutcome = timedOut?.()
+		let outcome: ApprovalPromptOutcome = timedOut?.()
 			? "timeout"
 			: choice === undefined
 				? "cancelled"
@@ -710,7 +737,27 @@ export class ExtensionUiController {
 					: isApproved(choice)
 						? "approved"
 						: "denied";
-		await runner.emit({
+		if (lease) {
+			try {
+				const recorded = await lease.close(outcome);
+				if (recorded === "denied" && outcome === "approved") {
+					choice = ledger?.denyChoice;
+					outcome = "denied";
+				} else if (recorded !== outcome) {
+					throw new Error("Native consent owner resolved differently");
+				}
+			} catch (error) {
+				if (lease.mode !== "shadow") {
+					await runner?.emit({ type: "approval_prompt_resolved", sessionId, approval, outcome: "unavailable" });
+					throw error;
+				}
+				this.ctx.showWarning(
+					`Shadow consent outcome remains unrecorded: ${error instanceof Error ? error.message : "unknown error"}`,
+				);
+			}
+		}
+		if (outcome !== "approved" && outcome !== "denied") choice = undefined;
+		await runner?.emit({
 			type: "approval_prompt_resolved",
 			sessionId,
 			approval,
@@ -727,13 +774,19 @@ export class ExtensionUiController {
 		options: string[],
 		denyChoice: string,
 		dialogOptions?: InteractiveSelectorDialogOptions,
+		ledger?: { owner: object; onceChoice: string },
 	): Promise<string | undefined> {
 		let timedOut = false;
 		return this.#observeApprovalPrompt(
 			{ kind, prompt: title, choices: options },
-			() =>
+			ledgerSignal =>
 				this.showCollabAwareSelector(title, options, {
 					...dialogOptions,
+					signal: ledgerSignal
+						? dialogOptions?.signal
+							? AbortSignal.any([dialogOptions.signal, ledgerSignal])
+							: ledgerSignal
+						: dialogOptions?.signal,
 					onTimeout: () => {
 						timedOut = true;
 						dialogOptions?.onTimeout?.();
@@ -741,6 +794,7 @@ export class ExtensionUiController {
 				}),
 			choice => choice !== denyChoice,
 			() => timedOut,
+			ledger ? { ...ledger, denyChoice, isCurrent: () => !timedOut && !dialogOptions?.signal?.aborted } : undefined,
 		);
 	}
 
@@ -826,69 +880,78 @@ export class ExtensionUiController {
 		});
 		const signal = dialogOptions?.signal ? AbortSignal.any([dialogOptions.signal, steered.signal]) : steered.signal;
 		let timedOut = false;
-		let answer: ExtensionApprovalAnswer | undefined;
 		try {
 			const choice = await this.#observeApprovalPrompt(
 				{ ...prompt.source, kind: "tool", prompt: prompt.full, choices },
-				() =>
-					this.#raceCollabDialog(request, signal, localSignal =>
-						this.#presentDialog(localSignal, settle => {
-							const editor = this.ctx.editor;
-							const dialog = new ApprovalDialogComponent(
-								prompt.compact,
-								{ onApprove: () => settle(onceLabel), onDeny: () => settle("Deny") },
-								{
-									tui: this.ctx.ui,
-									fullPrompt: prompt.full,
-									timeout: dialogOptions?.timeout,
-									onTimeout: () => {
-										timedOut = true;
-										dialogOptions?.onTimeout?.();
+				ledgerSignal =>
+					this.#raceCollabDialog(
+						request,
+						ledgerSignal ? AbortSignal.any([signal, ledgerSignal]) : signal,
+						localSignal =>
+							this.#presentDialog(localSignal, settle => {
+								const editor = this.ctx.editor;
+								const dialog = new ApprovalDialogComponent(
+									prompt.compact,
+									{ onApprove: () => settle(onceLabel), onDeny: () => settle("Deny") },
+									{
+										tui: this.ctx.ui,
+										fullPrompt: prompt.full,
+										timeout: dialogOptions?.timeout,
+										onTimeout: () => {
+											timedOut = true;
+											dialogOptions?.onTimeout?.();
+										},
+										onTimeoutStart: dialogOptions?.onTimeoutStart,
+										onTimeoutReset: dialogOptions?.onTimeoutReset,
+										...(sessionLabel
+											? { session: { label: sessionLabel, onApprove: () => settle(sessionLabel) } }
+											: {}),
+										...(prompt.grants?.length
+											? {
+													grants: prompt.grants,
+													onGrant: (grant, always) => settle(always ? grant.alwaysLabel : grant.label),
+												}
+											: {}),
+										draft: {
+											hasDraft: () =>
+												editor.getText().length > 0 ||
+												editor.pendingImages.length > 0 ||
+												editor.pasteInFlight,
+											handleInput: keyData => editor.handleDraftEdit(keyData),
+										},
 									},
-									onTimeoutStart: dialogOptions?.onTimeoutStart,
-									onTimeoutReset: dialogOptions?.onTimeoutReset,
-									...(sessionLabel
-										? { session: { label: sessionLabel, onApprove: () => settle(sessionLabel) } }
-										: {}),
-									...(prompt.grants?.length
-										? {
-												grants: prompt.grants,
-												onGrant: (grant, always) => settle(always ? grant.alwaysLabel : grant.label),
-											}
-										: {}),
-									draft: {
-										hasDraft: () =>
-											editor.getText().length > 0 || editor.pendingImages.length > 0 || editor.pasteInFlight,
-										handleInput: keyData => editor.handleDraftEdit(keyData),
-									},
-								},
-							);
-							this.ctx.editorContainer.clear();
-							this.ctx.editorContainer.addChild(dialog);
-							this.ctx.editorContainer.addChild(editor);
-							this.ctx.ui.setFocus(dialog);
-							// The dialog owns focus but forwards typing: keep the composer's cursor visible.
-							editor.focused = true;
-							// Its submissions steer this (main) session, even from a focused agent's view.
-							this.ctx.approvalOwnsComposer = true;
-							this.ctx.ui.requestRender();
-							return () => {
-								this.ctx.approvalOwnsComposer = false;
-								dialog.dispose();
+								);
 								this.ctx.editorContainer.clear();
+								this.ctx.editorContainer.addChild(dialog);
 								this.ctx.editorContainer.addChild(editor);
-								this.ctx.ui.setFocus(editor);
+								this.ctx.ui.setFocus(dialog);
+								// The dialog owns focus but forwards typing: keep the composer's cursor visible.
+								editor.focused = true;
+								// Its submissions steer this (main) session, even from a focused agent's view.
+								this.ctx.approvalOwnsComposer = true;
 								this.ctx.ui.requestRender();
-							};
-						}),
+								return () => {
+									this.ctx.approvalOwnsComposer = false;
+									dialog.dispose();
+									this.ctx.editorContainer.clear();
+									this.ctx.editorContainer.addChild(editor);
+									this.ctx.ui.setFocus(editor);
+									this.ctx.ui.requestRender();
+								};
+							}),
 					),
-				choice => {
-					answer = approvalAnswerForChoice(prompt, choice);
-					return answer !== "deny";
-				},
+				choice => approvalAnswerForChoice(prompt, choice) !== "deny",
 				() => timedOut,
+				nativeLedgerConfigured()
+					? {
+							owner: prompt,
+							onceChoice: onceLabel,
+							denyChoice: "Deny",
+							isCurrent: () => !timedOut && !signal.aborted,
+						}
+					: undefined,
 			);
-			return answer ?? approvalAnswerForChoice(prompt, choice);
+			return signal.aborted || timedOut ? "deny" : approvalAnswerForChoice(prompt, choice);
 		} finally {
 			unsubscribe();
 		}

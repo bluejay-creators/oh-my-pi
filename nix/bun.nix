@@ -129,6 +129,10 @@
     url = "https://registry.npmjs.org/@bufbuild/protobuf/-/protobuf-2.15.0.tgz";
     hash = "sha512-DAheWUkVr/SJTWCc+lg9dhY0eN4SaWlf4+bG1KzHeXbnqt0AfB/NX0Z+VunGlM1ki1B4zVvye27MpKh/svySUA==";
   };
+  "@cedar-policy/cedar-wasm@4.14.0" = fetchurl {
+    url = "https://registry.npmjs.org/@cedar-policy/cedar-wasm/-/cedar-wasm-4.14.0.tgz";
+    hash = "sha512-TPyz3zMl5r7W5iSHq51IgG+NTILGoXB0VPrEcXnzCEpPUqL/7b+AtMPVVHB/UoJWuXA8YORjLuWxKHUW33ePAA==";
+  };
   "@connectrpc/connect@2.2.0" = fetchurl {
     url = "https://registry.npmjs.org/@connectrpc/connect/-/connect-2.2.0.tgz";
     hash = "sha512-M63OQ1ZFcPUm85CuewJ9G9CMV8LjzGR9935xOnXNQGSazAbwMb3x2W7vXBYM1zqrP7XFD8uxp/dUAhirclgwnQ==";

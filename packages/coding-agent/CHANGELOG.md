@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added an opt-in Cedar 4.14.0 exact-action consent adapter for native tool, settings and consent dialogs. An explicitly configured, byte-pinned local ledger can settle only the original owner with a verified, current, one-use phone or separately delegated coordinator grant; shadow consent never becomes live authority through a mode flip, existing native denials remain authoritative, and permission is recorded separately from observed tool outcomes. No configuration, installation or activation happens automatically ([#4](https://github.com/bluejay-creators/oh-my-pi/pull/4) by [@bluejay-creators](https://github.com/bluejay-creators)).
 - Added native permission UI snapshot events with per-dialog identity, final display text and choices, and the actual selected choice or a distinct cancellation/timeout outcome; tool, settings, and consent UI paths share the capture boundary.
 - Added opt-in `taskFile` input (`task.file=true`) to dispatch subagent instructions from a UTF-8 file via an absolute path or `local://` URL, recording the submitted path and SHA-256 ([#17133](https://github.com/can1357/oh-my-pi/pull/17133) by [@iliaal](https://github.com/iliaal)).
 - Pin and unpin sessions from the resume picker with `Alt+K` / `Alt+Shift+K` (remappable as `app.session.pin` / `app.session.unpin`); pinned sessions move to the top at once and also lead search results ([#9837](https://github.com/can1357/oh-my-pi/pull/9837) by [@zhang17-24](https://github.com/zhang17-24))
@@ -25,6 +26,8 @@
 
 ### Fixed
 
+- Forwarded tool and eval-prelude abort signals to their actual permission dialogs, so cancellation closes the original owner and revokes an unused consent instead of leaving a stale approval target ([#4](https://github.com/bluejay-creators/oh-my-pi/pull/4) by [@bluejay-creators](https://github.com/bluejay-creators)).
+- Reject ledger-supplied consent if native or tool-resolution handlers change the bound context before execution; recheck the original inputs, effective settings, environment, cwd and pinned helper configuration at the final synchronous invocation or settings/preference boundary ([#4](https://github.com/bluejay-creators/oh-my-pi/pull/4) by [@bluejay-creators](https://github.com/bluejay-creators)).
 - Fixed cached approvals offering a directory grant that would not cover every target in the call ([#17309](https://github.com/can1357/oh-my-pi/pull/17309) by [@iliaal](https://github.com/iliaal)).
 - Fixed `pr://` metadata and diffs staying stale after successful `git push` calls through `bash` ([#17183](https://github.com/can1357/oh-my-pi/pull/17183) by [@alphastorm](https://github.com/alphastorm))
 - Fixed `read` rejecting artifact URLs from truncation hints when cached approvals or restricted folders are configured ([#17282](https://github.com/can1357/oh-my-pi/pull/17282) by [@iliaal](https://github.com/iliaal)).
