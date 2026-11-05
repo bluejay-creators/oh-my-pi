@@ -162,7 +162,7 @@ export const cfgBashPatterns = register({
 		group: "Bash",
 		label: "Bash Approval Patterns",
 		description:
-			"Ordered bash command approval rules. Each item has match and approval fields; only '*' wildcards are supported.",
+			"Ordered Bash approval rules. Match is a literal '*' glob or an argv-prefix object with optional optionsWithValue.",
 	},
 });
 

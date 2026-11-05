@@ -187,6 +187,57 @@ tools:
 
 `tools.approval` is a record keyed by tool name; dotted forms such as `tools.approval.eval` and `tools.approval.computer` identify entries in that record, not separate setting ids. Each entry sets that tool's default policy. For bash, you can add ordered command rules with `bash.patterns`; the first matching rule wins. Patterns support literal text plus `*` as a wildcard. Whitespace is the exception: before matching, every run of spaces, tabs, or newlines in both the pattern and the command collapses to a single space, and leading/trailing whitespace is trimmed. A newline in a pattern therefore matches any whitespace: `match: "*\n*"` behaves like `"* *"` and matches every command containing a space. A newline-specific rule is unnecessary to catch dangerous commands in a newline-separated list: `deny` and `prompt` rules check each segment (see below). `allow` rules reject unquoted newline command separators, but can approve commands containing quoted or escaped literal newlines when the full command matches.
 
+`match` can also be an argv-prefix object when argument boundaries matter:
+
+```yaml
+bash:
+  patterns:
+    - match:
+        argv: [gh, pr, merge]
+        optionsWithValue: [-R, --repo]
+      approval: deny
+```
+
+This denies `gh -R owner/repo pr merge 17`, but not `gh search prs pr merge`
+or `gh pr comment 17 --body "pr merge 17"`. The first `argv` word is a literal
+program name; each later word is a literal/glob for exactly **one** shell
+argument. Matching a prefix includes its trailing arguments. `*` never crosses
+an argv boundary. Quoting is removed by the existing shell tokenizer, and
+whitespace is normalized within each word as for string patterns.
+
+Only named `optionsWithValue` options may intervene between prefix words. They
+consume one value (`-R repo`, `--repo repo`) or an attached value (`-Rrepo`,
+`--repo=repo`). Unknown options and arbitrary positional words are not skipped.
+A literal `--` ends option skipping; missing option values do not match.
+Leading `time`/`time -p` and paths identifying the same executable as the
+literal program on `PATH` are recognized for object rules, including within
+tokenized compound segments. A different executable sharing only the basename
+does not match.
+
+Object rules support only `argv` and optional `optionsWithValue`; invalid or
+unsupported shapes abort approval instead of silently removing a restriction.
+String rules retain their existing semantics. Object rules still use the
+existing ordered approval and compound-command decision path.
+
+`omp config bash-check '<JSON request>'` returns a native dry decision without
+executing the command or loading/migrating settings. A request contains
+`command` and `patterns`, with optional `approvalMode` (`yolo`, `write`,
+`always-ask`, `always-ask-cached`), `userPolicies` and `allowCompoundCommands`. JSON output contains
+`interface: "bash-argv-v1"`, `policy`, `approvalMode`, optional `reason`,
+normalized `rules`, and zero-based `matches` for diagnostic rules that match
+individually. The effective policy still obeys ordered precedence. This allows
+installers to probe the **actual target executable**, not guess support from a
+version or an imported source checkout. Invalid requests/rules exit nonzero.
+An explicit matching `prompt` rule remains a prompt in every approval mode,
+including remote-fetch pipelines that the built-in classifier marks critical.
+
+Do not install object rules into an old runtime that ignores them. A successful
+probe of a new executable does not upgrade any already-running process:
+every session owning the old Bash tool must be upgraded/restarted separately
+before the new policy can be described as enforced. Configuration changes do
+not sandbox Eval, arbitrary subprocesses, or same-user software.
+
+
 By default, an `allow` rule must match the entire command and cannot approve a compound line. Set `bash.allowCompoundCommands: true` to also evaluate conservative chains of two or more literal commands joined only by `&&`:
 
 ```yaml

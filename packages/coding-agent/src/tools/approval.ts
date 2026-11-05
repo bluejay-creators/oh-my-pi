@@ -70,7 +70,7 @@ type ApprovalSubject = Pick<
 };
 
 /** Whether a runtime value names a supported approval mode. */
-function isApprovalMode(value: unknown): value is ApprovalMode {
+export function isApprovalMode(value: unknown): value is ApprovalMode {
 	return typeof value === "string" && APPROVAL_MODES.some(mode => mode === value);
 }
 
