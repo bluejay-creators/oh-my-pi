@@ -21,7 +21,10 @@ export async function loadMcpResourceContext(
 	if (session?.enableMCP === false || session?.restrictToolNames === true) {
 		return { manager: undefined, forSubagent };
 	}
-	if (session?.mcpManager) return { manager: session.mcpManager, forSubagent };
+	if (session) {
+		const manager = session.mcpManager ?? (!forSubagent ? await session.loadMcpManager?.() : undefined);
+		return { manager, forSubagent };
+	}
 	return { manager: forSubagent ? undefined : await MCPManager.load(), forSubagent };
 }
 

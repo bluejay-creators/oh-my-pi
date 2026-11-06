@@ -1244,6 +1244,9 @@ export class MCPCommandController {
 		config: MCPServerConfig,
 		authChallenge?: MCPAuthChallenge,
 	): Promise<OAuthEndpoints> {
+		if (config.type === "owner") {
+			throw new Error("This MCP transport is owned by its launcher; this session cannot reauthorize it.");
+		}
 		// Stdio servers manage credentials inside the child process; OMP's OAuth
 		// flow only applies to http/sse transports. Without this guard the
 		// unauthenticated preflight below spawns the child, which happily reuses

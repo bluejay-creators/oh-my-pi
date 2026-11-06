@@ -438,6 +438,8 @@ export interface ToolSession {
 	asyncJobManager?: AsyncJobManager;
 	/** MCP manager visible to subagents without relying on the process-global singleton. */
 	mcpManager?: MCPManager;
+	/** Explicit caller-owned lazy discovery, never a process-global fallback. */
+	loadMcpManager?: () => Promise<MCPManager | undefined>;
 	/** Local protocol root to propagate to nested subagents and eval-created agents. */
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Settings instance for passing to subagents */

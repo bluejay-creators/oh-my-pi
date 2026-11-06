@@ -6,6 +6,7 @@
 import * as path from "node:path";
 import * as url from "node:url";
 import { getProjectDir, logger, untilAborted, withTimeout } from "@oh-my-pi/pi-utils";
+import { createOwnerTransport } from "./owner-channel";
 import { describeMCPTimeout, isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "./timeout";
 import { createHttpTransport } from "./transports/http";
 import { LegacySseConnectionTimeoutError, createSseTransport } from "./transports/sse";
@@ -16,6 +17,7 @@ import type {
 	MCPHttpServerConfig,
 	MCPInitializeParams,
 	MCPInitializeResult,
+	MCPOwnerServerConfig,
 	MCPPrompt,
 	MCPPromptsListResult,
 	MCPRequestOptions,
@@ -74,6 +76,8 @@ async function createTransport(config: MCPServerConfig, signal?: AbortSignal): P
 	const serverType = config.type ?? "stdio";
 
 	switch (serverType) {
+		case "owner":
+			return createOwnerTransport(config as MCPOwnerServerConfig);
 		case "stdio":
 			return createStdioTransport(config as MCPStdioServerConfig);
 		case "http":
@@ -192,6 +196,7 @@ export async function connectToServer(
 				serverInfo: initResult.serverInfo,
 				capabilities: initResult.capabilities,
 				instructions: initResult.instructions,
+				protocolVersion: initResult.protocolVersion,
 			};
 		} catch (error) {
 			await transport.close();

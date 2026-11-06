@@ -43,6 +43,7 @@ import {
 } from "./cli/worker-selectors";
 import type * as JsProcessEntry from "./eval/js/process-entry";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
+import type * as McpOwnerChannel from "./mcp/owner-channel";
 import { startParentWatchdog } from "./subprocess/parent-watchdog";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -591,7 +592,15 @@ if (isProcessEntry || !Bun.isMainThread) {
 	// terminal lifetime; help/version/subcommand launches never start one. See #10930. The
 	// registration lives for the process — a one-shot entry exits right after runCli settles.
 	postmortem?.registerStdioDisconnectHandling();
-	const entry = runCli(process.argv.slice(2));
+	const entry = runCli(process.argv.slice(2)).finally(() => {
+		if (!isProcessEntry || typeof process.send !== "function") return;
+		// Command teardown, not per-server close: live roots may reconnect, but
+		// a completed one-shot command must not be pinned by its IPC listeners.
+		// The synchronous bridge preserves profile bootstrap and avoids loading
+		// MCP during ordinary CLI startup or worker-thread entry.
+		const ownerChannel: typeof McpOwnerChannel = require("./mcp/owner-channel");
+		ownerChannel.closeOwnerChannel();
+	});
 	postmortem?.reportUnsettledEntry(entry, () => runningCommand);
 	entry.catch(async error => {
 		// Failure boundary: inspector/postmortem is irrelevant to successful startup.

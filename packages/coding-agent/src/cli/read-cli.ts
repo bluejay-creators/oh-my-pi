@@ -14,7 +14,7 @@ import { releaseIdaDatabases } from "../ida";
 import { loadSkills } from "../extensibility/skills";
 import { closeDaemonClients } from "../launch/client";
 import { discoverAndLoadMCPTools } from "../mcp/loader";
-import { MCPManager } from "../mcp/manager";
+import type { MCPManager } from "../mcp/manager";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
 import type { AuthStorage } from "../session/auth-storage";
 import type { ToolSession } from "../tools";
@@ -58,6 +58,7 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 
 	let authStorage: AuthStorage | undefined;
 	let mcpManager: MCPManager | undefined;
+	let pendingMCPDiscovery: Promise<MCPManager> | undefined;
 	let failed = false;
 
 	try {
@@ -78,20 +79,21 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 
 		// MCP servers start only when a read reaches an MCP resource — `mcp://`, a scheme with no
 		// registered handler, or a skill:// URL no loaded skill owns — in any list entry.
-		MCPManager.setDeferredInstance(async () => {
-			authStorage ??= await discoverAuthStorage(undefined, { settings });
-			const result = await discoverAndLoadMCPTools(cwd, {
-				enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
-				filterExa: true,
-				// `omp read` has no Eval prelude, so browser MCP remains available.
-				filterBrowser: false,
-				cacheStorage: settings.getStorage(),
-				authStorage,
-			});
-			mcpManager = result.manager;
-			session.mcpManager = mcpManager;
-			return mcpManager;
-		});
+		session.loadMcpManager = () =>
+			(pendingMCPDiscovery ??= (async () => {
+				authStorage ??= await discoverAuthStorage(undefined, { settings });
+				const result = await discoverAndLoadMCPTools(cwd, {
+					enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
+					filterExa: true,
+					// `omp read` has no Eval prelude, so browser MCP remains available.
+					filterBrowser: false,
+					cacheStorage: settings.getStorage(),
+					authStorage,
+				});
+				mcpManager = result.manager;
+				session.mcpManager = mcpManager;
+				return mcpManager;
+			})());
 
 		// `read <image>?q=<question>` delegates to a vision model, and X URLs read
 		// through Grok's X tools; both need a model registry to resolve models and
@@ -127,10 +129,8 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 		process.stderr.write(`${chalk.red(renderError(err))}\n`);
 		failed = true;
 	} finally {
-		MCPManager.setDeferredInstance(undefined);
 		if (mcpManager) {
 			await mcpManager.disconnectAll();
-			if (MCPManager.instance() === mcpManager) MCPManager.setInstance(undefined);
 		}
 		authStorage?.close();
 		// Saves unsaved IDA changes and drops the host sockets that would keep the event loop alive.

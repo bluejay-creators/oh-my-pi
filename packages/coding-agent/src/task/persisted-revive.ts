@@ -7,7 +7,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { resolveAgentAdvisorRolePattern } from "../config/model-resolver";
 import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
-import { MCPManager } from "../mcp/manager";
+import type { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -46,6 +46,8 @@ export interface PersistedSubagentReviveContext {
 	settings: Settings;
 	/** LSP policy of the top-level session; revived subagents inherit it rather than defaulting on. */
 	enableLsp: boolean;
+	/** Manager owned by the actual root, never an unrelated process-global fallback. */
+	mcpManager?: MCPManager;
 	/**
 	 * Shared event bus feeding RPC/collab subagent subscriptions. Passed through
 	 * to the wake-turn monitor so an IRC send to a cold-revived subagent emits
@@ -195,7 +197,7 @@ export function createPersistedSubagentReviverFactory(
 			const restrictToolNames = init.restrictToolNames === true;
 			// The spawn's result contract: a session persisted without `yield` returned its final message.
 			const structured = revivedToolNames.includes("yield");
-			const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
+			const mcpManager = restrictToolNames ? undefined : ctx.mcpManager;
 			// Subscribe before minting proxies so a manager change during startup is replayed on bind.
 			const mcpFollower = mcpManager ? followMCPTools(mcpManager) : undefined;
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];

@@ -206,6 +206,7 @@ interface ReviveOwnerOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	mcpManager?: MCPManager;
 }
 
 function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptions = {}) {
@@ -233,6 +234,7 @@ function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptio
 	} as unknown as AgentSession;
 	return createPersistedSubagentReviverFactory({
 		session: parentSession,
+		mcpManager: owner.mcpManager,
 		authStorage: owner.authStorage ?? ({} as never),
 		modelRegistry: owner.modelRegistry ?? ({ authStorage: {} } as ModelRegistry),
 		settings: owner.settings ?? Settings.isolated(),
@@ -522,7 +524,7 @@ describe("persisted subagent revival", () => {
 		});
 
 		const ref = createRef(sessionFile);
-		const reviver = await createFactory(cwd)(ref);
+		const reviver = await createFactory(cwd, undefined, { mcpManager: hostileMcp })(ref);
 		if (!reviver) throw new Error("Expected a persisted reviver");
 		await reviver(ref);
 
@@ -531,6 +533,25 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.mcpManager).toBe(hostileMcp);
 		expect(capturedOptions?.mcpTools?.map(tool => tool.name)).toEqual(["mcp__server_read"]);
 		expect(capturedOptions?.customTools).toBeUndefined();
+	});
+
+	it("does not borrow another root's global MCP manager when the revival owner has none", async () => {
+		const cwd = makeTempDir("@pi-ownerless-revive-");
+		const sessionFile = await createPersistedSession(cwd);
+		const getTools = vi.fn(() => [{ name: "mcp__protected_read", label: "protected/read" }]);
+		MCPManager.setInstance(fakeMcpManager(getTools));
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+		expect(getTools).not.toHaveBeenCalled();
+		expect(capturedOptions?.mcpManager).toBeUndefined();
+		expect(capturedOptions?.mcpTools).toBeUndefined();
 	});
 
 	it("leaves isolated sessions transcript-only even when the workspace still exists", async () => {

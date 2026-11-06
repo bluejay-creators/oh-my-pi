@@ -903,6 +903,10 @@ export class MCPManager {
 					// Re-establish connection if the transport closes (server restart,
 					// network interruption).
 					connection.transport.onClose = () => {
+						if (connection.transport.isAdmitted?.() === false) {
+							void this.disconnectServer(name);
+							return;
+						}
 						logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
 						this.#emitConnectionStatus({ type: "reconnecting", serverName: name });
 						void this.reconnectServer(name);
@@ -948,7 +952,7 @@ export class MCPManager {
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
 					await this.#notifyOwnerToolsChanged();
-					void this.toolCache?.set(name, config, serverTools);
+					if (config.type !== "owner") void this.toolCache?.set(name, config, serverTools);
 
 					notify({ type: "connected", serverName: name });
 					void this.#loadServerResourcesAndPrompts(name, connection);
@@ -1003,6 +1007,7 @@ export class MCPManager {
 			if (pendingTasks.length > 0 && this.toolCache) {
 				await Promise.all(
 					pendingTasks.map(async task => {
+						if (task.config.type === "owner") return;
 						const cached = await this.toolCache?.get(task.name, task.config);
 						if (cached) {
 							cachedTools.set(task.name, cached);
@@ -1411,9 +1416,8 @@ export class MCPManager {
 		}
 		this.#subscribedResources.delete(name);
 
-		if (connection) {
-			await this.#discardConnection(name, connection);
-		}
+		// Remove revoked capabilities before awaiting transport teardown.
+		if (connection) this.#detachConnection(name, connection);
 
 		// Remove tools from this server and notify consumers
 		const hadTools = this.#tools.some(t => t.mcpServerName === name);
@@ -1425,6 +1429,7 @@ export class MCPManager {
 
 		// Notify prompt consumers so stale commands are cleared
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
+		if (connection) await disconnectServer(connection);
 	}
 
 	/**
@@ -1601,6 +1606,9 @@ export class MCPManager {
 		let config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
 		if (!config) return null;
+		// A protected reference cannot be replaced by a broader local OAuth
+		// handler, even while reconnect/auth work was queued before revocation.
+		if (config.type === "owner" && authChallenge) return null;
 
 		if (authChallenge) {
 			if (!this.#authHandler) {
@@ -1738,6 +1746,10 @@ export class MCPManager {
 			};
 		}
 		connection.transport.onClose = () => {
+			if (connection.transport.isAdmitted?.() === false) {
+				void this.disconnectServer(name);
+				return;
+			}
 			logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
 			this.#emitConnectionStatus({ type: "reconnecting", serverName: name });
 			void this.reconnectServer(name);
@@ -1746,7 +1758,7 @@ export class MCPManager {
 			const serverTools = await listTools(connection);
 			const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) => this.reconnectServer(name, options);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
-			void this.toolCache?.set(name, config, serverTools);
+			if (config.type !== "owner") void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#notifyOwnerToolsChanged().catch(error => logger.debug("MCP tools-changed handler failed", { error }));
 			void this.#loadServerResourcesAndPrompts(name, connection);
@@ -1834,7 +1846,7 @@ export class MCPManager {
 		const serverTools = await listTools(connection);
 		const reconnect = () => this.reconnectServer(name);
 		const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
-		void this.toolCache?.set(name, connection.config, serverTools);
+		if (connection.config.type !== "owner") void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);
@@ -2058,6 +2070,9 @@ export class MCPManager {
 		config: MCPServerConfig,
 		opts?: { forceRefresh?: boolean; oauth?: boolean; signal?: AbortSignal },
 	): Promise<MCPServerConfig> {
+		// An owner reference never consults local auth, refreshes credentials or
+		// evaluates config commands: only its private channel owns that authority.
+		if (config.type === "owner") return config;
 		const signal = opts?.signal;
 		let resolved: MCPServerConfig = { ...config };
 

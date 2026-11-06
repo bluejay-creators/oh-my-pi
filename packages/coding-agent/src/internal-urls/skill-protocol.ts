@@ -193,7 +193,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			if (
 				error instanceof UnknownSkillError &&
 				!options?.localOnly &&
-				(context?.session?.mcpManager || MCPManager.available())
+				(context?.session ? context.session.mcpManager || context.session.loadMcpManager : MCPManager.available())
 			)
 				return null;
 			throw error;

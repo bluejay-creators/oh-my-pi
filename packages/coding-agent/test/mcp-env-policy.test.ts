@@ -6,8 +6,8 @@ import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { MCPServerConfig, MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 
 function expectStdio(config: MCPServerConfig): MCPStdioServerConfig {
-	if (config.type === "http" || config.type === "sse") throw new Error("expected a stdio config");
-	return config;
+	if (config.type === "stdio" || config.type === undefined) return config;
+	throw new Error("expected a stdio config");
 }
 
 describe("stdio env value resolution policy", () => {

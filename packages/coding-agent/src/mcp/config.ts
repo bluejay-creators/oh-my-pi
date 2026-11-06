@@ -10,6 +10,7 @@ import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { readMCPConfigFile } from "./config-writer";
+import { getOwnerConfigs } from "./owner-channel";
 import type { MCPConfigFile, MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */
@@ -179,6 +180,10 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		configs = browserResult.configs;
 		sources = browserResult.sources;
 	}
+
+	// The launch channel contributes inert references after ordinary discovery.
+	// It never publishes the protected command, endpoint or authentication.
+	Object.assign(configs, await getOwnerConfigs(options?.forSubagent));
 
 	return { configs, exaApiKeys, sources };
 }
@@ -363,6 +368,13 @@ export function validateServerConfig(name: string, config: MCPServerConfig): str
 		const httpConfig = config as { url?: string };
 		if (!httpConfig.url) {
 			errors.push(`Server "${name}": ${serverType} server requires "url" field`);
+		}
+	} else if (serverType === "owner") {
+		if (!("server" in config) || typeof config.server !== "string" || !config.server) {
+			errors.push(`Server "${name}": owner server requires an inert server reference`);
+		}
+		if (hasCommand || hasUrl || config.auth || config.oauth) {
+			errors.push(`Server "${name}": owner references cannot contain transport authority`);
 		}
 	} else {
 		errors.push(`Server "${name}": unknown server type "${serverType}"`);

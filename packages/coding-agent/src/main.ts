@@ -2499,6 +2499,7 @@ export async function runRootCommand(
 			AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
 				createPersistedSubagentReviverFactory({
 					session,
+					mcpManager,
 					authStorage,
 					modelRegistry,
 					settings: settingsInstance,

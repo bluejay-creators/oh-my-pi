@@ -146,6 +146,119 @@ Only boolean values are accepted. A malformed value (for example, `"false"` or `
 
 This controls standard MCP tool and resource inheritance, not process isolation, arbitrary code execution, or explicitly parent-created custom forwarding tools. Task's `tools` argument selects extra Eval tools; it is not an MCP exclusion list.
 
+### Native owning host
+
+`omp mcp-owning-host` retains protected transport configuration in one native
+process and starts **exactly two independent native CLI roots**. Family names are
+caller-selected labels, not authority supplied by a root: each root's admission
+is bound to its own `Bun.spawn` IPC callback. The roots are ordinary independent
+processes, not Task children or sessions multiplexed in a shared manager.
+
+Keep the host's stdin open for its entire lifetime. Its first line is a JSON
+manifest with exactly `servers` and `roots`; subsequent lines are control frames.
+For example, this manifest launches two independently controllable RPC roots:
+
+```json
+{"servers":{"protected-example":{"type":"http","url":"https://example.invalid/mcp","headers":{"Authorization":"Bearer host-only-example-token"},"inheritInSubagents":false}},"roots":{"root-alpha":{"args":["--mode","rpc","--no-session"],"cwd":"/absolute/project-alpha"},"root-beta":{"args":["--mode","rpc","--no-session"],"cwd":"/absolute/project-beta"}}}
+```
+
+Launch the installed command as `omp mcp-owning-host`; source checkouts can use
+`bun packages/coding-agent/src/cli.ts mcp-owning-host`. A controller must write the
+manifest and retain stdin, rather than pipe a manifest and immediately reach EOF.
+The host uses the existing native CLI reentry mechanism (compiled executable, or
+Bun plus the CLI entrypoint) for both roots. It does not spawn a fixture-only
+entrypoint or deliver protected config through argv, environment, or root stdin.
+When an actual native root command completes, its process-entry teardown releases
+the owner channel and listeners so one-shot commands exit naturally while the
+controller keeps stdin open. Per-server close does not end the channel: a live
+root can reconnect until its command lifetime ends or the host revokes admission.
+
+The entire manifest is validated before either process starts. Root names must
+be distinct object keys, using 1–100 letters, digits, `_`, `-`, or `.` with an
+alphanumeric first character. Exactly two entries are required; each root has
+`args: string[]` and optional `cwd: string`. Server names use the same format.
+Protected servers accept raw `stdio` (the default), `http`, or `sse` configs with
+their transport fields and shared policy fields. Unknown fields, `owner`
+configs, invalid policy types, and malformed arguments are rejected. Managed
+`auth`/`oauth` references are intentionally unsupported here: supply ready-to-use
+transport authority directly; this command does not resolve auth storage.
+
+Root stdin, stdout, and stderr are separate pipes. Send literal stdin bytes as
+JSON strings (include `\n` when sending a complete RPC command):
+
+```json
+{"root":"root-alpha","input":"{\"id\":\"state-1\",\"type\":\"get_state\"}\n"}
+{"revoke":"root-alpha"}
+{"root":"root-beta","end":true}
+{"close":true}
+```
+
+`end` revokes that root before closing its stdin. `revoke` removes protected MCP
+authority but leaves the root process available for non-MCP work. Revocation is
+terminal for that channel: queued and later operations cannot reconnect or return
+successful in-flight results. `close`, host stdin EOF, malformed control input,
+SIGINT, or SIGTERM closes protected connections and terminates both roots.
+A root's IPC disconnect or exit revokes its own authority without revoking the
+other root. An unexpected protected connection close/error, or failed initial
+connection, also terminally revokes that root's entire family of protected servers.
+There is no transparent reconnect after such a loss: launch a new host/root
+channel to regain admission. A normal per-server consumer `close` instead releases
+that connection and permits a fresh connection while the root remains admitted.
+Controllers must retain control-channel ownership until shutdown.
+
+Host stdout is JSONL only:
+
+- `{"event":"started","root":"root-alpha","pid":123}` announces each native PID.
+- `{"event":"output","root":"root-alpha","stream":"stdout","data":"..."}` forwards
+  decoded UTF-8 chunks, not necessarily complete lines; `stream` can be `stderr`.
+  Concatenate each root/stream independently before parsing its RPC output.
+- `{"event":"revoked","root":"root-alpha"}` acknowledges an explicit revoke/end.
+- `{"event":"exit","root":"root-alpha","code":0}` reports root exit.
+- `{"event":"error","error":"..."}` reports a rejected launch/control operation
+  without echoing protected configuration or raw transport errors.
+
+The internal root channel uses `ompMcpOwner: 1`. Roots send strictly increasing,
+positive safe-integer IDs with `catalog`, `request`, `notify`, or per-server
+`close` operations. Replayed/out-of-order IDs revoke the channel. Catalogs contain
+only `{type:"owner",server,...policy}` references: no commands, environment,
+URLs, headers, or auth metadata. The host lazily initializes one real protected
+connection per root/server, returns its initialization metadata, and forwards
+generic MCP requests and notifications. Each dispatch and awaited result checks
+live admission. Unsolicited `revoke` invalidates the consumer catalog and pending
+requests; unsolicited server notifications remain scoped to their root.
+Standard server-to-client `ping` and `roots/list` requests are handled in the
+host, with `roots/list` bound to that root's resolved launch `cwd`, not the host's
+own working directory. Other server-to-client methods are rejected with `-32601`;
+the owner protocol does not add generic reverse-request forwarding.
+`inheritInSubagents: false` remains effective through consumer discovery and
+live Task-manager policy; separate native roots are not Task subagents.
+
+For synthetic process harnesses, `launchOwningHost(manifest, rootCommand?)` in
+`src/mcp/owning-host.ts` exposes the same mechanism. It returns a promise for
+`{roots, revoke, close, exited}`; `roots` is a read-only map of named subprocesses
+with caller-owned stdin/stdout/stderr pipes. `rootCommand` replaces only the native
+CLI command prefix, not admission or transport handling. Call `close()` on every
+exit path; the embedding caller, unlike the CLI wrapper, owns parent-input lifetime
+and output draining.
+
+**Deployment and threat assumptions:** remove all duplicate raw protected server
+entries and independently available credentials from ordinary user/project/tool
+configs, plugins, and root environments **before** using this as protection.
+The host cannot protect authority that a root can independently obtain elsewhere.
+Roots receive only a small runtime environment allowlist, not the host's
+credential-bearing environment or the manifest's server environment. Their normal
+home directories and independent CLI config discovery still exist; deployment
+must account for those sources. This command performs no credential migration.
+
+The threat addressed is an ordinary independent config-copy root with no admitted
+owner channel. IPC admission is not an OS sandbox: it does not defend against
+same-UID debuggers, process-memory inspection, hostile OS code, readable host
+manifest files, independently obtainable credentials, or an admitted root
+deliberately forwarding its capability/results. MCP responses, server metadata,
+notifications, and root output are authorized payloads, not a secret-redaction
+channel. Keep protected configs and the host's control input out of root-readable
+storage and logging.
+
 ### `stdio` transport
 
 Direct runtime configs and the config writer default to `stdio` when `type` is omitted. Discovery infers `http` for a URL-only entry and `stdio` for a command entry; use an explicit `type` for portable, schema-valid configuration.

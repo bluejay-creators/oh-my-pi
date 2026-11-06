@@ -176,6 +176,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.modelsHelp,
 	},
 	{
+		name: "mcp-owning-host",
+		load: () => import("./commands/mcp-owning-host").then(m => m.default),
+		help: { description: "Launch two native roots with host-owned protected MCP transports" },
+	},
+	{
 		name: "plugin",
 		load: () => import("./commands/plugin").then(m => m.default),
 		aliases: ["plugins"],

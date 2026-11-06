@@ -144,7 +144,13 @@ export interface MCPSseServerConfig extends MCPServerConfigBase {
 	headerPolicy?: "origin-locked";
 }
 
-export type MCPServerConfig = MCPStdioServerConfig | MCPHttpServerConfig | MCPSseServerConfig;
+/** Inert reference: only an inherited owning-host channel can materialize it. */
+export interface MCPOwnerServerConfig extends MCPServerConfigBase {
+	type: "owner";
+	server: string;
+}
+
+export type MCPServerConfig = MCPStdioServerConfig | MCPHttpServerConfig | MCPSseServerConfig | MCPOwnerServerConfig;
 
 export const MCP_CONFIG_SCHEMA_URL =
 	"https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json";
@@ -319,6 +325,9 @@ export interface MCPTransport {
 	/** Whether the transport is connected */
 	readonly connected: boolean;
 
+	/** Live owning-host admission, distinct from recoverable transport connectivity. */
+	isAdmitted?(): boolean;
+
 	/** Event handlers */
 	onClose?: () => void;
 	onError?: (error: Error) => void;
@@ -346,6 +355,8 @@ export interface MCPServerConnection {
 	serverInfo: MCPImplementation;
 	/** Server capabilities */
 	capabilities: MCPServerCapabilities;
+	/** Version negotiated by the owning transport's initialize handshake. */
+	protocolVersion?: string;
 	/** Cached tools (populated on demand) */
 	tools?: MCPToolDefinition[];
 	/** Source metadata (for display) */

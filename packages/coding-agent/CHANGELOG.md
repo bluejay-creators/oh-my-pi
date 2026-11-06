@@ -4,11 +4,13 @@
 
 ### Added
 
+- Launch two independent roots through `omp mcp-owning-host` with private, revocable MCP transport admission; protected server authority stays in the launcher rather than ordinary root configuration.
 - An explicitly registered trusted in-process controller can approve one pending tool request using immutable effective arguments, session directory, and a native request identity/fingerprint. Missing, multiple, invalid, stale, or unavailable controllers retain human approval; lifecycle listeners remain observers and provider safety checks cannot be bypassed.
 - Extensions can observe payload-free `native_prompt_requested` / `native_prompt_resolved` events and reconcile frozen pending snapshots, with native identities/timestamps across tool/provider approvals, awaited UI, explicitly owned settings/selector/hub/Git input lifetimes, RPC and ACP permission waits. Observation never answers prompts or changes approval grants.
 
 ### Fixed
 
+- Completed one-shot native commands release their owning-host IPC channel instead of remaining alive after producing their result.
 - Cancelling native tool approval now cancels the actual approve/select dialog and pending approval observers. Cancelled calls cannot execute after resolution observers, and late observer UI cannot reopen the aborted approval.
 - Added per-server `inheritInSubagents: false` to keep an MCP server available to the parent without exposing its tools or resources to Task children.
 
