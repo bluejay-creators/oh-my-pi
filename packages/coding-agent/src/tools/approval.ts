@@ -424,11 +424,15 @@ export async function requestApproval(
 	args: unknown,
 	reason?: string,
 	appendix: readonly string[] = [],
+	signal?: AbortSignal,
 ): Promise<boolean> {
+	signal?.throwIfAborted();
 	const full = [formatApprovalPrompt(tool, args, reason), ...appendix].join("\n");
 	if (ui.approve) {
 		const compact = [formatApprovalPrompt(tool, args, reason, { compact: true }), ...appendix].join("\n");
-		return (await ui.approve({ full, compact })) === true;
+		signal?.throwIfAborted();
+		return (signal ? await ui.approve({ full, compact }, { signal }) : await ui.approve({ full, compact })) === true;
 	}
-	return (await ui.select(full, ["Approve", "Deny"])) === "Approve";
+	signal?.throwIfAborted();
+	return (signal ? await ui.select(full, ["Approve", "Deny"], { signal }) : await ui.select(full, ["Approve", "Deny"])) === "Approve";
 }

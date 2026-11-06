@@ -13,7 +13,14 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
-import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type {
+	ExtensionFactory,
+	NativePromptRequest,
+	NativePromptResolvedEvent,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type {
@@ -25,6 +32,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 // ---------------------------------------------------------------------------
@@ -89,6 +97,7 @@ async function createSession(
 		xdev?: XdevState;
 		builtInToolNames?: string[];
 		persist?: boolean;
+		extensionFactory?: ExtensionFactory;
 	},
 ): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -113,6 +122,16 @@ async function createSession(
 
 	const toolRegistry = options?.xdev?.tools ?? new Map<string, AgentTool>();
 	for (const tool of tools) toolRegistry.set(tool.name, tool);
+	let extensionRunner: ExtensionRunner | undefined;
+	if (options?.extensionFactory) {
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			options.extensionFactory, tempDir.path(), new EventBus(), runtime,
+		);
+		extensionRunner = new ExtensionRunner(
+			[extension], runtime, tempDir.path(), sessionManager, {} as ModelRegistry,
+		);
+	}
 	const sess = new AgentSession({
 		agent,
 		sessionManager,
@@ -120,6 +139,7 @@ async function createSession(
 		modelRegistry: {} as never,
 		toolRegistry,
 		xdev: options?.xdev,
+		extensionRunner,
 		builtInToolNames: options?.builtInToolNames,
 	});
 
@@ -225,6 +245,7 @@ it("explicit yolo still gates tools whose per-tool policy requires a prompt", as
 function noUiRunner(): ExtensionRunner {
 	return {
 		hasHandlers: () => false,
+		hasApprovalDecider: () => false,
 		consumeToolCallEmitted: () => false,
 		hasUI: () => false,
 		sessionId: "acp-permission-test",
@@ -791,6 +812,63 @@ it("aborting an open permission request rejects without executing the tool", asy
 	expect(bashTool.executeCalls).toBe(0);
 	pending.resolve({ outcome: "cancelled" });
 });
+
+for (const outcome of ["complete", "cancel"] as const) {
+	it(`observes the actual ACP permission ${outcome} await without granting or exposing payloads`, async () => {
+		const bashTool = makeFakeTool("bash");
+		const pending = Promise.withResolvers<ClientBridgePermissionOutcome>();
+		const entered = Promise.withResolvers<NativePromptRequest>();
+		const completed = Promise.withResolvers<NativePromptResolvedEvent>();
+		const requests: NativePromptRequest[] = [];
+		let decisions = 0;
+		const bridge: ClientBridge = {
+			capabilities: { requestPermission: true },
+			requestPermission: async () => pending.promise,
+		};
+		session = await createSession([bashTool], bridge, {}, {
+			extensionFactory: pi => {
+				pi.registerApprovalDecider(() => { decisions++; return { decision: "pass" }; });
+				pi.on("native_prompt_requested", event => {
+					requests.push(event.request);
+					entered.resolve(event.request);
+				});
+				pi.on("native_prompt_resolved", event => { completed.resolve(event); });
+			},
+		});
+		await session.setActiveToolsByName(["bash"]);
+		const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash")!;
+		const controller = new AbortController();
+		const started = Date.now();
+		const execution = wrappedBash.execute(
+			"native-acp", { command: "secret-command-payload" }, controller.signal, undefined as never, undefined as never,
+		);
+		const result = execution.then(() => undefined, (error: unknown) => error);
+		const request = await entered.promise;
+		expect(request).toMatchObject({
+			kind: "tool-approval", toolCallId: "native-acp", toolName: "bash",
+		});
+		expect(request.requestedAt).toBeGreaterThanOrEqual(started);
+		expect(request.requestedAt).toBeLessThanOrEqual(Date.now());
+		expect(bashTool.executeCalls).toBe(0);
+		if (outcome === "cancel") controller.abort();
+		else pending.resolve({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+		const failure = await result;
+		if (outcome === "cancel") {
+			expect(failure).toMatchObject({ message: expect.stringContaining("Permission request cancelled") });
+		} else {
+			expect(failure).toBeUndefined();
+		}
+		const resolution = await completed.promise;
+		expect(resolution).toMatchObject({
+			requestId: request.requestId, outcome: outcome === "cancel" ? "cancelled" : "completed",
+		});
+		expect(JSON.stringify([request, resolution])).not.toContain("secret-");
+		expect(requests).toHaveLength(1);
+		expect(decisions).toBe(0);
+		expect(bashTool.executeCalls).toBe(outcome === "cancel" ? 0 : 1);
+		pending.resolve({ outcome: "cancelled" });
+	});
+}
 
 // ---------------------------------------------------------------------------
 // 2. Reject once: throws, underlying execute never called

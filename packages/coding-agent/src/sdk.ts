@@ -4242,7 +4242,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		};
 
 		const setToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean) => {
-			toolContextStore.setUIContext(uiContext, hasUI);
+			// Tool UI may differ from the runner's extension UI (notably headless RPC).
+			const observedUIContext = hasUI ? extensionRunner.observeUIContext(uiContext) : uiContext;
+			toolContextStore.setUIContext(observedUIContext, hasUI);
 		};
 
 		const initialTools = initialToolNames

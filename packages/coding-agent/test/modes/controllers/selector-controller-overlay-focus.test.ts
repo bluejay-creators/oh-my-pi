@@ -5,6 +5,9 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Text } from "@oh-my-pi/pi-tui";
 
 beforeAll(async () => {
@@ -137,7 +140,10 @@ describe("SelectorController session replacement overlay", () => {
 		let selector: SessionSelectorComponent | undefined;
 		const editor = { id: "editor" };
 		const editorContainer = createEditorSlot(editor);
+		const manager = SessionManager.inMemory();
+		const runner = new ExtensionRunner([], new ExtensionRuntime(), manager.getCwd(), manager, {} as ModelRegistry);
 		const ctx = {
+			session: { extensionRunner: runner },
 			editor,
 			editorContainer,
 			sessionManager: {
@@ -166,11 +172,14 @@ describe("SelectorController session replacement overlay", () => {
 		});
 		await controller.showSessionSelector();
 		expect(selector).toBeDefined();
+		expect(runner.getPendingNativePrompts()).toHaveLength(1);
 		selector!.handleInput("\n");
 		await resumeStarted.promise;
 
 		expect(handleResume).toHaveBeenCalledWith(session.path);
 		expect(hide).not.toHaveBeenCalled();
+		// The response has settled; transcript loading is not another pending prompt.
+		expect(runner.getPendingNativePrompts()).toEqual([]);
 
 		// The selector remains mounted until resume finishes, but it must not accept
 		// a second selection or cancel the overlay during that interval.

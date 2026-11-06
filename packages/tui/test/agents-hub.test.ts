@@ -8,7 +8,13 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { TspPickerProps } from "@oh-my-pi/pi-wire";
-import { AgentsHubComponent, type HubAgent, parseGeneratedAgentSpec } from "../src/overlays/agents-hub";
+import {
+	AgentsHubComponent,
+	type AgentsHubCallbacks,
+	type AgentsHubDeps,
+	type HubAgent,
+	parseGeneratedAgentSpec,
+} from "../src/overlays/agents-hub";
 import { initTheme } from "../src/theme";
 import type { TUI } from "../src/index";
 import type { DescribeContext, NativeChild, NativeNode } from "../src/native/node";
@@ -58,7 +64,11 @@ const sonnet = buildModel({
 	maxTokens: 8192,
 });
 
-async function createHub(settings: TestSettings): Promise<{
+async function createHub(
+	settings: TestSettings,
+	callbacks: Pick<AgentsHubCallbacks, "onPromptChange"> = {},
+	deps: Partial<AgentsHubDeps> = {},
+): Promise<{
 	hub: AgentsHubComponent;
 	strip: () => string;
 	type: (text: string) => void;
@@ -120,8 +130,9 @@ async function createHub(settings: TestSettings): Promise<{
 			saveAgent: async () => {
 				throw new Error("Agent creation is not used by configuration tests");
 			},
+			...deps,
 		},
-		{ onCancel: () => (cancelled = true) },
+		{ ...callbacks, onCancel: () => (cancelled = true) },
 	);
 	return {
 		hub,
@@ -175,6 +186,122 @@ describe("AgentsHub layout", () => {
 		expect(rendered).toContain("dev");
 		hub.handleInput("\x1b");
 		expect(cancelled()).toBe(true);
+	});
+});
+
+describe("AgentsHub prompt observation", () => {
+	test("reports actual choice/input stages and ends before persisting a pattern, not on passive hub presence", async () => {
+		const settings = new TestSettings();
+		const events: Array<"input" | "select" | "confirm" | undefined> = [];
+		const { hub, type } = await createHub(settings, { onPromptChange: kind => events.push(kind) }, {
+			setAgentOverride: (property, name, value) => {
+				expect(events.at(-1)).toBeUndefined();
+				settings.setEntry(OVERRIDE_KEYS[property], name, value);
+			},
+		});
+		expect(events).toEqual([]);
+		hub.handleNativeEvent({ type: "action", key: "", act: "model", mods: [] });
+		expect(events).toEqual(["select"]);
+		hub.handleNativeEvent({ type: "action", key: "", act: "strip", value: "1", mods: [] });
+		expect(events).toEqual(["select", "input"]);
+		type("private/model:high");
+		hub.handleInput("\r");
+		expect(events).toEqual(["select", "input", undefined]);
+		expect(settings.records.get(OVERRIDE_KEYS.model)).toEqual({ dev: "private/model:high" });
+		hub.dispose();
+		hub.dispose();
+		expect(events).toHaveLength(3);
+	});
+
+	test("reports pattern cancellation back to choices, model-browser submission, and disposal exactly once", async () => {
+		const events: Array<"input" | "select" | "confirm" | undefined> = [];
+		const { hub } = await createHub(new TestSettings(), { onPromptChange: kind => events.push(kind) });
+		hub.handleNativeEvent({ type: "action", key: "", act: "model", mods: [] });
+		hub.handleNativeEvent({ type: "action", key: "", act: "strip", value: "1", mods: [] });
+		hub.handleInput("\x1b");
+		expect(events).toEqual(["select", "input", "select"]);
+		hub.handleInput("\r");
+		expect(events).toEqual(["select", "input", "select", undefined, "select"]);
+		hub.handleInput("\r");
+		expect(events.at(-1)).toBeUndefined();
+		hub.handleNativeEvent({ type: "action", key: "", act: "model", mods: [] });
+		hub.handleNativeEvent({ type: "action", key: "", act: "strip", value: "1", mods: [] });
+		expect(events.at(-1)).toBe("input");
+		hub.dispose();
+		expect(events.at(-1)).toBeUndefined();
+		const count = events.length;
+		hub.dispose();
+		expect(events).toHaveLength(count);
+	});
+
+	test("ends editor input before generation and review before saving, without observing backend duration", async () => {
+		const events: Array<"input" | "select" | "confirm" | undefined> = [];
+		const generation = Promise.withResolvers<string>();
+		const save = Promise.withResolvers<string>();
+		const { hub, type } = await createHub(new TestSettings(), { onPromptChange: kind => events.push(kind) }, {
+			generateAgent: async () => {
+				expect(events.at(-1)).toBeUndefined();
+				return generation.promise;
+			},
+			saveAgent: async () => {
+				expect(events.at(-1)).toBeUndefined();
+				return save.promise;
+			},
+		});
+		hub.handleNativeEvent({ type: "action", key: "", act: "new", mods: [] });
+		type("private agent description");
+		hub.handleInput("\x11");
+		expect(events).toEqual(["input", undefined]);
+		generation.resolve(JSON.stringify({
+			identifier: "test-helper",
+			whenToUse: "Use this agent when testing.",
+			systemPrompt: "Private generated content.",
+		}));
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(events).toEqual(["input", undefined, "confirm"]);
+		hub.handleInput("\r");
+		expect(events).toEqual(["input", undefined, "confirm", undefined]);
+		save.resolve("/tmp/test-helper.md");
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(events).toHaveLength(4);
+		hub.dispose();
+	});
+
+	test("rearms the actual editor after generation fails, but never rearms a disposed hub", async () => {
+		const events: Array<"input" | "select" | "confirm" | undefined> = [];
+		let generation = Promise.withResolvers<string>();
+		const { hub, type } = await createHub(new TestSettings(), { onPromptChange: kind => events.push(kind) }, {
+			generateAgent: async () => generation.promise,
+		});
+		hub.handleNativeEvent({ type: "action", key: "", act: "new", mods: [] });
+		type("private description");
+		hub.handleInput("\x11");
+		generation.reject(new Error("private generation failure"));
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(events).toEqual(["input", undefined, "input"]);
+		generation = Promise.withResolvers<string>();
+		hub.handleInput("\x11");
+		hub.dispose();
+		generation.resolve(JSON.stringify({
+			identifier: "test-helper",
+			whenToUse: "Use this agent when testing.",
+			systemPrompt: "Private generated content.",
+		}));
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(events).toEqual(["input", undefined, "input", undefined]);
+	});
+
+	test("ignores observer failures without changing native input or persistence", async () => {
+		const settings = new TestSettings();
+		const { hub, type } = await createHub(settings, {
+			onPromptChange: () => { throw new Error("observer failure"); },
+		});
+		hub.handleNativeEvent({ type: "action", key: "", act: "model", mods: [] });
+		hub.handleNativeEvent({ type: "action", key: "", act: "strip", value: "1", mods: [] });
+		type("private/model");
+		hub.handleInput("\r");
+		expect(settings.records.get(OVERRIDE_KEYS.model)).toEqual({ dev: "private/model" });
+		hub.dispose();
 	});
 });
 

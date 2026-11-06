@@ -46,6 +46,7 @@ import type {
 	ExtensionContext,
 	ExtensionFactory,
 	ExtensionRuntime as IExtensionRuntime,
+	ToolApprovalDecider,
 	LoadExtensionsResult,
 	MessageRenderer,
 	PreparedExtension,
@@ -211,6 +212,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		const list = this.extension.handlers.get(event) ?? [];
 		list.push(handler);
 		this.extension.handlers.set(event, list);
+	}
+
+	registerApprovalDecider(decider: ToolApprovalDecider): void {
+		(this.extension.approvalDeciders ??= []).push(decider);
 	}
 
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {

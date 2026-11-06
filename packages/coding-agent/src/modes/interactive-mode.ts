@@ -1182,6 +1182,19 @@ const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 /** Repaint cadence of the open jobs sheet: output tails, pids and list ages are polled, not pushed. */
 const JOBS_SHEET_REFRESH_MS = 250;
 
+interface PlanReviewDialogOptions {
+	helpText?: string;
+	disabledIndices?: number[];
+	onExternalEditor?: () => void;
+	onPlanEdited?: (content: string) => void;
+	onFeedbackChange?: (feedback: string) => void;
+	annotationState?: PlanReviewAnnotationState;
+	onAnnotationStateChange?: (state: PlanReviewAnnotationState) => void;
+	initialIndex?: number;
+	/** Called once, with the settled choice, when the review overlay is hidden. */
+	onClose?: (choice: string | undefined) => void;
+}
+
 export class InteractiveMode implements InteractiveModeContext {
 	#ownsStartedUi: boolean;
 	session: AgentSession;
@@ -1963,7 +1976,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#tanCommandController = new TanCommandController(this);
 		this.#omfgController = new OmfgController(this);
 		this.#cleanseController = new CleanseCommandController(this);
-		this.#extensionUiController = new ExtensionUiController(this);
+		this.#extensionUiController = new ExtensionUiController(this, () => this.#selectorController.endSelectorPrompts());
 		this.#eventController = new EventController(this);
 		this.#commandController = new CommandController(this);
 		this.#todoCommandController = new TodoCommandController(this);
@@ -2073,6 +2086,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// behind the approval mutex must prompt on a live signal, not a dead one.
 		this.#dialogLifetime.abort();
 		this.#dialogLifetime = new AbortController();
+		this.#selectorController.startNativePromptObservation();
 
 		this.keybindings = logger.time("InteractiveMode.init:keybindings", () => KeybindingsManager.create());
 		// Before first paint, so hints the user already learned never flash on.
@@ -5301,18 +5315,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		planContent: string,
 		title: string,
 		options: string[],
-		dialogOptions?: {
-			helpText?: string;
-			disabledIndices?: number[];
-			onExternalEditor?: () => void;
-			onPlanEdited?: (content: string) => void;
-			onFeedbackChange?: (feedback: string) => void;
-			annotationState?: PlanReviewAnnotationState;
-			onAnnotationStateChange?: (state: PlanReviewAnnotationState) => void;
-			initialIndex?: number;
-			/** Called once, with the settled choice, when the review overlay is hidden. */
-			onClose?: (choice: string | undefined) => void;
-		},
+		dialogOptions?: PlanReviewDialogOptions,
+		extra?: { slider?: HookSelectorSlider },
+	): Promise<string | undefined> {
+		const present = () => this.#presentPlanReview(planContent, title, options, dialogOptions, extra);
+		const runner = this.session.extensionRunner;
+		return runner ? runner.observeNativePrompt("select", present) : present();
+	}
+
+	#presentPlanReview(
+		planContent: string,
+		title: string,
+		options: string[],
+		dialogOptions?: PlanReviewDialogOptions,
 		extra?: { slider?: HookSelectorSlider },
 	): Promise<string | undefined> {
 		this.#hidePlanReview();
@@ -6977,6 +6992,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	stop(): void {
 		this.#hidePlanReview();
+		this.#selectorController.endNativePrompts();
 		this.#appearanceRefreshRequest = undefined;
 		// Settle any pending approval prompt as dismissed (deny). The
 		// controller stays aborted: approvals still queued behind the approval
@@ -7044,6 +7060,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.stop();
 			this.#ownsStartedUi = false;
 		}
+		this.session.extensionRunner?.endPendingNativePrompts();
 		this.isInitialized = false;
 	}
 
@@ -7355,6 +7372,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		nextEditor.setText(previousText);
 
+		this.#selectorController.endSelectorPrompts();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(nextEditor);
 		this.ui.setFocus(nextEditor);

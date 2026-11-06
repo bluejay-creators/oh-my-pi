@@ -8099,6 +8099,7 @@ export class AgentSession implements SettingsScope {
 			ui: noOpUIContext,
 			mode: "print",
 			hasUI: false,
+			getPendingNativePrompts: () => NO_PENDING_NATIVE_PROMPTS,
 			cwd: this.sessionManager.getCwd(),
 			sessionManager: this.sessionManager,
 			modelRegistry: this.#modelRegistry,
@@ -13737,3 +13738,6 @@ export class AgentSession implements SettingsScope {
 		return this.#recovery.consumeActiveFallbackCreditRedemption(targetModel);
 	}
 }
+
+// Hand-constructed sessions without a runner have only the no-op UI above.
+const NO_PENDING_NATIVE_PROMPTS = Object.freeze([]);

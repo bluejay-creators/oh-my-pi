@@ -20,6 +20,7 @@ import type {
 	ExtensionUiComponent,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
+	NativePromptKind,
 	SendMessageHandler,
 	SendUserMessageHandler,
 	TerminalInputHandler,
@@ -121,7 +122,26 @@ export class ExtensionUiController {
 	 * call with the same picker/dialog primitives a live tool call would get.
 	 */
 	#toolUIContext: ExtensionUIContext | undefined;
-	constructor(private ctx: InteractiveModeContext) {}
+	constructor(
+		private ctx: InteractiveModeContext,
+		private readonly onEditorReplacement?: () => void,
+	) {}
+
+	#clearEditorSurface(): void {
+		this.ctx.editorContainer.clear();
+		this.onEditorReplacement?.();
+	}
+
+	// Managed commands also call raw dialogs without ExtensionUIContext. Observe
+	// their shared awaits; the runner suppresses nested extension/collab roots.
+	#observeNativePrompt<T>(
+		kind: NativePromptKind,
+		action: () => Promise<T>,
+		signal?: AbortSignal,
+	): Promise<T> {
+		const runner = this.ctx.session?.extensionRunner;
+		return runner ? runner.observeNativePrompt(kind, action, { signal }) : action();
+	}
 
 	#syncExtensionComposerShapes(): void {
 		this.disposeComposerShapes();
@@ -634,7 +654,7 @@ export class ExtensionUiController {
 			markableCount: dialogOptions?.markableCount,
 			helpText: dialogOptions?.helpText,
 		};
-		return this.#raceCollabDialog(request, dialogOptions?.signal, signal =>
+		return this.#raceCollabDialog("select", request, dialogOptions?.signal, signal =>
 			this.showHookSelector(title, options, { ...dialogOptions, signal }, extra),
 		);
 	}
@@ -646,7 +666,7 @@ export class ExtensionUiController {
 		editorOptions?: { promptStyle?: boolean },
 	): Promise<string | undefined> {
 		const request: CollabUiRequestDraft = { kind: "editor", title, prefill };
-		return this.#raceCollabDialog(request, dialogOptions?.signal, signal =>
+		return this.#raceCollabDialog("editor", request, dialogOptions?.signal, signal =>
 			this.showHookEditor(title, prefill, { ...dialogOptions, signal }, editorOptions),
 		);
 	}
@@ -665,8 +685,8 @@ export class ExtensionUiController {
 			title: prompt.full,
 			options: [APPROVE_OPTION, DENY_OPTION],
 		};
-		const choice = await this.#raceCollabDialog(request, dialogOptions?.signal, signal =>
-			this.#presentDialog(signal, settle => {
+		const choice = await this.#raceCollabDialog("tool-approval", request, dialogOptions?.signal, signal =>
+			this.#presentDialog("tool-approval", signal, settle => {
 				const callHidden = this.ctx.hideToolActivity;
 				const dialog = new ApprovalDialogComponent(
 					callHidden ? prompt.full : prompt.compact,
@@ -680,13 +700,13 @@ export class ExtensionUiController {
 						onTimeoutReset: dialogOptions?.onTimeoutReset,
 					},
 				);
-				this.ctx.editorContainer.clear();
+				this.#clearEditorSurface();
 				this.ctx.editorContainer.addChild(dialog);
 				this.ctx.ui.setFocus(dialog);
 				this.ctx.ui.requestRender();
 				return () => {
 					dialog.dispose();
-					this.ctx.editorContainer.clear();
+					this.#clearEditorSurface();
 					this.ctx.editorContainer.addChild(this.ctx.editor);
 					this.ctx.ui.setFocus(this.ctx.editor);
 					this.ctx.ui.requestRender();
@@ -697,6 +717,13 @@ export class ExtensionUiController {
 	}
 
 	async showAskDialog(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined> {
+		return this.#observeNativePrompt("ask", () => this.#showAskDialog(questions, dialogOptions), dialogOptions?.signal);
+	}
+
+	async #showAskDialog(
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
@@ -728,7 +755,7 @@ export class ExtensionUiController {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
-		return this.#presentDialog<ExtensionAskDialogResult>(dialogOptions?.signal, settle => {
+		return this.#presentDialog<ExtensionAskDialogResult>("ask", dialogOptions?.signal, settle => {
 			let promptEditor: HookEditorComponent | undefined;
 			let promptResolve: ((value: AskDialogPromptValue | undefined) => void) | undefined;
 			let closed = false;
@@ -749,7 +776,7 @@ export class ExtensionUiController {
 
 			const restoreAskDialog = (): void => {
 				if (closed || !askDialog) return;
-				this.ctx.editorContainer.clear();
+				this.#clearEditorSurface();
 				this.ctx.editorContainer.addChild(askDialog);
 				// Keep the draft editor mounted beneath the restored ask, matching the
 				// initial presentation: the guard re-blocks whenever the draft is
@@ -788,7 +815,7 @@ export class ExtensionUiController {
 					() => finishPrompt(undefined),
 					{ promptStyle: true, externalEditor: editDialogExternally, question: prompt.question, ...options },
 				);
-				this.ctx.editorContainer.clear();
+				this.#clearEditorSurface();
 				this.ctx.editorContainer.addChild(promptEditor);
 				this.ctx.ui.setFocus(promptEditor);
 				this.ctx.ui.requestRender();
@@ -833,7 +860,7 @@ export class ExtensionUiController {
 					inputGuard,
 				},
 			);
-			this.ctx.editorContainer.clear();
+			this.#clearEditorSurface();
 			this.ctx.editorContainer.addChild(askDialog);
 			if (inputGuard) this.ctx.editorContainer.addChild(this.ctx.editor);
 			this.ctx.ui.setFocus(askDialog);
@@ -846,7 +873,7 @@ export class ExtensionUiController {
 				promptResolve?.(undefined);
 				promptResolve = undefined;
 				promptEditor = undefined;
-				this.ctx.editorContainer.clear();
+				this.#clearEditorSurface();
 				this.ctx.editorContainer.addChild(this.ctx.editor);
 				this.ctx.ui.setFocus(this.ctx.editor);
 				this.ctx.ui.requestRender();
@@ -862,6 +889,19 @@ export class ExtensionUiController {
 	 * eventual result is returned.
 	 */
 	async #raceCollabDialog(
+		kind: NativePromptKind,
+		request: CollabUiRequestDraft,
+		signal: AbortSignal | undefined,
+		local: (signal: AbortSignal | undefined) => Promise<string | undefined>,
+	): Promise<string | undefined> {
+		return this.#observeNativePrompt(
+			kind,
+			() => this.#raceUnobservedCollabDialog(request, signal, local),
+			signal,
+		);
+	}
+
+	async #raceUnobservedCollabDialog(
 		request: CollabUiRequestDraft,
 		signal: AbortSignal | undefined,
 		local: (signal: AbortSignal | undefined) => Promise<string | undefined>,
@@ -1050,7 +1090,7 @@ export class ExtensionUiController {
 		dialogOptions?: InteractiveSelectorDialogOptions,
 		extra?: { slider?: HookSelectorSlider },
 	): Promise<string | undefined> {
-		return this.#presentDialog(dialogOptions?.signal, settle => {
+		return this.#presentDialog("select", dialogOptions?.signal, settle => {
 			const maxVisible = Math.max(4, Math.min(15, this.ctx.ui.terminal.rows - 12));
 			this.ctx.hookSelector = new HookSelectorComponent(
 				title,
@@ -1088,7 +1128,7 @@ export class ExtensionUiController {
 					slider: extra?.slider,
 				},
 			);
-			this.ctx.editorContainer.clear();
+			this.#clearEditorSurface();
 			this.ctx.editorContainer.addChild(this.ctx.hookSelector);
 			this.ctx.ui.setFocus(this.ctx.hookSelector);
 			this.ctx.ui.requestRender();
@@ -1100,7 +1140,7 @@ export class ExtensionUiController {
 	 */
 	hideHookSelector(): void {
 		this.ctx.hookSelector?.dispose();
-		this.ctx.editorContainer.clear();
+		this.#clearEditorSurface();
 		this.ctx.editorContainer.addChild(this.ctx.editor);
 		this.ctx.hookSelector = undefined;
 		this.ctx.ui.setFocus(this.ctx.editor);
@@ -1115,8 +1155,14 @@ export class ExtensionUiController {
 		message: string,
 		dialogOptions?: InteractiveSelectorDialogOptions,
 	): Promise<boolean> {
-		const result = await this.showHookSelector(`${title}\n${message}`, ["Yes", "No"], dialogOptions);
-		return result === "Yes";
+		return this.#observeNativePrompt(
+			"confirm",
+			async () => {
+				const result = await this.showHookSelector(`${title}\n${message}`, ["Yes", "No"], dialogOptions);
+				return result === "Yes";
+			},
+			dialogOptions?.signal,
+		);
 	}
 
 	/**
@@ -1127,7 +1173,7 @@ export class ExtensionUiController {
 		placeholder?: string,
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return this.#presentDialog(dialogOptions?.signal, settle => {
+		return this.#presentDialog("input", dialogOptions?.signal, settle => {
 			this.ctx.hookInput = new HookInputComponent(
 				title,
 				placeholder,
@@ -1139,7 +1185,7 @@ export class ExtensionUiController {
 					tui: this.ctx.ui,
 				},
 			);
-			this.ctx.editorContainer.clear();
+			this.#clearEditorSurface();
 			this.ctx.editorContainer.addChild(this.ctx.hookInput);
 			this.ctx.ui.setFocus(this.ctx.hookInput);
 			this.ctx.ui.requestRender();
@@ -1152,7 +1198,7 @@ export class ExtensionUiController {
 	 */
 	hideHookInput(): void {
 		this.ctx.hookInput?.dispose();
-		this.ctx.editorContainer.clear();
+		this.#clearEditorSurface();
 		this.ctx.editorContainer.addChild(this.ctx.editor);
 		this.ctx.hookInput = undefined;
 		this.ctx.ui.setFocus(this.ctx.editor);
@@ -1168,7 +1214,7 @@ export class ExtensionUiController {
 		dialogOptions?: ExtensionUIDialogOptions,
 		editorOptions?: { promptStyle?: boolean },
 	): Promise<string | undefined> {
-		return this.#presentDialog(dialogOptions?.signal, settle => {
+		return this.#presentDialog("editor", dialogOptions?.signal, settle => {
 			this.ctx.hookEditor = new HookEditorComponent(
 				this.ctx.ui,
 				title,
@@ -1177,7 +1223,7 @@ export class ExtensionUiController {
 				() => settle(undefined),
 				{ ...editorOptions, externalEditor: editDialogExternally },
 			);
-			this.ctx.editorContainer.clear();
+			this.#clearEditorSurface();
 			this.ctx.editorContainer.addChild(this.ctx.hookEditor);
 			this.ctx.ui.setFocus(this.ctx.hookEditor);
 			this.ctx.ui.requestRender();
@@ -1190,7 +1236,7 @@ export class ExtensionUiController {
 	 */
 	hideHookEditor(): void {
 		this.ctx.hookEditor?.dispose();
-		this.ctx.editorContainer.clear();
+		this.#clearEditorSurface();
 		this.ctx.editorContainer.addChild(this.ctx.editor);
 		this.ctx.hookEditor = undefined;
 		this.ctx.ui.setFocus(this.ctx.editor);
@@ -1222,6 +1268,18 @@ export class ExtensionUiController {
 		) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
 		options?: ExtensionCustomOptions,
 	): Promise<T> {
+		return this.#observeNativePrompt("custom", () => this.#showCustom(factory, options), options?.signal);
+	}
+
+	async #showCustom<T>(
+		factory: (
+			tui: TUI,
+			theme: Theme,
+			keybindings: KeybindingsManager,
+			done: (result: T) => void,
+		) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+		options?: ExtensionCustomOptions,
+	): Promise<T> {
 		const savedText = this.ctx.editor.getText();
 		const keybindings = KeybindingsManager.inMemory();
 
@@ -1236,7 +1294,7 @@ export class ExtensionUiController {
 			overlayHandle?.hide();
 			overlayHandle = undefined;
 			if (editorReplaced) {
-				this.ctx.editorContainer.clear();
+				this.#clearEditorSurface();
 				this.ctx.editorContainer.addChild(this.ctx.editor);
 				this.ctx.editor.setText(savedText);
 			}
@@ -1286,7 +1344,7 @@ export class ExtensionUiController {
 					return;
 				}
 				editorReplaced = true;
-				this.ctx.editorContainer.clear();
+				this.#clearEditorSurface();
 				this.ctx.editorContainer.addChild(component);
 				this.ctx.ui.setFocus(component);
 				this.ctx.ui.requestRender();
@@ -1411,6 +1469,14 @@ export class ExtensionUiController {
 	 * whose signal aborts before its turn resolves `undefined` and is never shown.
 	 */
 	#presentDialog<T = string>(
+		kind: NativePromptKind,
+		signal: AbortSignal | undefined,
+		present: (settle: (value: T | undefined) => void) => () => void,
+	): Promise<T | undefined> {
+		return this.#observeNativePrompt(kind, () => this.#queueDialog(signal, present), signal);
+	}
+
+	#queueDialog<T>(
 		signal: AbortSignal | undefined,
 		present: (settle: (value: T | undefined) => void) => () => void,
 	): Promise<T | undefined> {

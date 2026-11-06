@@ -52,6 +52,7 @@ async function withMixedRepo(run: (harness: SidebarHarness) => Promise<void>): P
 /** Drives a real Sidebar against a real GitModel, applying raised actions like the root component. */
 class SidebarHarness {
 	readonly actions: SidebarAction[] = [];
+	readonly inputModes: boolean[] = [];
 	readonly model: GitModel;
 	readonly sidebar: Sidebar;
 
@@ -64,6 +65,7 @@ class SidebarHarness {
 			onAction: action => this.actions.push(action),
 			onFocusDiff: () => {},
 			requestRender: () => {},
+			onInputModeChange: active => { this.inputModes.push(active); },
 		});
 	}
 
@@ -291,7 +293,7 @@ describe("git tui sidebar staging", () => {
 		});
 	});
 	test("wand pill opens the AI textbox; enter raises stage-ai with the typed prompt", async () => {
-		await withDirtyRepo(async ({ sidebar, actions }) => {
+		await withDirtyRepo(async ({ sidebar, actions, inputModes }) => {
 			sidebar.setFocused(true);
 			const strip = (line: string): string => line.replace(/\x1b\[[0-9;]*m/g, "");
 			const lines = sidebar.render(44, 30);
@@ -305,10 +307,12 @@ describe("git tui sidebar staging", () => {
 			sidebar.handleClick(headerRow, wandCol);
 			expect(actions).toEqual([]);
 			expect(sidebar.editing).toBe(true);
+			expect(inputModes).toEqual([true]);
 
 			for (const ch of "all comment changes") sidebar.handleInput(ch);
 			sidebar.handleInput("\r");
 			expect(actions).toEqual([{ type: "stage-ai", prompt: "all comment changes" }]);
+			expect(inputModes).toEqual([true, false]);
 			// Submission closes the box and clears the typed prompt.
 			expect(sidebar.aiInput.getValue()).toBe("");
 			expect(sidebar.render(44, 30).some(line => strip(line).includes("What should we stage?"))).toBe(false);
@@ -316,7 +320,7 @@ describe("git tui sidebar staging", () => {
 	});
 
 	test("escape closes the AI textbox without raising an action and clears the draft", async () => {
-		await withDirtyRepo(async ({ sidebar, actions }) => {
+		await withDirtyRepo(async ({ sidebar, actions, inputModes }) => {
 			sidebar.setFocused(true);
 			const strip = (line: string): string => line.replace(/\x1b\[[0-9;]*m/g, "");
 			const lines = sidebar.render(44, 30);
@@ -327,10 +331,40 @@ describe("git tui sidebar staging", () => {
 			expect(sidebar.handleEscape()).toBe(true);
 			expect(actions).toEqual([]);
 			expect(sidebar.aiInput.getValue()).toBe("");
+			expect(inputModes).toEqual([true, false]);
 			// Empty prompt + enter must not raise an action either.
 			sidebar.handleClick(headerRow, strip(lines[headerRow] ?? "").indexOf("✦"));
 			sidebar.handleInput("\r");
 			expect(actions).toEqual([]);
+			expect(inputModes).toEqual([true, false, true]);
+		});
+	});
+});
+
+describe("git tui native input observation", () => {
+	test("follows real input capture and disposal, not passive rendering or generation duration", async () => {
+		await withDirtyRepo(async ({ sidebar, inputModes }) => {
+			sidebar.render(44, 30);
+			sidebar.reconcile();
+			sidebar.setFocused(true);
+			expect(inputModes).toEqual([]);
+			expect(sidebar.focusCommitForm()).toBe(true);
+			expect(inputModes).toEqual([true]);
+			sidebar.handleInput("secret-text");
+			sidebar.setGenerating(true);
+			sidebar.setGenerating(false);
+			sidebar.reconcile();
+			expect(inputModes).toEqual([true]);
+			sidebar.setFocused(false);
+			sidebar.setFocused(false);
+			expect(inputModes).toEqual([true, false]);
+			sidebar.setFocused(true);
+			expect(inputModes).toEqual([true, false, true]);
+			expect(sidebar.handleEscape()).toBe(true);
+			expect(inputModes).toEqual([true, false, true, false]);
+			sidebar.focusCommitForm();
+			sidebar.dispose();
+			expect(inputModes).toEqual([true, false, true, false, true, false]);
 		});
 	});
 });

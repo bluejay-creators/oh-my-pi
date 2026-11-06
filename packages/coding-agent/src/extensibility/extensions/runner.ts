@@ -38,6 +38,7 @@ import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/age
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
+import { NativePromptObserver } from "../native-prompts";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
@@ -82,6 +83,10 @@ import type {
 	CacheWarmingDecisionEventResult,
 	McpNotificationEvent,
 	MessageRenderer,
+	NativePromptHandle,
+	NativePromptKind,
+	NativePromptOutcome,
+	NativePromptRequest,
 	RegisteredCommand,
 	RegisteredTool,
 	ResourcesDiscoverEvent,
@@ -93,6 +98,9 @@ import type {
 	SessionCompactingResult,
 	SessionStopEvent,
 	SessionStopEventResult,
+	ToolApprovalDecider,
+	ToolApprovalDeciderResult,
+	ToolApprovalRequest,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRegistrationListener,
@@ -199,6 +207,7 @@ function createHandlerUIContext(
 	const askDialog = ui.askDialog;
 	const approve = ui.approve;
 	const runDialog = async <T>(dialog: () => Promise<T>): Promise<T> => {
+		handlerSignal.throwIfAborted();
 		timeoutBudget?.pause();
 		try {
 			return await dialog();
@@ -222,6 +231,7 @@ function createHandlerUIContext(
 					runDialog(() => approve.call(ui, prompt, attachHandlerSignal(dialogOptions, handlerSignal)))
 			: undefined,
 		custom: async (factory, options) => {
+			handlerSignal.throwIfAborted();
 			let customSettled = false;
 			let componentReady = false;
 			try {
@@ -452,6 +462,7 @@ export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner 
 		});
 		return true;
 	} finally {
+		extensionRunner.endPendingNativePrompts("cancelled");
 		extensionRunner.disposeFileFallbacks();
 		extensionRunner.clearManagedTimers();
 	}
@@ -508,6 +519,7 @@ export const UNAVAILABLE_ANNOTATIONS: ExtensionAnnotationsAPI = Object.freeze({
 
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
+	readonly #promptObserver: NativePromptObserver;
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
@@ -741,6 +753,13 @@ export class ExtensionRunner {
 		createAnnotations?: ExtensionAnnotationsFactory,
 	) {
 		this.#uiContext = noOpUIContext;
+		this.#promptObserver = new NativePromptObserver(
+			() => this.sessionManager.getSessionId(),
+			event => {
+				// Never await observers before UI; no reply authority or payload-bearing failure log.
+				void this.emit(event).catch(() => logger.warn("Native prompt event observer failed", { event: event.type }));
+			},
+		);
 		this.#getMemoryFn = getMemory;
 		this.#createAnnotations = createAnnotations;
 		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
@@ -844,7 +863,7 @@ export class ExtensionRunner {
 			this.#compactFn = commandContextActions.compact;
 		}
 
-		this.#uiContext = uiContext ?? noOpUIContext;
+		this.#uiContext = uiContext ? this.observeUIContext(uiContext) : noOpUIContext;
 		this.#mode = mode;
 		this.#initialized = true;
 
@@ -1048,8 +1067,103 @@ export class ExtensionRunner {
 		await this.#toolApprovalPreviewWaiter?.(toolCallId);
 	}
 
+	hasApprovalDecider(): boolean {
+		return this.extensions.some(extension => (extension.approvalDeciders?.length ?? 0) > 0);
+	}
+
+	/** One explicitly registered controller; lifecycle observers never authorize. */
+	async decideToolApproval(
+		request: ToolApprovalRequest,
+		signal?: AbortSignal,
+		agent?: ExtensionAgentIdentity,
+	): Promise<ToolApprovalDeciderResult | undefined> {
+		let owner: Extension | undefined;
+		let controller: ToolApprovalDecider | undefined;
+		for (const extension of this.extensions) {
+			for (const decider of extension.approvalDeciders ?? []) {
+				if (controller) {
+					this.emitError({
+						extensionPath: extension.path,
+						event: "tool_approval_requested",
+						error: "Multiple approval deciders registered; retaining human approval",
+					});
+					return undefined;
+				}
+				owner = extension;
+				controller = decider;
+			}
+		}
+		if (!owner || !controller || signal?.aborted) return undefined;
+		const decider = controller;
+		const event = { type: "tool_approval_requested" as const, request };
+		const result: unknown = await this.#runHandlerWithTimeout(
+			(_event, ctx) => decider(request, ctx),
+			event,
+			this.createContext(undefined, undefined, agent),
+			owner,
+			handlerTimeoutForEvent(event.type),
+			undefined,
+			signal,
+		);
+		// Registration can change while an asynchronous controller is probing.
+		const count = this.extensions.reduce((total, extension) => total + (extension.approvalDeciders?.length ?? 0), 0);
+		if (count > 1) {
+			this.emitError({
+				extensionPath: owner.path,
+				event: "tool_approval_requested",
+				error: "Multiple approval deciders registered; retaining human approval",
+			});
+		}
+		if (count !== 1 || owner.approvalDeciders?.[0] !== decider || signal?.aborted) return undefined;
+		try {
+			if (
+				typeof result === "object" &&
+				result !== null &&
+				"decision" in result &&
+				result.decision === "approve-once" &&
+				"requestId" in result &&
+				result.requestId === request.requestId &&
+				"fingerprint" in result &&
+				result.fingerprint === request.fingerprint
+			) {
+				return { decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint };
+			}
+		} catch {
+			// A malformed controller return cannot authorize execution.
+		}
+		return undefined;
+	}
+
 	getUIContext(): ExtensionUIContext {
 		return this.#uiContext;
+	}
+
+	observeUIContext(ui: ExtensionUIContext): ExtensionUIContext {
+		return ui === noOpUIContext ? ui : this.#promptObserver.wrapUI(ui);
+	}
+
+	observeNativePrompt<T>(
+		kind: NativePromptKind,
+		action: () => Promise<T>,
+		options?: { request?: NativePromptRequest; signal?: AbortSignal },
+	): Promise<T> {
+		return this.#promptObserver.observe(kind, action, options);
+	}
+
+	beginNativePrompt(
+		kind: NativePromptKind,
+		options?: { request?: NativePromptRequest; signal?: AbortSignal },
+	): NativePromptHandle {
+		return this.#promptObserver.begin(kind, options);
+	}
+
+	getPendingNativePrompts(): readonly NativePromptRequest[] {
+		return this.#promptObserver.getPending();
+	}
+
+	/** Observation-only end at actual native UI teardown; never settles UI replies. */
+	endPendingNativePrompts(outcome: NativePromptOutcome = "cancelled"): void {
+		this.#promptObserver.end(outcome);
 	}
 
 	hasUI(): boolean {
@@ -1412,6 +1526,7 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			resolvePlanReview: (reviewId, choice, input) => this.#resolvePlanReviewFn(reviewId, choice, input),
 			getPendingPlanReview: () => this.#getPendingPlanReviewFn(),
+			getPendingNativePrompts: () => this.getPendingNativePrompts(),
 			openPlanReview: () => this.#openPlanReviewFn(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
@@ -1528,15 +1643,15 @@ export class ExtensionRunner {
 		onFailure?: (kind: "timeout" | "error", message: string) => R,
 		outerSignal?: AbortSignal,
 	): Promise<R | undefined> {
-		// `session_stop` carries its own signal on the event; `tool_call` receives
-		// the outer dispatch signal (loop request or wrapper execute) so an abort
-		// while a handler awaits a human dialog cancels the dialog and settles the
-		// gate without executing the underlying tool. Compose whichever apply.
-		const sessionStopSignal =
-			event.type === "session_stop" && "signal" in event && event.signal instanceof AbortSignal
+		// Stop/approval observers carry their owning request signal; tool_call
+		// receives the dispatch signal separately. All handler UI uses the same
+		// cancellation so a late observer cannot open a dialog for an aborted call.
+		const eventSignal =
+			(event.type === "session_stop" || event.type === "tool_approval_requested") &&
+			"signal" in event && event.signal instanceof AbortSignal
 				? event.signal
 				: undefined;
-		const signals = [outerSignal, sessionStopSignal].filter((s): s is AbortSignal => s !== undefined);
+		const signals = [outerSignal, eventSignal].filter((s): s is AbortSignal => s !== undefined);
 		const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 		if (signal?.aborted) return undefined;
 		const registrationScope: ToolRegistrationScope = { pending: new Set(), closed: false };
@@ -1616,7 +1731,11 @@ export class ExtensionRunner {
 		let ctx: ExtensionContext | undefined;
 		let result: SessionBeforeEventResult | SessionCompactingResult | SessionStopEventResult | undefined;
 
-		if (this.#isSessionShutdownEvent(event)) {
+		if (
+			this.#isSessionShutdownEvent(event) ||
+			event.type === "native_prompt_requested" ||
+			event.type === "native_prompt_resolved"
+		) {
 			const timeoutMs = handlerTimeoutForEvent(event.type);
 			const promises: Promise<unknown>[] = [];
 			for (const ext of this.extensions) {

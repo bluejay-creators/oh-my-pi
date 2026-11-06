@@ -29,6 +29,7 @@ import {
 	type ExtensionUIDialogOptions,
 	type ExtensionUISelectItem,
 	type ExtensionWidgetOptions,
+	type NativePromptKind,
 	getExtensionUISelectOptionLabel,
 	timedOutAskDialogResult,
 } from "../../extensibility/extensions";
@@ -1414,11 +1415,22 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
 
+	// Observe the actual remote wait, including tool-only/headless and login UI.
+	// The runner suppresses nested wrappers for this session's observed root.
+	const observeRpcPrompt = <T>(
+		kind: NativePromptKind,
+		action: () => Promise<T>,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<T> =>
+		session.extensionRunner?.observeNativePrompt(kind, action, { signal: dialogOptions?.signal }) ?? action();
+
 	/**
 	 * Extension UI context that uses the RPC protocol.
 	 */
 	class RpcExtensionUIContext implements ExtensionUIContext {
 		readonly supportsEditor = true;
+		readonly supportsDialogs = true;
+		readonly supportsCustom = false;
 		/** Set by `set_ask_dialog`; hosts that never opt in keep the select/editor ask fallback. */
 		askDialogEnabled = false;
 
@@ -1430,7 +1442,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		get askDialog(): ExtensionUIContext["askDialog"] {
 			if (!this.askDialogEnabled) return undefined;
 			return (questions, dialogOptions) =>
-				requestRpcAskDialog(this.pendingRequests, this.output, questions, dialogOptions);
+				observeRpcPrompt(
+					"ask",
+					() => requestRpcAskDialog(this.pendingRequests, this.output, questions, dialogOptions),
+					dialogOptions,
+				);
 		}
 
 		select(
@@ -1438,24 +1454,33 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			options: ExtensionUISelectItem[],
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return requestRpcSelect(this.pendingRequests, this.output, title, options, dialogOptions);
+			return observeRpcPrompt(
+				"select",
+				() => requestRpcSelect(this.pendingRequests, this.output, title, options, dialogOptions),
+				dialogOptions,
+			);
 		}
 
 		confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
-			return requestRpcDialog(
-				this.pendingRequests,
-				this.output,
+			return observeRpcPrompt(
+				"confirm",
+				() =>
+					requestRpcDialog(
+						this.pendingRequests,
+						this.output,
+						dialogOptions,
+						false,
+						{ method: "confirm", title, message, timeout: dialogOptions?.timeout },
+						response => {
+							if ("cancelled" in response && response.cancelled) {
+								if (response.timedOut) dialogOptions?.onTimeout?.();
+								return false;
+							}
+							if ("confirmed" in response) return response.confirmed;
+							return false;
+						},
+					),
 				dialogOptions,
-				false,
-				{ method: "confirm", title, message, timeout: dialogOptions?.timeout },
-				response => {
-					if ("cancelled" in response && response.cancelled) {
-						if (response.timedOut) dialogOptions?.onTimeout?.();
-						return false;
-					}
-					if ("confirmed" in response) return response.confirmed;
-					return false;
-				},
 			);
 		}
 
@@ -1464,13 +1489,18 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			placeholder?: string,
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return requestRpcDialog(
-				this.pendingRequests,
-				this.output,
+			return observeRpcPrompt(
+				"input",
+				() =>
+					requestRpcDialog(
+						this.pendingRequests,
+						this.output,
+						dialogOptions,
+						undefined,
+						{ method: "input", title, placeholder, timeout: dialogOptions?.timeout },
+						response => parseValueDialogResponse(response, dialogOptions),
+					),
 				dialogOptions,
-				undefined,
-				{ method: "input", title, placeholder, timeout: dialogOptions?.timeout },
-				response => parseValueDialogResponse(response, dialogOptions),
 			);
 		}
 
@@ -1571,7 +1601,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			dialogOptions?: ExtensionUIDialogOptions,
 			editorOptions?: { promptStyle?: boolean },
 		): Promise<string | undefined> {
-			return requestRpcEditor(this.pendingRequests, this.output, title, prefill, dialogOptions, editorOptions);
+			return observeRpcPrompt(
+				"editor",
+				() => requestRpcEditor(this.pendingRequests, this.output, title, prefill, dialogOptions, editorOptions),
+				dialogOptions,
+			);
 		}
 
 		addAutocompleteProvider(): void {

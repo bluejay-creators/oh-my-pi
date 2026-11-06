@@ -15,6 +15,8 @@ export interface GitTuiOptions {
 	cwd?: string;
 	/** Pin the view to one commit (any rev-parse-able revision). */
 	revision?: string;
+	/** Native input capture transitions only; no text or Git-operation duration. */
+	onInputModeChange?: (active: boolean) => void;
 }
 
 async function createHost(options: GitTuiOptions): Promise<GitTuiHost> {
@@ -32,6 +34,7 @@ async function createHost(options: GitTuiOptions): Promise<GitTuiHost> {
 		createAvatarSource: onReady => new AvatarLoader(onReady),
 		aiStage,
 		generateCommitMessage: generateGitCommit,
+		onInputModeChange: options.onInputModeChange,
 	};
 }
 

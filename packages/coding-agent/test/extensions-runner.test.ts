@@ -15,10 +15,15 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import {
+	ExtensionRuntime,
+	loadExtensionFromFactory,
+	loadExtensions,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
+	emitSessionShutdownEvent,
 	SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS,
 	testSetExtensionHandlerTimeoutMs,
 	testSetSessionShutdownHandlerTimeoutMs,
@@ -26,14 +31,21 @@ import {
 import type {
 	Extension,
 	ExtensionError,
+	ExtensionFactory,
 	ExtensionUIContext,
+	ExtensionUIDialogOptions,
 	InputEvent,
 	InputEventResult,
+	ToolApprovalRequest,
+	ToolApprovalDeciderResult,
+	NativePromptRequest,
+	NativePromptResolvedEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { getProjectAgentDir, logger, TempDir, untilAborted } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 describe("ExtensionRunner", () => {
@@ -2893,6 +2905,795 @@ describe("ExtensionRunner", () => {
 				},
 			]);
 			delete globalState.__partialContextApprovalEvents;
+		});
+
+		describe("native approve-once decisions", () => {
+			// Bun promise matchers may wait while evaluated. Attach an ordinary
+			// rejection handler before driving a deferred request, then assert its result.
+			const captureFailure = (operation: Promise<unknown>): Promise<unknown> =>
+				operation.then(() => undefined, (error: unknown) => error);
+
+			const createHarness = async (factory: ExtensionFactory | ExtensionFactory[], withUI = true) => {
+				const runtime = new ExtensionRuntime();
+				const factories = Array.isArray(factory) ? factory : [factory];
+				const extensions = await Promise.all(factories.map(initialize =>
+					loadExtensionFromFactory(initialize, tempDir.path(), new EventBus(), runtime),
+				));
+				const runner = new ExtensionRunner(extensions, runtime, tempDir.path(), sessionManager, modelRegistry);
+				const select = vi.fn(async (_title: string, _options: string[]) => "Deny");
+				if (withUI) initializeRunner(runner, select);
+				const execute = vi.fn(async (_id: string, _args: { command: string }) => ({
+					content: [{ type: "text" as const, text: "ok" }],
+				}));
+				const wrapper = new ExtensionToolWrapper({
+					...approvalTool,
+					parameters: Type.Object({ command: Type.String() }),
+					execute,
+				}, runner);
+				const context: AgentToolContext = {
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+				};
+				return { runner, wrapper, context, select, execute };
+			};
+
+			it("exposes an immutable post-interceptor request and approves without a UI", async () => {
+				const requests: ToolApprovalRequest[] = [];
+				const resolved: string[] = [];
+				const input = { command: "original" };
+				const harness = await createHarness(pi => {
+					pi.on("tool_call", () => ({ input: { command: "effective" } }));
+					pi.on("tool_approval_requested", event => {
+						expect(Object.isFrozen(event)).toBe(true);
+						expect(event.request?.arguments).toEqual({ command: "effective" });
+					});
+					pi.registerApprovalDecider(request => {
+						requests.push(request);
+						expect(Object.isFrozen(request)).toBe(true);
+						expect(Object.isFrozen(request.arguments)).toBe(true);
+						expect(request.arguments).toEqual({ command: "effective" });
+						return { decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint };
+					});
+					pi.on("tool_approval_resolved", event => {
+						if (event.approved && event.requestId) resolved.push(event.requestId);
+					});
+				}, false);
+
+				await harness.wrapper.execute("native-call", input, undefined, undefined, harness.context);
+				expect(harness.execute).toHaveBeenCalledTimes(1);
+				expect(harness.execute.mock.calls[0][1]).toEqual({ command: "effective" });
+				expect(input).toEqual({ command: "original" });
+				expect(requests[0]).toMatchObject({
+					sessionId: sessionManager.getSessionId(),
+					cwd: sessionManager.getCwd(),
+					toolName: approvalTool.name,
+					toolCallId: "native-call",
+					approvalMode: "always-ask",
+					tier: "exec",
+				});
+				expect(requests[0].requestId).toMatch(/^[0-9a-f-]{36}$/);
+				expect(requests[0].fingerprint).toMatch(/^[0-9a-f]{64}$/);
+				expect(resolved).toEqual([requests[0].requestId]);
+				expect(harness.select).not.toHaveBeenCalled();
+			});
+
+			it("retains the human prompt without a decision handler", async () => {
+				const harness = await createHarness(() => {});
+				await expect(harness.wrapper.execute("default", { command: "original" }, undefined, undefined, harness.context))
+					.rejects.toThrow("denied by user");
+				expect(harness.select).toHaveBeenCalledTimes(1);
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			it("never treats a legacy observer return value as approval", async () => {
+				const observer = vi.fn();
+				const harness = await createHarness(pi => {
+					pi.on("tool_approval_requested", event => {
+						observer();
+						// JavaScript listeners can return arbitrary values; this remains observation only.
+						return {
+							decision: "approve-once",
+							requestId: event.request!.requestId,
+							fingerprint: event.request!.fingerprint,
+						} as unknown as undefined;
+					});
+				});
+				await expect(harness.wrapper.execute("observer", { command: "same" }, undefined, undefined, harness.context))
+					.rejects.toThrow("denied by user");
+				expect(observer).toHaveBeenCalledTimes(1);
+				expect(harness.select).toHaveBeenCalledTimes(1);
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			it("invokes one authority probe and one observer for a request", async () => {
+				const observer = vi.fn();
+				const decider = vi.fn((request: ToolApprovalRequest): ToolApprovalDeciderResult => ({
+					decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint,
+				}));
+				const harness = await createHarness(pi => {
+					pi.on("tool_approval_requested", () => { observer(); });
+					pi.registerApprovalDecider(decider);
+				});
+				await harness.wrapper.execute("single-probe", { command: "same" }, undefined, undefined, harness.context);
+				expect(observer).toHaveBeenCalledTimes(1);
+				expect(decider).toHaveBeenCalledTimes(1);
+				expect(harness.execute).toHaveBeenCalledTimes(1);
+				expect(harness.select).not.toHaveBeenCalled();
+			});
+
+			it("retains human approval with a diagnostic for controllers in multiple extensions", async () => {
+				const decider = vi.fn((request: ToolApprovalRequest): ToolApprovalDeciderResult => ({
+					decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint,
+				}));
+				const harness = await createHarness([
+					pi => { pi.registerApprovalDecider(decider); },
+					pi => { pi.registerApprovalDecider(decider); },
+				]);
+				const errors: ExtensionError[] = [];
+				harness.runner.onError(error => { errors.push(error); });
+				await expect(harness.wrapper.execute("ambiguous", { command: "same" }, undefined, undefined, harness.context))
+					.rejects.toThrow("denied by user");
+				expect(errors).toEqual([expect.objectContaining({ error: expect.stringContaining("Multiple approval deciders") })]);
+				expect(decider).not.toHaveBeenCalled();
+				expect(harness.select).toHaveBeenCalledTimes(1);
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			for (const failure of ["void", "pass", "unknown", "request-id", "fingerprint", "error", "timeout"] as const) {
+				it(`retains the human prompt for ${failure} decisions`, async () => {
+					if (failure === "timeout") testSetExtensionHandlerTimeoutMs(10);
+					const harness = await createHarness(pi => {
+						pi.registerApprovalDecider(async request => {
+							if (failure === "void") return;
+							if (failure === "pass") return { decision: "pass" };
+							if (failure === "error") throw new Error("Unavailable");
+							if (failure === "timeout") {
+								await Promise.withResolvers<void>().promise;
+								return;
+							}
+							return {
+								decision: failure === "unknown" ? "allow-session" : "approve-once",
+								requestId: failure === "request-id" ? "wrong-id" : request.requestId,
+								fingerprint: failure === "fingerprint" ? "wrong-fingerprint" : request.fingerprint,
+							} as ToolApprovalDeciderResult;
+						});
+					});
+					await expect(harness.wrapper.execute("fallback", { command: "original" }, undefined, undefined, harness.context))
+						.rejects.toThrow("denied by user");
+					expect(harness.select).toHaveBeenCalledTimes(1);
+					expect(harness.execute).not.toHaveBeenCalled();
+				});
+			}
+
+			it("cannot replay a decision even for identical arguments and reused tool-call identity", async () => {
+				let decision: ToolApprovalDeciderResult | undefined;
+				const requests: ToolApprovalRequest[] = [];
+				const harness = await createHarness(pi => {
+					pi.registerApprovalDecider(request => {
+						requests.push(request);
+						decision ??= {
+							decision: "approve-once",
+							requestId: request.requestId,
+							fingerprint: request.fingerprint,
+						};
+						return decision;
+					});
+				});
+				await harness.wrapper.execute("same-call", { command: "same" }, undefined, undefined, harness.context);
+				await expect(harness.wrapper.execute("same-call", { command: "same" }, undefined, undefined, harness.context))
+					.rejects.toThrow("denied by user");
+				expect(requests[0].requestId).not.toBe(requests[1].requestId);
+				expect(requests[0].fingerprint).not.toBe(requests[1].fingerprint);
+				expect(harness.execute).toHaveBeenCalledTimes(1);
+				expect(harness.select).toHaveBeenCalledTimes(1);
+			});
+
+			it("does not exchange decisions between concurrent pending requests", async () => {
+				const entered = Promise.withResolvers<void>();
+				const decisions = [
+					Promise.withResolvers<ToolApprovalDeciderResult>(),
+					Promise.withResolvers<ToolApprovalDeciderResult>(),
+				];
+				const requests: ToolApprovalRequest[] = [];
+				const harness = await createHarness(pi => {
+					pi.registerApprovalDecider(request => {
+						const index = requests.push(request) - 1;
+						if (requests.length === 2) entered.resolve();
+						return decisions[index].promise;
+					});
+				});
+				const executions = [
+					harness.wrapper.execute("concurrent-a", { command: "same" }, undefined, undefined, harness.context),
+					harness.wrapper.execute("concurrent-b", { command: "same" }, undefined, undefined, harness.context),
+				];
+				const rejected = executions.map(captureFailure);
+				await entered.promise;
+				for (let index = 0; index < 2; index++) {
+					const other = requests[1 - index];
+					decisions[index].resolve({
+						decision: "approve-once", requestId: other.requestId, fingerprint: other.fingerprint,
+					});
+				}
+				for (const failure of await Promise.all(rejected)) {
+					expect(failure).toMatchObject({ message: expect.stringContaining("denied by user") });
+				}
+				expect(harness.select).toHaveBeenCalledTimes(2);
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			it("retains human approval if effective arguments change while a decision is pending", async () => {
+				const input = { command: "original" };
+				const harness = await createHarness(pi => {
+					pi.registerApprovalDecider(request => {
+						input.command = "changed";
+						expect(request.arguments).toEqual({ command: "original" });
+						return {
+							decision: "approve-once",
+							requestId: request.requestId,
+							fingerprint: request.fingerprint,
+						};
+					});
+				});
+				await expect(harness.wrapper.execute("changed", input, undefined, undefined, harness.context))
+					.rejects.toThrow("denied by user");
+				expect(harness.select).toHaveBeenCalledTimes(1);
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			it("rejects a matching decision after the session working directory changes", async () => {
+				const destination = tempDir.join("moved");
+				fs.mkdirSync(destination);
+				const harness = await createHarness(pi => {
+					pi.registerApprovalDecider(async request => {
+						await sessionManager.moveTo(destination);
+						return {
+							decision: "approve-once",
+							requestId: request.requestId,
+							fingerprint: request.fingerprint,
+						};
+					});
+				});
+				await expect(harness.wrapper.execute("moved", { command: "same" }, undefined, undefined, harness.context))
+					.rejects.toThrow("denied by user");
+				expect(harness.select).toHaveBeenCalledTimes(1);
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			it("cancels a pending request and ignores a late matching decision", async () => {
+				const entered = Promise.withResolvers<ToolApprovalRequest>();
+				const late = Promise.withResolvers<ToolApprovalDeciderResult>();
+				const controller = new AbortController();
+				const resolutions: Array<{ requestId?: string; approved: boolean; reason?: string }> = [];
+				const harness = await createHarness(pi => {
+					pi.registerApprovalDecider(request => {
+						entered.resolve(request);
+						return late.promise;
+					});
+					pi.on("tool_approval_resolved", event => { resolutions.push(event); });
+				});
+				const execution = harness.wrapper.execute(
+					"cancelled", { command: "same" }, controller.signal, undefined, harness.context,
+				);
+				const request = await entered.promise;
+				const rejection = captureFailure(execution);
+				controller.abort();
+				expect(await rejection).toBe(controller.signal.reason);
+				late.resolve({ decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint });
+				await late.promise;
+				expect(resolutions).toMatchObject([{
+					requestId: request.requestId, approved: false, reason: "approval cancelled",
+				}]);
+				expect(harness.select).not.toHaveBeenCalled();
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			it("cancels an awaited request observer and prevents its late UI from opening", async () => {
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const late = Promise.withResolvers<unknown>();
+				const controller = new AbortController();
+				const reason = new Error("native request cancelled");
+				const resolutions: Array<{ approved: boolean }> = [];
+				let observedSignal: AbortSignal | undefined;
+				const harness = await createHarness(pi => {
+					pi.on("tool_approval_requested", async (event, ctx) => {
+						observedSignal = event.signal;
+						entered.resolve();
+						await release.promise;
+						late.resolve(await captureFailure(ctx.ui.input("late observer input")));
+					});
+					pi.on("tool_approval_resolved", event => { resolutions.push(event); });
+				});
+				const input = vi.fn(async () => undefined);
+				harness.runner.getUIContext().input = input;
+				const execution = harness.wrapper.execute(
+					"observer-cancelled", { command: "same" }, controller.signal, undefined, harness.context,
+				);
+				const failure = captureFailure(execution);
+				await entered.promise;
+				try {
+					expect(observedSignal).toBe(controller.signal);
+					controller.abort(reason);
+					expect(await failure).toBe(reason);
+					expect(resolutions).toMatchObject([{ approved: false }]);
+				} finally {
+					controller.abort(reason);
+					release.resolve();
+				}
+				expect(await late.promise).toBe(reason);
+				expect(input).not.toHaveBeenCalled();
+				expect(harness.select).not.toHaveBeenCalled();
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			for (const surface of ["select", "approve"] as const) {
+				it(`forwards cancellation to the actual ${surface} approval surface`, async () => {
+					const entered = Promise.withResolvers<AbortSignal | undefined>();
+					const closed = Promise.withResolvers<void>();
+					const choice = Promise.withResolvers<void>();
+					const controller = new AbortController();
+					const reason = new Error("cancel visible approval");
+					const harness = await createHarness(() => {});
+					let calls = 0;
+					const waitForInput = async (signal: AbortSignal | undefined) => {
+						calls++;
+						entered.resolve(signal);
+						try {
+							await untilAborted(signal, () => choice.promise);
+						} finally {
+							closed.resolve();
+						}
+					};
+					initializeRunner(harness.runner, async (_title, _choices, options?: ExtensionUIDialogOptions) => {
+						await waitForInput(options?.signal);
+						return "Deny";
+					});
+					if (surface === "approve") {
+						harness.runner.getUIContext().approve = async (_prompt, options) => {
+							await waitForInput(options?.signal);
+							return false;
+						};
+					}
+					const execution = harness.wrapper.execute(
+						"visible-cancelled", { command: "same" }, controller.signal, undefined, harness.context,
+					);
+					const failure = captureFailure(execution);
+					try {
+						expect(await entered.promise).toBe(controller.signal);
+						controller.abort(reason);
+						expect(await failure).toMatchObject({ name: "AbortError", cause: reason });
+						await closed.promise;
+						expect(calls).toBe(1);
+						expect(harness.execute).not.toHaveBeenCalled();
+						expect(harness.runner.getPendingNativePrompts()).toEqual([]);
+					} finally {
+						controller.abort(reason);
+						choice.resolve();
+					}
+				});
+			}
+
+			for (const approval of ["native", "human"] as const) {
+				it(`cancels ${approval} approval while a resolution observer is pending without executing`, async () => {
+					const entered = Promise.withResolvers<void>();
+					const release = Promise.withResolvers<void>();
+					const controller = new AbortController();
+					const reason = new Error("cancel before execution");
+					let resolved = 0;
+					let prompted = 0;
+					const harness = await createHarness(pi => {
+						if (approval === "native") {
+							pi.registerApprovalDecider(request => ({
+								decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint,
+							}));
+						}
+						pi.on("tool_approval_resolved", async () => {
+							resolved++;
+							entered.resolve();
+							await release.promise;
+						});
+					});
+					if (approval === "human") {
+						initializeRunner(harness.runner, async () => { prompted++; return "Approve"; });
+					}
+					const execution = harness.wrapper.execute(
+						"resolution-cancelled", { command: "same" }, controller.signal, undefined, harness.context,
+					);
+					const failure = captureFailure(execution);
+					await entered.promise;
+					try {
+						controller.abort(reason);
+						expect(await failure).toBe(reason);
+						expect(harness.execute).not.toHaveBeenCalled();
+						expect(resolved).toBe(1);
+						expect(prompted).toBe(approval === "human" ? 1 : 0);
+					} finally {
+						controller.abort(reason);
+						release.resolve();
+					}
+				});
+			}
+
+			it("fails closed if a resolution observer changes the consumed request", async () => {
+				const input = { command: "original" };
+				const harness = await createHarness(pi => {
+					pi.registerApprovalDecider(request => ({
+						decision: "approve-once",
+						requestId: request.requestId,
+						fingerprint: request.fingerprint,
+					}));
+					pi.on("tool_approval_resolved", () => { input.command = "changed"; });
+				});
+				await expect(harness.wrapper.execute("resolved-change", input, undefined, undefined, harness.context))
+					.rejects.toThrow("changed or was cancelled");
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			it("withholds a request for arguments that cannot be represented losslessly", async () => {
+				let request: ToolApprovalRequest | undefined;
+				const decider = vi.fn(() => ({ decision: "pass" as const }));
+				const harness = await createHarness(pi => {
+					pi.on("tool_approval_requested", event => { request = event.request; });
+					pi.registerApprovalDecider(decider);
+				});
+				await expect(harness.wrapper.execute(
+					"unsupported", { command: "same", extra: undefined } as { command: string },
+					undefined, undefined, harness.context,
+				)).rejects.toThrow("denied by user");
+				expect(request).toBeUndefined();
+				expect(decider).not.toHaveBeenCalled();
+				expect(harness.select).toHaveBeenCalledTimes(1);
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			it("never converts provider safety checks into an extension approval", async () => {
+				let request: ToolApprovalRequest | undefined;
+				const harness = await createHarness(pi => {
+					pi.on("tool_approval_requested", event => { request = event.request; });
+					pi.registerApprovalDecider(() => {
+						throw new Error("Provider safety must not reach an approval controller");
+					});
+				});
+				harness.context.toolCall = {
+					batchId: "safety",
+					index: 0,
+					total: 1,
+					toolCalls: [{ id: "safety", name: approvalTool.name }],
+					providerMetadata: {
+						type: "computer",
+						providerItemId: "computer-request",
+						actions: [],
+						pendingSafetyChecks: [{ id: "check", code: "sensitive", message: "Review required" }],
+					},
+				};
+				await expect(harness.wrapper.execute("safety", { command: "same" }, undefined, undefined, harness.context))
+					.rejects.toThrow("denied by user");
+				expect(request).toBeUndefined();
+				expect(harness.select).toHaveBeenCalledTimes(1);
+				expect(harness.execute).not.toHaveBeenCalled();
+			});
+
+			for (const kind of ["tool-approval", "provider-safety"] as const) {
+				it(`observes one factual ${kind} pending root without duplicating its permission selector`, async () => {
+					const entered = Promise.withResolvers<NativePromptRequest>();
+					const completed = Promise.withResolvers<NativePromptResolvedEvent>();
+					const answer = Promise.withResolvers<string | undefined>();
+					const requests: NativePromptRequest[] = [];
+					let approvalPrompt: NativePromptRequest | undefined;
+					const harness = await createHarness(pi => {
+						pi.on("tool_approval_requested", event => { approvalPrompt = event.prompt; });
+						pi.on("native_prompt_requested", event => {
+							requests.push(event.request);
+							entered.resolve(event.request);
+						});
+						pi.on("native_prompt_resolved", event => { completed.resolve(event); });
+					});
+					initializeRunner(harness.runner, async () => answer.promise);
+					if (kind === "provider-safety") {
+						harness.context.toolCall = {
+							batchId: "native-safety", index: 0, total: 1,
+							toolCalls: [{ id: "native-prompt", name: approvalTool.name }],
+							providerMetadata: {
+								type: "computer", providerItemId: "native-computer", actions: [],
+								pendingSafetyChecks: [{ id: "check", code: "sensitive", message: "secret-safety-payload" }],
+							},
+						};
+					}
+					const started = Date.now();
+					const execution = harness.wrapper.execute(
+						"native-prompt", { command: "secret-command-payload" }, undefined, undefined, harness.context,
+					);
+					const rejected = captureFailure(execution);
+					const pending = await entered.promise;
+					expect(pending).toMatchObject({
+						kind, requestId: approvalPrompt?.requestId, requestedAt: approvalPrompt?.requestedAt,
+						sessionId: sessionManager.getSessionId(), toolCallId: "native-prompt", toolName: approvalTool.name,
+					});
+					expect(pending.requestedAt).toBeGreaterThanOrEqual(started);
+					expect(pending.requestedAt).toBeLessThanOrEqual(Date.now());
+					expect(JSON.stringify(pending)).not.toContain("secret-");
+					answer.resolve("Deny");
+					expect(await rejected).toMatchObject({ message: expect.stringContaining("denied by user") });
+					expect(await completed.promise).toMatchObject({
+						requestId: pending.requestId, sessionId: pending.sessionId, outcome: "completed",
+					});
+					expect(requests).toHaveLength(1);
+					expect(harness.execute).not.toHaveBeenCalled();
+				});
+			}
+
+			for (const unsupported of ["custom", "dialogs"] as const) {
+				it(`does not invent native waits for explicitly unsupported ${unsupported} UI`, async () => {
+					const requested = vi.fn();
+					const harness = await createHarness(pi => {
+						pi.on("native_prompt_requested", () => { requested(); });
+					});
+					const ui = harness.runner.observeUIContext({
+						...harness.runner.getUIContext(),
+						...(unsupported === "dialogs" ? { supportsDialogs: false } : { supportsCustom: false }),
+						custom: async <T>() => undefined as T,
+						select: async () => undefined,
+					});
+					const factory = vi.fn(() => { throw new Error("Unsupported custom UI must not invoke its factory"); });
+					expect(await ui.custom(factory)).toBeUndefined();
+					if (unsupported === "dialogs") expect(await ui.select("secret-title", [])).toBeUndefined();
+					expect(factory).not.toHaveBeenCalled();
+					expect(requested).not.toHaveBeenCalled();
+					expect(harness.runner.getPendingNativePrompts()).toEqual([]);
+				});
+			}
+
+			it("retains fail-closed approval defaults without announcing a nonexistent dialog surface", async () => {
+				const requested = vi.fn();
+				const harness = await createHarness(pi => {
+					pi.on("native_prompt_requested", () => { requested(); });
+				});
+				harness.runner.getUIContext().supportsDialogs = false;
+				await expect(harness.wrapper.execute("unsupported-ui", { command: "same" }, undefined, undefined, harness.context))
+					.rejects.toThrow("denied by user");
+				expect(harness.select).toHaveBeenCalledTimes(1);
+				expect(harness.execute).not.toHaveBeenCalled();
+				expect(requested).not.toHaveBeenCalled();
+				expect(harness.runner.getPendingNativePrompts()).toEqual([]);
+			});
+
+			for (const { method, kind, args } of [
+				{ method: "select", kind: "select", args: ["secret-title", ["secret-choice"]] },
+				{ method: "confirm", kind: "confirm", args: ["secret-title", "secret-question"] },
+				{ method: "input", kind: "input", args: ["secret-title", "secret-placeholder"] },
+				{ method: "askDialog", kind: "ask", args: [[{ id: "secret-question", question: "secret-question", options: [] }]] },
+				{ method: "editor", kind: "editor", args: ["secret-title", "secret-prefill"] },
+				{ method: "custom", kind: "custom", args: [() => undefined] },
+			] as const) {
+				it(`observes actual awaited ${method} without exposing its payload or answer`, async () => {
+					const entered = Promise.withResolvers<NativePromptRequest>();
+					const completed = Promise.withResolvers<NativePromptResolvedEvent>();
+					const answer = Promise.withResolvers<unknown>();
+					const harness = await createHarness(pi => {
+						pi.on("native_prompt_requested", event => { entered.resolve(event.request); });
+						pi.on("native_prompt_resolved", event => { completed.resolve(event); });
+					});
+					const ui = harness.runner.observeUIContext({
+						...harness.runner.getUIContext(),
+						[method]: async () => answer.promise,
+					} as ExtensionUIContext);
+					const invoke = Reflect.get(ui, method) as (...parameters: unknown[]) => Promise<unknown>;
+					const operation = invoke(...args);
+					const pending = await entered.promise;
+					expect(pending.kind).toBe(kind);
+					expect(Object.isFrozen(pending)).toBe(true);
+					expect(Object.keys(pending).sort()).toEqual(["kind", "requestId", "requestedAt", "sessionId"]);
+					const secretAnswer = { secret: "secret-answer" };
+					answer.resolve(secretAnswer);
+					expect(await operation).toBe(secretAnswer);
+					const resolution = await completed.promise;
+					expect(resolution).toMatchObject({ requestId: pending.requestId, outcome: "completed" });
+					expect(Object.keys(resolution).sort()).toEqual(["outcome", "requestId", "resolvedAt", "sessionId", "type"]);
+					expect(JSON.stringify([pending, resolution])).not.toContain("secret-");
+				});
+			}
+
+			it("keeps concurrent native UI waits independent and resolves the correct identities", async () => {
+				const ready = Promise.withResolvers<void>();
+				const allResolved = Promise.withResolvers<void>();
+				const requests: NativePromptRequest[] = [];
+				const resolutions: NativePromptResolvedEvent[] = [];
+				const answers = [Promise.withResolvers<string>(), Promise.withResolvers<string>()];
+				const harness = await createHarness(pi => {
+					pi.on("native_prompt_requested", event => {
+						requests.push(event.request);
+						if (requests.length === 2) ready.resolve();
+					});
+					pi.on("native_prompt_resolved", event => {
+						resolutions.push(event);
+						if (resolutions.length === 2) allResolved.resolve();
+					});
+				});
+				let index = 0;
+				const ui = harness.runner.observeUIContext({
+					...harness.runner.getUIContext(),
+					select: async () => answers[index++].promise,
+				});
+				const first = ui.select("secret-first", []);
+				const second = ui.select("secret-second", []);
+				await ready.promise;
+				expect(requests[0].requestId).not.toBe(requests[1].requestId);
+				answers[1].resolve("second");
+				expect(await second).toBe("second");
+				answers[0].resolve("first");
+				expect(await first).toBe("first");
+				await allResolved.promise;
+				expect(resolutions.map(event => event.requestId)).toEqual([requests[1].requestId, requests[0].requestId]);
+			});
+
+			for (const failure of ["cancel", "error"] as const) {
+				it(`settles native UI observation on ${failure} without leaking error/input data`, async () => {
+					const entered = Promise.withResolvers<NativePromptRequest>();
+					const completed = Promise.withResolvers<NativePromptResolvedEvent>();
+					const answer = Promise.withResolvers<string | undefined>();
+					const controller = new AbortController();
+					const harness = await createHarness(pi => {
+						pi.on("native_prompt_requested", event => { entered.resolve(event.request); });
+						pi.on("native_prompt_resolved", event => { completed.resolve(event); });
+					});
+					const ui = harness.runner.observeUIContext({
+						...harness.runner.getUIContext(),
+						input: async () => untilAborted(controller.signal, () => answer.promise),
+					});
+					const operation = ui.input("secret-title", "secret-placeholder", { signal: controller.signal });
+					const rejected = captureFailure(operation);
+					const pending = await entered.promise;
+					const reason = new Error(failure === "cancel" ? "secret-cancellation" : "secret-error");
+					if (failure === "cancel") controller.abort(reason);
+					else answer.reject(reason);
+					const failureResult = await rejected;
+					if (failure === "cancel") {
+						expect(failureResult).toMatchObject({ name: "AbortError", cause: reason });
+					} else {
+						expect(failureResult).toBe(reason);
+					}
+					const resolution = await completed.promise;
+					expect(resolution).toMatchObject({
+						requestId: pending.requestId, outcome: failure === "cancel" ? "cancelled" : "error",
+					});
+					expect(JSON.stringify(resolution)).not.toContain("secret-");
+				});
+			}
+
+			it("does not let a pending observation handler block or answer native UI", async () => {
+				const observer = Promise.withResolvers<void>();
+				const invoked = vi.fn(async () => "human-result");
+				const harness = await createHarness(pi => {
+					pi.on("native_prompt_requested", async () => { await observer.promise; });
+				});
+				const ui = harness.runner.observeUIContext({ ...harness.runner.getUIContext(), select: invoked });
+				try {
+					expect(await ui.select("secret-title", [])).toBe("human-result");
+					expect(invoked).toHaveBeenCalledTimes(1);
+				} finally {
+					observer.resolve();
+				}
+			});
+
+			it("delivers native pending metadata to independent receivers without waiting for another observer", async () => {
+				const heldObserver = Promise.withResolvers<void>();
+				const received = Promise.withResolvers<NativePromptRequest>();
+				const answer = Promise.withResolvers<string | undefined>();
+				const harness = await createHarness([
+					pi => { pi.on("native_prompt_requested", async () => { await heldObserver.promise; }); },
+					pi => { pi.on("native_prompt_requested", event => { received.resolve(event.request); }); },
+				]);
+				const ui = harness.runner.observeUIContext({
+					...harness.runner.getUIContext(), input: async () => answer.promise,
+				});
+				const operation = ui.input("secret-title");
+				try {
+					const pending = await Promise.race([received.promise, Promise.resolve(undefined)]);
+					if (!pending) throw new Error("Native observation was blocked by another receiver");
+					expect(pending.kind).toBe("input");
+					expect(harness.runner.getPendingNativePrompts()[0]?.requestId).toBe(pending.requestId);
+				} finally {
+					heldObserver.resolve();
+					answer.resolve(undefined);
+					await operation;
+				}
+			});
+
+			it("reconciles an already-open native wait through a metadata-only context snapshot", async () => {
+				const answer = Promise.withResolvers<string | undefined>();
+				const harness = await createHarness(() => {});
+				const ui = harness.runner.observeUIContext({
+					...harness.runner.getUIContext(), input: async () => answer.promise,
+				});
+				const operation = ui.input("secret-title", "secret-prefill");
+				// A receiver joining after the requested event can query live native state.
+				const laterContext = harness.runner.createContext();
+				const snapshot = laterContext.getPendingNativePrompts();
+				expect(snapshot).toHaveLength(1);
+				expect(snapshot[0].kind).toBe("input");
+				expect(Object.isFrozen(snapshot)).toBe(true);
+				expect(Object.isFrozen(snapshot[0])).toBe(true);
+				expect(Object.keys(snapshot[0]).sort()).toEqual(["kind", "requestId", "requestedAt", "sessionId"]);
+				expect(JSON.stringify(snapshot)).not.toContain("secret-");
+				answer.resolve("secret-answer");
+				expect(await operation).toBe("secret-answer");
+				expect(laterContext.getPendingNativePrompts()).toEqual([]);
+				expect(snapshot).toHaveLength(1);
+			});
+
+			it("ends native observation at real runner shutdown without answering an unresolved UI call", async () => {
+				const answer = Promise.withResolvers<string | undefined>();
+				const completed = Promise.withResolvers<NativePromptResolvedEvent>();
+				const resolutions: NativePromptResolvedEvent[] = [];
+				const harness = await createHarness(pi => {
+					pi.on("native_prompt_resolved", event => {
+						resolutions.push(event);
+						completed.resolve(event);
+					});
+				});
+				const ui = harness.runner.observeUIContext({
+					...harness.runner.getUIContext(), input: async () => answer.promise,
+				});
+				const operation = ui.input("secret-title");
+				const request = harness.runner.getPendingNativePrompts()[0];
+				expect(await emitSessionShutdownEvent(harness.runner)).toBe(false);
+				expect(await completed.promise).toMatchObject({ requestId: request.requestId, outcome: "cancelled" });
+				expect(harness.runner.getPendingNativePrompts()).toEqual([]);
+				expect(await Promise.race([operation.then(() => true), Promise.resolve(false)])).toBe(false);
+				answer.resolve("unchanged-result");
+				expect(await operation).toBe("unchanged-result");
+				expect(resolutions).toHaveLength(1);
+			});
+
+			it("keeps a callback-owned root pending across a nested subform without duplicate notification", async () => {
+				const requests: NativePromptRequest[] = [];
+				const resolved = Promise.withResolvers<NativePromptResolvedEvent>();
+				const answer = Promise.withResolvers<string | undefined>();
+				const harness = await createHarness(pi => {
+					pi.on("native_prompt_requested", event => { requests.push(event.request); });
+					pi.on("native_prompt_resolved", event => { resolved.resolve(event); });
+				});
+				const ui = harness.runner.observeUIContext({
+					...harness.runner.getUIContext(), input: async () => answer.promise,
+				});
+				const menu = harness.runner.beginNativePrompt("select");
+				const subform = menu.run(() => ui.input("secret-field", "secret-value"));
+				answer.resolve("secret-answer");
+				expect(await subform).toBe("secret-answer");
+				expect(harness.runner.getPendingNativePrompts().map(request => request.requestId)).toEqual([menu.request.requestId]);
+				menu.resolve("cancelled");
+				expect(await resolved.promise).toMatchObject({ requestId: menu.request.requestId, outcome: "cancelled" });
+				expect(requests).toHaveLength(1);
+				expect(harness.runner.getPendingNativePrompts()).toEqual([]);
+			});
+
+			it("retains an explicitly nested callback lifetime after its parent closes and settles each once", async () => {
+				const completed = Promise.withResolvers<void>();
+				const resolutions: NativePromptResolvedEvent[] = [];
+				const harness = await createHarness(pi => {
+					pi.on("native_prompt_resolved", event => {
+						resolutions.push(event);
+						if (resolutions.length === 2) completed.resolve();
+					});
+				});
+				const parent = harness.runner.beginNativePrompt("select");
+				const child = parent.run(() => harness.runner.beginNativePrompt("input"));
+				expect(child.request.parentRequestId).toBe(parent.request.requestId);
+				parent.resolve("completed");
+				expect(harness.runner.getPendingNativePrompts().map(request => request.requestId)).toEqual([child.request.requestId]);
+				child.resolve("cancelled");
+				child.resolve("error");
+				await completed.promise;
+				expect(resolutions.map(event => [event.requestId, event.outcome])).toEqual([
+					[parent.request.requestId, "completed"], [child.request.requestId, "cancelled"],
+				]);
+				expect(harness.runner.getPendingNativePrompts()).toEqual([]);
+			});
 		});
 	});
 

@@ -548,9 +548,165 @@ and `/new`. Commands retain their explicit prefill and session-transition action
 - `tool_call` (pre-exec, may block, revise the tool's execution `input`, or return passive `additionalContext`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike; passive context from non-blocking handlers is delivered after the batch's tool results in assistant call order, before the next provider request)
 - `tool_result` (post-exec, may patch content/details/isError or return passive `additionalContext`; result context is delivered outside the tool output even when `event.isError` is true, so a failure-specific handler can guide the next model step)
 - `tool_execution_start` / `tool_execution_update` / `tool_execution_end` (observability)
-- `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
+- `tool_approval_requested` / `tool_approval_resolved` (approval lifecycle; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
 
 `tool_result` is middleware-style: handlers run in extension order and each sees prior modifications. Distinct non-blank `additionalContext` from every handler is preserved in registration order (repeats, compared ignoring surrounding whitespace, are dropped) and delivered before that call's `tool_call` context.
+
+#### Trusted approve-once decisions
+
+An in-process extension may call `pi.registerApprovalDecider(decider)` to register
+an explicit trusted approval controller. Exactly one controller across all loaded
+extensions is required; multiple registrations retain human approval and emit an
+extension diagnostic. Existing `tool_approval_requested` handlers remain void,
+once-per-request observers: their return values never authorize execution.
+
+The controller receives a detached, recursively frozen `ToolApprovalRequest`
+created after `tool_call` interceptors and preflight. The same snapshot appears as
+the optional observer `event.request`. It contains a native UUID `requestId`,
+native epoch-millisecond `requestedAt`, a SHA-256 `fingerprint`, `sessionId`,
+`toolCallId`, `toolName`, `arguments`, `cwd`, `approvalMode`, and the actual resolved
+`tier` (`read`, `write`, or `exec`). The timestamp is included in the fingerprint.
+
+`cwd` is the live session directory used to resolve relative tool paths. Explicit
+working-directory overrides remain part of `arguments`; a shell's later `cd` is
+part of its command, not a change to this session directory. Consumers must assess
+the complete arguments and directory context, not just a displayed command.
+
+```ts
+pi.registerApprovalDecider(request => {
+  // Apply a trusted, application-specific policy to this exact snapshot.
+  if (request.toolName !== "read" || request.tier !== "read") return { decision: "pass" };
+  return {
+    decision: "approve-once",
+    requestId: request.requestId,
+    fingerprint: request.fingerprint,
+  };
+});
+```
+
+Only an exact `approve-once` result bound to the current request and fingerprint
+can replace the human prompt. The controller is invoked once and may probe
+asynchronously; revalidate external policy at the end of that probe before
+returning. Native code then compares current arguments, directory, session,
+approval context and cancellation and consumes the decision without a second
+authority probe. Existing lifecycle observers still run, but do not arbitrate.
+
+No controller, `{ decision: "pass" }`, `void`, timeout, error, unknown result,
+mismatched identity, or changed context keeps the ordinary human gate; without a
+UI that gate continues to fail closed. The controller is not invoked and
+`event.request` is absent when session identity or lossless JSON arguments are
+unavailable, or provider safety checks are pending. Those safety checks always
+require their existing human approval. Native policy denies remain authoritative.
+
+The decision is consumed once, never saved as an allow rule, and cannot approve
+another call, even one reusing the same tool-call id and arguments. Cancellation
+while a controller is pending discards its eventual result and never runs the
+tool. Resolution includes `requestId` when available; arguments and cancellation
+are checked again after resolution observers finish. If that already-consumed
+request changes, execution fails closed rather than using a stale approval.
+Approval observers receive the owning optional `event.signal`; cancellation releases
+their pending wait and prevents late handler UI from opening for that call. Native
+approve/select dialogs receive the same signal. Resolution observers are awaited
+while the call is live, but cannot hold a cancelled call pending; execution checks
+cancellation again after those observers, including for a human approval.
+
+
+This is a trusted-extension seam, not an authentication or sandbox mechanism.
+Extensions already execute arbitrary code in the host process. No new RPC,
+socket, model-callable approval tool, session/global grant, or protection against
+hostile same-user code is provided. The seam covers wrapped registry-tool approval,
+not separate eval-prelude or external-host approval dialogs.
+
+#### Native pending-prompt observation
+
+`native_prompt_requested` and `native_prompt_resolved` observe managed user-response
+waits without answering them. Generic UI never invokes an approval decider.
+
+- Requested: `event.request` is frozen and contains `requestId` (native UUID),
+  `requestedAt` (`Date.now()` epoch milliseconds), `sessionId`, and `kind`:
+  `tool-approval`, `provider-safety`, `select`, `confirm`, `input`, `ask`, `editor`,
+  or `custom`. Known tool approvals also include `toolCallId` and `toolName`.
+  `parentRequestId` identifies an actual known parent when a separately owned
+  callback or cross-session prompt lifetime is nested.
+- Resolved: `requestId`, `sessionId`, `resolvedAt`, and `outcome`:
+  `completed`, `cancelled`, or `error`. No question, title, answer, command, custom
+  payload, input value or error detail is included.
+
+```ts
+pi.on("native_prompt_requested", event => {
+  console.log(event.request.requestId, event.request.requestedAt, event.request.kind);
+});
+pi.on("native_prompt_resolved", event => {
+  console.log(event.requestId, event.outcome);
+});
+```
+
+Tool and provider-safety approval have native identity and time even when a
+lossless auto-approval snapshot is unavailable: `tool_approval_requested.prompt`
+contains this metadata, and `tool_approval_resolved` includes `requestId` and
+`requestedAt`. A human approval wait uses that same identity. Its timestamp starts
+when approval becomes required, before preview/controller waits; ordinary UI time
+starts at the actual managed UI invocation. Promptless approvals and native policy
+denials do not fabricate a user-response wait.
+
+Observed UI routes include extension/tool contexts, direct and collaboration-raced
+TUI dialog awaits, plan-review choices, OAuth/manual-code input, RPC dialogs,
+ACP elicitation and the native client-bridge permission-response race.
+Explicit callback lifetimes cover settings/shared selectors, model/session/copy/
+rewind choices, model-hub and advisor configuration, and Agents Hub configuration,
+pattern/create input, model assignment and generated-spec confirmation.
+Git observes actual summary/body/AI input capture transitions, not the entire view.
+Submission ends observation before backend/model work; failed choices rearm only
+when user-response UI actually returns. Replacement, cancellation and real UI/
+session teardown settle owned observations without answering an outstanding UI
+promise or altering its result.
+Nested primitives in one managed wait share one root: a tool permission select,
+or a confirm implemented by select, does not create a second pending notification.
+Independent concurrent waits keep distinct identities. Existing returns,
+exceptions, cancellation and client permission decisions are unchanged.
+A separately owned callback lifetime can outlive its parent; correlate its
+`parentRequestId` instead of joining prompts by title.
+
+Observation handlers are dispatched independently: asynchronous observer waits do
+not delay the underlying UI or other receivers. Synchronous trusted extension
+code retains normal in-process event-loop behavior; this is not isolation.
+Consumers must correlate by native identity, tolerate asynchronous handler
+completion, and clear pending state on resolution. `completed` describes normal
+return, not an affirmative answer: it may include denial, dismissal, or a host
+timeout returning normally. `cancelled` means an aborted caller signal or an
+explicit native cancellation/teardown; other rejected waits report `error`,
+without error details.
+
+`ctx.getPendingNativePrompts()` returns a frozen, metadata-only snapshot of this
+runner's currently observed native waits and explicitly owned callback lifetimes.
+A receiver joining after a requested event can reconcile the existing identities
+and native timestamps without inventing an open time or retaining payloads:
+
+```ts
+pi.on("session_start", (_event, ctx) => {
+  for (const request of ctx.getPendingNativePrompts()) {
+    console.log(request.requestId, request.requestedAt, request.kind);
+  }
+});
+```
+
+Entries disappear when the real await/callback lifetime settles or its native UI/
+session is explicitly torn down. A late underlying result cannot resolve the same
+observation twice. This is live in-process state, not a durable record across
+process exits or an inventory of external OS/browser prompts.
+
+Known unsupported providers declare `supportsDialogs: false` or
+`supportsCustom: false`; returning an unsupported default does not invent a
+pending user prompt or change that default.
+
+Coverage is not full-machine UI monitoring. Passive dashboards, navigation/search,
+widgets and detached overlay presence are not inferred as response prompts.
+Neither are standalone external editors, browser authorization/network progress,
+external terminal prompts, OS permission/Keychain/Touch ID dialogs, or broker UI
+beyond the native client request/response await. Standalone commands/helpers
+without a session runner/capture are outside this lifecycle. A session runner with
+registered listeners is required; there is no legacy-event alias, durable prompt
+registry or new transport.
 
 ### Plan review lifecycle
 

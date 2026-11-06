@@ -28,6 +28,7 @@ import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md"
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
+import { createNativePromptRequest } from "../extensibility/native-prompts";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { isFilesystemSourcePath } from "../tools/path-utils";
 import { supportsExternalThinking } from "../tools/think";
@@ -934,25 +935,36 @@ export class SessionTools {
 					signal?.addEventListener("abort", onAbort, { once: true });
 					let raced: PermissionRaceResult;
 					try {
-						const permissionPromise = bridge.requestPermission!(
-							{
-								toolCallId,
-								toolName: target.name,
-								title: permissionIntent.title,
-								...(target.name === "bash" ? { kind: "execute" } : {}),
-								status: "pending",
-								rawInput: args,
-								...(commandContent ? { content: commandContent } : {}),
-								locations: extractPermissionLocations(
-									args,
-									this.#host.sessionManager.getCwd(),
-									permissionIntent.paths,
-								),
-							},
-							PERMISSION_OPTIONS,
-							signal,
-						).then(outcome => ({ kind: "permission" as const, outcome }));
-						raced = await Promise.race([permissionPromise, abortPromise]);
+						const requestPermission = async (): Promise<PermissionRaceResult> => {
+							const permissionPromise = bridge.requestPermission!(
+								{
+									toolCallId,
+									toolName: target.name,
+									title: permissionIntent.title,
+									...(target.name === "bash" ? { kind: "execute" } : {}),
+									status: "pending",
+									rawInput: args,
+									...(commandContent ? { content: commandContent } : {}),
+									locations: extractPermissionLocations(
+										args,
+										this.#host.sessionManager.getCwd(),
+										permissionIntent.paths,
+									),
+								},
+								PERMISSION_OPTIONS,
+								signal,
+							).then(outcome => ({ kind: "permission" as const, outcome }));
+							return await Promise.race([permissionPromise, abortPromise]);
+						};
+						const runner = this.#host.extensionRunner();
+						raced = runner
+							? await runner.observeNativePrompt("tool-approval", requestPermission, {
+									request: createNativePromptRequest(this.#host.sessionManager.getSessionId(), "tool-approval", {
+										toolCallId, toolName: target.name,
+									}),
+									signal,
+								})
+							: await requestPermission();
 					} finally {
 						signal?.removeEventListener("abort", onAbort);
 					}

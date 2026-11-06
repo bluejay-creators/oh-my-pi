@@ -367,6 +367,8 @@ export class Sidebar {
 	amend = false;
 	generating = false;
 	#aiPromptOpen = false;
+	readonly #onInputModeChange: ((active: boolean) => void) | undefined;
+	#inputModeActive = false;
 	/** File-list presentation: flat paths or a collapsible directory tree. */
 	viewStyle: "path" | "tree" = "tree";
 	readonly #collapsed = new Set<string>();
@@ -417,6 +419,7 @@ export class Sidebar {
 		onAction: (action: SidebarAction) => void;
 		onFocusDiff: () => void;
 		requestRender: () => void;
+		onInputModeChange?: (active: boolean) => void;
 	}) {
 		this.#model = options.model;
 		this.#avatars = options.avatars;
@@ -425,6 +428,7 @@ export class Sidebar {
 		this.#onAction = options.onAction;
 		this.#onFocusDiff = options.onFocusDiff;
 		this.#requestRender = options.requestRender;
+		this.#onInputModeChange = options.onInputModeChange;
 		this.summary = new TextFormField({
 			theme: SIDEBAR_FORM_THEME,
 			prompt: "",
@@ -482,6 +486,7 @@ export class Sidebar {
 		}
 		const target = this.selected;
 		if (this.#selection.selectedKey !== previousKey) this.#followSelection = true;
+		this.#syncInputMode();
 		if (target?.kind === "file") return target.file;
 		const firstFile = this.#selection.items.find(candidate => candidate.kind === "file");
 		if (firstFile?.kind === "file" && (!target || target.kind === "section")) {
@@ -598,8 +603,20 @@ export class Sidebar {
 		this.summary.focused = this.focused && target.kind === "summary";
 		this.#descriptionField.focused = this.focused && target.kind === "description";
 		this.aiInput.focused = this.focused && target.kind === "stage-ai-input";
+		this.#syncInputMode();
 		if (target.kind === "file") this.#onSelectFile(target.file);
 		this.#requestRender();
+	}
+
+	#syncInputMode(): void {
+		const active = this.editing;
+		if (active === this.#inputModeActive) return;
+		this.#inputModeActive = active;
+		try {
+			this.#onInputModeChange?.(active);
+		} catch {
+			// Observation cannot change native input or expose its text on failure.
+		}
 	}
 
 	/** Called by the root when pane focus changes. */
@@ -609,6 +626,7 @@ export class Sidebar {
 		this.summary.focused = focused && target?.kind === "summary";
 		this.#descriptionField.focused = focused && target?.kind === "description";
 		this.aiInput.focused = focused && target?.kind === "stage-ai-input";
+		this.#syncInputMode();
 	}
 
 	#moveSelection(delta: number): void {
@@ -1471,6 +1489,8 @@ export class Sidebar {
 
 	/** Permanently release viewport, form, and avatar resources. */
 	dispose(): void {
+		this.focused = false;
+		this.#syncInputMode();
 		this.#scrollView.dispose();
 		this.summary.dispose();
 		this.aiInput.dispose();

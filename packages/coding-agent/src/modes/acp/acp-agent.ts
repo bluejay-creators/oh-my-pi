@@ -448,6 +448,8 @@ export function createAcpExtensionUiContext(
 	const supportsForm = clientCapabilities?.elicitation?.form != null;
 	return {
 		supportsEditor: false,
+		supportsDialogs: supportsForm,
+		supportsCustom: false,
 		select: async (title, options, dialogOptions) => {
 			if (!supportsForm) return undefined;
 			const value = await elicitFromAcpClient(
@@ -2043,7 +2045,7 @@ export class AcpAgent implements Agent {
 		const previewLines = planContent.split("\n").slice(0, 12).join("\n");
 		const ellipsis = planContent.split("\n").length > 12 ? "\n…" : "";
 		const message = `Approve plan "${title}" and start implementation?\n\n${previewLines}${ellipsis}`;
-		const value = await elicitFromAcpClient(
+		const choose = () => elicitFromAcpClient(
 			this.#connection,
 			sessionId,
 			"select",
@@ -2051,6 +2053,8 @@ export class AcpAgent implements Agent {
 			{ type: "string", enum: [APPROVE_OPTION, REFINE_OPTION] },
 			undefined,
 		);
+		const runner = this.#sessions.get(sessionId)?.session.extensionRunner;
+		const value = runner ? await runner.observeNativePrompt("select", choose) : await choose();
 		// Approve ONLY on the explicit approve selection. Dismissal, cancel,
 		// timeout, or any other non-approve response falls through to refine
 		// semantics so closing the dialog can never grant write access.
@@ -2554,11 +2558,13 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
-		const uiContext = createAcpExtensionUiContext(
+		const extensionRunner = record.session.extensionRunner;
+		const nativeUIContext = createAcpExtensionUiContext(
 			this.#connection,
 			() => record.session.sessionId,
 			this.#clientCapabilities,
 		);
+		const uiContext = extensionRunner?.observeUIContext(nativeUIContext) ?? nativeUIContext;
 		if (this.#clientCapabilities?.elicitation?.form != null) {
 			record.setToolUIContext?.(uiContext, true);
 			record.session.setUsageFallbackConfirmer((confirmation, signal) => {
@@ -2574,7 +2580,6 @@ export class AcpAgent implements Agent {
 			});
 		}
 
-		const extensionRunner = record.session.extensionRunner;
 		if (!extensionRunner) {
 			record.extensionsConfigured = true;
 			return;

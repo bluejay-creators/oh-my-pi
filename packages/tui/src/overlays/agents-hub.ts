@@ -136,6 +136,8 @@ export interface AgentsHubDeps {
 
 export interface AgentsHubCallbacks {
 	onCancel: () => void;
+	/** Actual response-form transitions only; undefined ends the current form. No input values are exposed. */
+	onPromptChange?: (kind: "input" | "select" | "confirm" | undefined) => void;
 }
 
 const IDENTIFIER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+){1,5}$/;
@@ -239,6 +241,8 @@ export class AgentsHubComponent implements Component {
 	#createSpec: GeneratedAgentSpec | null = null;
 	#createError: string | null = null;
 	#createStreamingText = "";
+	#promptKind: "input" | "select" | "confirm" | undefined;
+	#disposed = false;
 
 	/** Bumped on every visible-state change; the described node is rebuilt when it moves. */
 	#nativeVersion = 0;
@@ -299,7 +303,20 @@ export class AgentsHubComponent implements Component {
 		return hub;
 	}
 
-	dispose(): void {}
+	dispose(): void {
+		this.#disposed = true;
+		this.#setPromptKind(undefined);
+	}
+
+	#setPromptKind(kind: "input" | "select" | "confirm" | undefined): void {
+		if ((this.#disposed && kind !== undefined) || this.#promptKind === kind) return;
+		this.#promptKind = kind;
+		try {
+			this.#callbacks.onPromptChange?.(kind);
+		} catch {
+			// Observation cannot interrupt native input or expose its payload on failure.
+		}
+	}
 	invalidate(): void {
 		this.#nativeVersion++;
 		this.#frame.invalidate();
@@ -495,6 +512,7 @@ export class AgentsHubComponent implements Component {
 			chips: [enabledChip, propertyChip("model"), propertyChip("prewalk"), propertyChip("advisor")],
 			index: 1,
 		};
+		this.#setPromptKind("select");
 	}
 
 	/** Level-2 strip: value choices for one property of `agent`. */
@@ -549,6 +567,7 @@ export class AgentsHubComponent implements Component {
 			});
 		}
 		this.#strip = { kind: "chips", agent, property, chips, index: 0 };
+		this.#setPromptKind("select");
 	}
 
 	#openPatternStrip(agent: HubAgent, property: PropertyKind): void {
@@ -556,11 +575,25 @@ export class AgentsHubComponent implements Component {
 		const current = this.#overrideFor(agent, property);
 		if (current) input.setValue(current);
 		this.#strip = { kind: "pattern", agent, property, input };
+		this.#setPromptKind("input");
 	}
 
 	#closeStrip(): void {
+		this.#setPromptKind(undefined);
 		this.#strip = null;
 		this.#frame.chipRanges = [];
+	}
+
+	#commitStrip(action: () => void): void {
+		const strip = this.#strip;
+		this.#setPromptKind(undefined);
+		try {
+			action();
+			this.#closeStrip();
+		} catch (error) {
+			if (strip && this.#strip === strip) this.#setPromptKind(strip.kind === "pattern" ? "input" : "select");
+			throw error;
+		}
 	}
 
 	#activateStripChip(): void {
@@ -571,15 +604,13 @@ export class AgentsHubComponent implements Component {
 		const action = chip.action;
 		switch (action.kind) {
 			case "toggle":
-				this.#toggleAgent(strip.agent);
-				this.#closeStrip();
+				this.#commitStrip(() => this.#toggleAgent(strip.agent));
 				return;
 			case "property":
 				this.#openPropertyStrip(strip.agent, action.property);
 				return;
 			case "set":
-				this.#setOverride(strip.agent, action.property, action.value);
-				this.#closeStrip();
+				this.#commitStrip(() => this.#setOverride(strip.agent, action.property, action.value));
 				return;
 			case "pick":
 				this.#closeStrip();
@@ -594,8 +625,7 @@ export class AgentsHubComponent implements Component {
 	#submitPattern(): void {
 		const strip = this.#strip;
 		if (strip?.kind !== "pattern") return;
-		this.#setOverride(strip.agent, strip.property, strip.input.getValue());
-		this.#closeStrip();
+		this.#commitStrip(() => this.#setOverride(strip.agent, strip.property, strip.input.getValue()));
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -610,17 +640,20 @@ export class AgentsHubComponent implements Component {
 		this.#browser.setQuery("");
 		const current = this.#overrideFor(agent, property);
 		if (current) this.#browser.selectSelector(current);
+		this.#setPromptKind("select");
 	}
 
 	#commitPickedModel(item: ModelBrowserItem): void {
 		const target = this.#assigning;
 		if (!target) return;
+		this.#setPromptKind(undefined);
 		this.#assigning = null;
 		this.#browser.setQuery("");
 		this.#setOverride(target.agent, target.property, item.selector);
 	}
 
 	#cancelAssign(): void {
+		this.#setPromptKind(undefined);
 		this.#assigning = null;
 		this.#browser.setQuery("");
 		this.#requestRender();
@@ -648,10 +681,12 @@ export class AgentsHubComponent implements Component {
 			this.#createDescription = value;
 		};
 		this.#createInput = editor;
+		this.#setPromptKind("input");
 		this.#requestRender();
 	}
 
 	#clearCreateFlow(): void {
+		this.#setPromptKind(undefined);
 		this.#createInput = null;
 		this.#createDescription = "";
 		this.#createGenerating = false;
@@ -668,6 +703,7 @@ export class AgentsHubComponent implements Component {
 			this.#requestRender();
 			return;
 		}
+		this.#setPromptKind(undefined);
 		this.#createGenerating = true;
 		this.#createError = null;
 		this.#createSpec = null;
@@ -681,6 +717,8 @@ export class AgentsHubComponent implements Component {
 			this.#createError = error instanceof Error ? error.message : String(error);
 		} finally {
 			this.#createGenerating = false;
+			if (this.#createSpec) this.#setPromptKind("confirm");
+			else if (this.#createInput) this.#setPromptKind("input");
 			this.#requestRender();
 		}
 	}
@@ -696,6 +734,7 @@ export class AgentsHubComponent implements Component {
 	async #saveGeneratedAgent(): Promise<void> {
 		const spec = this.#createSpec;
 		if (!spec) return;
+		this.#setPromptKind(undefined);
 		const filePath = await this.#deps.saveAgent(this.#createScope, spec);
 		this.#clearCreateFlow();
 		this.#notice = `Created agent ${spec.identifier} at ${shortenPath(filePath)}`;
@@ -738,6 +777,7 @@ export class AgentsHubComponent implements Component {
 				this.#requestRender();
 				return;
 			}
+			this.#setPromptKind(undefined);
 			this.#callbacks.onCancel();
 			return;
 		}
@@ -891,6 +931,7 @@ export class AgentsHubComponent implements Component {
 			if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
 				void this.#saveGeneratedAgent().catch(error => {
 					this.#createError = error instanceof Error ? error.message : String(error);
+					if (this.#createSpec && !this.#createGenerating) this.#setPromptKind("confirm");
 					this.#requestRender();
 				});
 			}
@@ -1361,6 +1402,7 @@ export class AgentsHubComponent implements Component {
 			return;
 		}
 		if (pick.act === "close") {
+			this.#setPromptKind(undefined);
 			this.#callbacks.onCancel();
 			return;
 		}

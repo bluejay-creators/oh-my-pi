@@ -46,6 +46,9 @@ const scriptedAskProvider = `
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 
 export default function (pi) {
+	for (const type of ["native_prompt_requested", "native_prompt_resolved"]) {
+		pi.on(type, event => console.log(JSON.stringify({ type: "test_native_lifecycle", event })));
+	}
 	pi.registerProvider("scripted", {
 		baseUrl: "http://127.0.0.1:9/v1",
 		apiKey: "scripted-key",
@@ -90,7 +93,7 @@ export default function (pi) {
 `;
 
 describe("RPC extension UI", () => {
-	it("keeps extension dialogs headless while tool selections round-trip", async () => {
+	it("observes concurrent tool-only dialogs and cancellation while extensions stay headless", async () => {
 		await using temp = await TempDir.create("@rpc-headless-tool-ui-");
 		const fixturePath = temp.join("runtime.ts");
 		const sourceDir = path.resolve(import.meta.dir, "../src");
@@ -109,6 +112,9 @@ const { session } = await createAgentSession({
   disableExtensionDiscovery: true,
   settings: Settings.isolated({ "compaction.enabled": false }),
   extensions: [pi => {
+    for (const type of ["native_prompt_requested", "native_prompt_resolved"]) {
+      pi.on(type, event => console.log(JSON.stringify({ type: "test_native_lifecycle", event })));
+    }
     pi.on("session_start", async (_event, ctx) => {
       const confirmed = await ctx.ui.confirm("Extension confirm", "Must not reach the host");
       ctx.ui.notify("Extension notification");
@@ -119,8 +125,13 @@ const { session } = await createAgentSession({
 await runRpcMode(session, {
   headless: true,
   setToolUIContext(ui, hasUI) {
-    void ui.select("Tool choice", ["Keep", "Deploy"]).then(selected => {
-      ui.notify(JSON.stringify({ toolHasUI: hasUI, selected, extension: extensionState }));
+    const controller = new AbortController();
+    const selected = ui.select("Tool choice", ["Keep", "Deploy"]);
+    const input = ui.input("Private draft", "Private placeholder", { signal: controller.signal });
+    void selected.then(async selected => {
+      controller.abort();
+      const cancelled = await input;
+      ui.notify(JSON.stringify({ toolHasUI: hasUI, selected, cancelled: cancelled ?? null, extension: extensionState }));
     });
   },
 });
@@ -145,10 +156,16 @@ await runRpcMode(session, {
 		});
 		const stderr = new Response(child.stderr).text();
 		const requests: Record<string, unknown>[] = [];
+		const lifecycle: Record<string, unknown>[] = [];
 		let result: unknown;
 		try {
 			for await (const frame of readJsonl<unknown>(child.stdout)) {
-				if (!isRecord(frame) || frame.type !== "extension_ui_request") continue;
+				if (!isRecord(frame)) continue;
+				if (frame.type === "test_native_lifecycle" && isRecord(frame.event)) {
+					lifecycle.push(frame.event);
+					continue;
+				}
+				if (frame.type !== "extension_ui_request") continue;
 				requests.push(frame);
 				if (frame.method === "select") {
 					child.stdin.write(
@@ -158,6 +175,8 @@ await runRpcMode(session, {
 				} else if (frame.method === "notify") {
 					if (typeof frame.message === "string") result = JSON.parse(frame.message);
 					break;
+				} else if (frame.method === "input" || frame.method === "cancel") {
+					// Keep input pending until selecting the concurrent dialog aborts its signal.
 				} else {
 					throw new Error(`Unexpected extension UI: ${JSON.stringify(frame)}`);
 				}
@@ -170,9 +189,48 @@ await runRpcMode(session, {
 			toolHasUI: true,
 			selected: "Deploy",
 			extension: { hasUI: false, confirmed: false },
+			cancelled: null,
 		});
-		expect(requests.map(frame => frame.method)).toEqual(["select", "notify"]);
-		expect(requests[0]).toMatchObject({ title: "Tool choice", options: ["Keep", "Deploy"] });
+		expect(requests.map(frame => frame.method)).toEqual(
+			expect.arrayContaining(["select", "input", "cancel", "notify"]),
+		);
+		expect(requests).toHaveLength(4);
+		expect(requests.find(frame => frame.method === "select")).toMatchObject({
+			title: "Tool choice",
+			options: ["Keep", "Deploy"],
+		});
+		const requested = lifecycle.filter(event => event.type === "native_prompt_requested");
+		const resolved = lifecycle.filter(event => event.type === "native_prompt_resolved");
+		expect(requested).toHaveLength(2);
+		expect(resolved).toHaveLength(2);
+		const pending = requested.map(event => event.request);
+		expect(pending).toEqual(expect.arrayContaining([
+			{
+				requestId: expect.any(String),
+				requestedAt: expect.any(Number),
+				sessionId: expect.any(String),
+				kind: "select",
+			},
+			{
+				requestId: expect.any(String),
+				requestedAt: expect.any(Number),
+				sessionId: expect.any(String),
+				kind: "input",
+			},
+		]));
+		expect(new Set(pending.map(request => isRecord(request) && request.requestId)).size).toBe(2);
+		expect(resolved.map(event => event.outcome)).toEqual(["completed", "cancelled"]);
+		for (const event of resolved) {
+			expect(event).toEqual({
+				type: "native_prompt_resolved",
+				requestId: expect.any(String),
+				sessionId: expect.any(String),
+				resolvedAt: expect.any(Number),
+				outcome: expect.any(String),
+			});
+			expect(pending.some(request => isRecord(request) && request.requestId === event.requestId)).toBe(true);
+		}
+		expect(JSON.stringify(lifecycle)).not.toMatch(/Private|Deploy|Tool choice|Extension confirm/);
 	}, 30_000);
 
 	it("keeps the label-only wire shape for bare options", async () => {
@@ -262,6 +320,9 @@ await runRpcMode(session, {
 			`
 export default function(pi) {
   globalThis.fetch = async () => { throw new Error("Offline login fixture refuses network"); };
+  for (const type of ["native_prompt_requested", "native_prompt_resolved"]) {
+    pi.on(type, event => console.log(JSON.stringify({ type: "test_native_lifecycle", event })));
+  }
   // rpc-alias is a second login for rpc-ordinary's credentials, like openai-codex-device.
   for (const [id, secret, storeCredentialsAs] of [["rpc-secret", true], ["rpc-ordinary", false], ["rpc-alias", false, "rpc-ordinary"]]) {
     pi.registerProvider(id, {
@@ -324,6 +385,7 @@ export default function(pi) {
 		if (!stdout) throw new Error("RPC login fixture did not expose stdout");
 		const stderr = new Response(child.stderr).text();
 		const inputTitles: string[] = [];
+		const lifecycle: Record<string, unknown>[] = [];
 		let secretResponse: unknown;
 		let ordinaryResponse: unknown;
 		let loggedInProvidersResponse: unknown;
@@ -342,6 +404,10 @@ export default function(pi) {
 			await send({ type: "login", providerId: "rpc-secret", id: "secret" });
 			for await (const frame of readJsonl<unknown>(stdout)) {
 				if (!isRecord(frame)) continue;
+				if (frame.type === "test_native_lifecycle" && isRecord(frame.event)) {
+					lifecycle.push(frame.event);
+					continue;
+				}
 				if (frame.type === "extension_ui_request" && frame.method === "input") {
 					if (typeof frame.id !== "string" || typeof frame.title !== "string") {
 						throw new Error("RPC input request did not carry string id and title");
@@ -403,6 +469,13 @@ export default function(pi) {
 		});
 		expect(inputTitles).toEqual(["rpc-ordinary"]);
 		expect(ordinaryResponse).toMatchObject({ type: "response", command: "login", success: true });
+		expect(lifecycle.filter(event => event.type === "native_prompt_requested")).toMatchObject([
+			{ request: { kind: "input" } },
+		]);
+		expect(lifecycle.filter(event => event.type === "native_prompt_resolved")).toMatchObject([
+			{ outcome: "completed" },
+		]);
+		expect(JSON.stringify(lifecycle)).not.toMatch(/rpc-secret|rpc-ordinary|authorize|value|title/);
 		expect(loggedInProvidersResponse).toMatchObject({
 			data: {
 				providers: expect.arrayContaining([
@@ -604,6 +677,7 @@ describe("RPC ask dialog", () => {
 		};
 		const selectRequests: Record<string, unknown>[] = [];
 		const askRequests: Record<string, unknown>[] = [];
+		const lifecycle: Record<string, unknown>[] = [];
 		const toolResults: unknown[] = [];
 		let optInResponse: unknown;
 		let finished = false;
@@ -613,6 +687,10 @@ describe("RPC ask dialog", () => {
 			await send({ type: "set_model", id: "model", provider: "scripted", modelId: "ask" });
 			for await (const frame of readJsonl<unknown>(stdout)) {
 				if (!isRecord(frame)) continue;
+				if (frame.type === "test_native_lifecycle" && isRecord(frame.event)) {
+					lifecycle.push(frame.event);
+					continue;
+				}
 				if (frame.type === "response" && frame.id === "model") {
 					if (frame.success !== true) throw new Error(`Scripted model unavailable: ${JSON.stringify(frame)}`);
 					await send({ type: "prompt", id: "fallback", message: JSON.stringify({ questions: [dbQuestion] }) });
@@ -655,6 +733,11 @@ describe("RPC ask dialog", () => {
 		await stderr;
 		expect(selectRequests).toHaveLength(1);
 		expect(selectRequests[0]).toMatchObject({ method: "select", title: "Which database?" });
+		const requested = lifecycle.filter(event => event.type === "native_prompt_requested");
+		const resolved = lifecycle.filter(event => event.type === "native_prompt_resolved");
+		expect(requested).toMatchObject([{ request: { kind: "select" } }, { request: { kind: "ask" } }]);
+		expect(resolved).toMatchObject([{ outcome: "completed" }, { outcome: "completed" }]);
+		expect(JSON.stringify(lifecycle)).not.toMatch(/Which database|Postgres|DuckDB|Search|Auth/);
 		expect(optInResponse).toEqual({
 			id: "opt-in",
 			type: "response",

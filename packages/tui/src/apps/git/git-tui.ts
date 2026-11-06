@@ -69,6 +69,8 @@ export interface AiStageOutcome {
 export interface GitTuiHost {
 	model: GitTuiModel;
 	createAvatarSource(onReady: () => void): AvatarSource;
+	/** Observation only: native text input mode entered/left, never its payload. */
+	onInputModeChange?(active: boolean): void;
 	aiStage(options: {
 		cwd: string;
 		instruction: string;
@@ -205,6 +207,7 @@ class GitTuiComponent implements Component {
 			onAction: action => void this.#runAction(action),
 			onFocusDiff: () => this.#setFocus("diff"),
 			requestRender: () => this.#ui.requestRender(),
+			onInputModeChange: active => host.onInputModeChange?.(active),
 		});
 		this.#sidebar.setFocused(true);
 		this.#split = new SplitPane({

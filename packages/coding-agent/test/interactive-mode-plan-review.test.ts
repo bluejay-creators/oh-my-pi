@@ -18,6 +18,7 @@ import type {
 	Extension,
 	ExtensionContext,
 	ExtensionEvent,
+	NativePromptEvent,
 	PlanReviewRequestedEvent,
 	PlanReviewResolvedEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -83,9 +84,17 @@ function observeExtensionEvents(session: AgentSession, onEvent?: (event: Extensi
 		onEvent?.(event);
 		return Promise.resolve();
 	};
+	const runner = new ExtensionRunner(
+		[],
+		new ExtensionRuntime(),
+		session.sessionManager.getCwd(),
+		session.sessionManager,
+		session.modelRegistry,
+	);
+	Object.defineProperty(runner, "emit", { value: emit });
 	Object.defineProperty(session, "extensionRunner", {
 		configurable: true,
-		get: () => ({ emit }),
+		get: () => runner,
 	});
 	return events;
 }
@@ -224,6 +233,64 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.initHooksAndCustomTools();
 		return runner;
 	}
+
+	it("ends no-signal native observation on mode stop without answering its original UI promise", async () => {
+		const events: NativePromptEvent[] = [];
+		const observer = planReviewExtension("native-stop", () => {});
+		const record = async (...args: unknown[]): Promise<void> => {
+			events.push(args[0] as NativePromptEvent);
+		};
+		observer.handlers.set("native_prompt_requested", [record]);
+		observer.handlers.set("native_prompt_resolved", [record]);
+		const runner = await loadExtensions(observer);
+		const pending = mode.showHookConfirm("private title", "private question");
+		const selector = mode.hookSelector;
+		expect(runner.getPendingNativePrompts()).toHaveLength(1);
+		mode.stop();
+		expect(runner.getPendingNativePrompts()).toEqual([]);
+		expect(events).toHaveLength(2);
+		expect(events[1]).toMatchObject({ type: "native_prompt_resolved", outcome: "cancelled" });
+		if (!selector) throw new Error("Expected the original UI selector");
+		selector.handleInput("\r");
+		expect(await pending).toBe(true);
+		expect(events).toHaveLength(2);
+		expect(JSON.stringify(events)).not.toContain("private");
+	});
+
+	it("observes only the awaited plan-review choice, not the overlay's remaining visibility", async () => {
+		const events: NativePromptEvent[] = [];
+		const observer = planReviewExtension("native-prompts", () => {});
+		const record = async (...args: unknown[]): Promise<void> => {
+			events.push(args[0] as NativePromptEvent);
+		};
+		observer.handlers.set("native_prompt_requested", [record]);
+		observer.handlers.set("native_prompt_resolved", [record]);
+		await loadExtensions(observer);
+
+		const pending = mode.showPlanReview("private plan content", "private title", ["private choice"]);
+		expect(events).toHaveLength(1);
+		const requested = events[0];
+		if (requested?.type !== "native_prompt_requested") throw new Error("Expected a pending plan choice");
+		expect(requested.request).toEqual({
+			requestId: expect.any(String),
+			requestedAt: expect.any(Number),
+			sessionId: session.sessionManager.getSessionId(),
+			kind: "select",
+		});
+		const overlay = mode.ui.getFocused() as PlanReviewOverlay;
+		overlay.handleInput("\n");
+		expect(await pending).toBe("private choice");
+		expect(events).toHaveLength(2);
+		expect(events[1]).toMatchObject({
+			type: "native_prompt_resolved",
+			requestId: requested.request.requestId,
+			sessionId: requested.request.sessionId,
+			resolvedAt: expect.any(Number),
+			outcome: "completed",
+		});
+		expect(mode.ui.hasOverlay()).toBe(true);
+		expect(JSON.stringify(events)).not.toContain("private");
+	});
 
 	it("exits empty plan mode without confirmation", async () => {
 		const planFilePath = "local://PLAN.md";
@@ -942,7 +1009,10 @@ describe("InteractiveMode plan review rendering", () => {
 		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN" });
 
 		const resolved = events.find((event): event is PlanReviewResolvedEvent => event.type === "plan_review_resolved");
-		expect(events.map(event => event.type)).toEqual(["plan_review_requested", "plan_review_resolved"]);
+		expect(events.filter(event => event.type.startsWith("plan_review_")).map(event => event.type)).toEqual([
+			"plan_review_requested",
+			"plan_review_resolved",
+		]);
 		expect(resolved).toMatchObject({ choice: "execute", by: "local" });
 	});
 

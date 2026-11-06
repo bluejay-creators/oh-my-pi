@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Git view hosts can observe native text-input capture mode through an optional payload-free callback. Focus, form exit, target reconciliation and disposal delimit the lifetime; repository loading and backend operation duration do not.
+- Agents Hub hosts can observe explicit input, model-choice and generated-spec review lifetimes through optional metadata-only callbacks, independently of the passive dashboard or backend generation/persistence.
+
 ## [18.10.4] - 2026-10-13
 
 ### Added

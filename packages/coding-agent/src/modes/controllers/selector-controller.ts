@@ -44,6 +44,7 @@ import { getRoleInfo } from "../../config/model-roles";
 import { settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
+import type { NativePromptHandle, NativePromptKind, NativePromptOutcome } from "../../extensibility/extensions";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	getInstalledPluginsRegistryPath,
@@ -206,8 +207,75 @@ export class SelectorController {
 	 * focuses it instead of stacking another menu on top.
 	 */
 	#openMenus = new Map<MenuKind, OpenMenu>();
+	#callbackPrompts = new Set<NativePromptHandle>();
+	#selectorPrompts = new Set<NativePromptHandle>();
+	#observingNativePrompts = true;
+	#promptGeneration = 0;
 
 	constructor(private ctx: InteractiveModeContext) {}
+
+	startNativePromptObservation(): void {
+		this.#observingNativePrompts = true;
+	}
+
+	/** The mode's real teardown ends observation without invoking or changing UI callbacks. */
+	endNativePrompts(): void {
+		this.#observingNativePrompts = false;
+		this.#promptGeneration++;
+		for (const prompt of this.#callbackPrompts) prompt.resolve("cancelled");
+		this.#callbackPrompts.clear();
+		this.#selectorPrompts.clear();
+	}
+
+	/** A raw hook/custom editor replacement does not restore an editor-slot selector. */
+	endSelectorPrompts(): void {
+		for (const prompt of this.#selectorPrompts) {
+			this.#callbackPrompts.delete(prompt);
+			prompt.resolve("cancelled");
+		}
+		this.#selectorPrompts.clear();
+	}
+
+	#beginNativePrompt(kind: NativePromptKind, generation = this.#promptGeneration): NativePromptHandle | undefined {
+		if (!this.#observingNativePrompts || generation !== this.#promptGeneration) return undefined;
+		const prompt = this.ctx.session?.extensionRunner?.beginNativePrompt(kind);
+		if (prompt) {
+			// A requested-event handler can synchronously tear down the mode.
+			if (!this.#observingNativePrompts || generation !== this.#promptGeneration) {
+				prompt.resolve("cancelled");
+				return undefined;
+			}
+			this.#callbackPrompts.add(prompt);
+		}
+		return prompt;
+	}
+
+	#resolveNativePrompt(prompt: NativePromptHandle | undefined, outcome: NativePromptOutcome): void {
+		if (!prompt) return;
+		this.#callbackPrompts.delete(prompt);
+		this.#selectorPrompts.delete(prompt);
+		prompt.resolve(outcome);
+	}
+
+	#endSelectorsAfter(prompt: NativePromptHandle | undefined): void {
+		let displaced = !prompt || !this.#selectorPrompts.has(prompt);
+		for (const candidate of this.#selectorPrompts) {
+			if (candidate === prompt) {
+				displaced = true;
+				continue;
+			}
+			if (displaced) this.#resolveNativePrompt(candidate, "cancelled");
+		}
+	}
+
+	#runNativePrompt<T>(prompt: NativePromptHandle | undefined, action: () => T): T {
+		try {
+			return prompt ? prompt.run(action) : action();
+		} catch (error) {
+			this.#resolveNativePrompt(prompt, "error");
+			throw error;
+		}
+	}
 	/**
 	 * Mount a primary fullscreen menu through the one polished modal path shared
 	 * by Settings, Model Hub, and Agent Hub.
@@ -251,10 +319,15 @@ export class SelectorController {
 	}
 
 	/** Mount `component` as `menu`'s overlay through `mount`, which also raises it later. */
-	#mountMenu(menu: OpenMenu, component: Component, mount: () => OverlayHandle): void {
+	#mountMenu(
+		menu: OpenMenu,
+		component: Component,
+		mount: () => OverlayHandle,
+		prompt?: NativePromptHandle,
+	): void {
 		menu.component = component;
 		menu.mount = mount;
-		menu.handle = mount();
+		menu.handle = this.#runNativePrompt(prompt, mount);
 	}
 
 	/** Register a new `kind` menu; pass it to {@link #releaseMenu} when it closes or fails to open. */
@@ -307,10 +380,16 @@ export class SelectorController {
 	 * Temporarily replaces the editor slot with a selector, restoring the prior
 	 * slot contents and focus when the selector finishes.
 	 */
-	showSelector(create: (done: () => void) => { component: Component; focus: Component }): void {
+	showSelector(
+		create: (done: (outcome?: NativePromptOutcome) => void) => { component: Component; focus: Component },
+	): void {
 		const previousChildren = [...this.ctx.editorContainer.children];
 		const previousFocus = this.ctx.ui.getFocused();
-		const done = () => {
+		const prompt = this.#beginNativePrompt("select");
+		if (prompt) this.#selectorPrompts.add(prompt);
+		const done = (outcome: NativePromptOutcome = "completed") => {
+			this.#endSelectorsAfter(prompt);
+			this.#resolveNativePrompt(prompt, outcome);
 			this.ctx.editorContainer.clear();
 			for (const child of previousChildren) this.ctx.editorContainer.addChild(child);
 			const focus =
@@ -319,22 +398,30 @@ export class SelectorController {
 					: (previousChildren[0] ?? this.ctx.editor);
 			this.ctx.ui.setFocus(focus);
 		};
-		const { component, focus } = create(done);
-		this.ctx.editorContainer.clear();
-		this.ctx.editorContainer.addChild(component);
-		this.ctx.ui.setFocus(focus);
-		this.ctx.ui.requestRender();
+		try {
+			const result = prompt ? prompt.run(() => create(done)) : create(done);
+			this.ctx.editorContainer.clear();
+			this.ctx.editorContainer.addChild(result.component);
+			this.ctx.ui.setFocus(result.focus);
+			this.ctx.ui.requestRender();
+		} catch (error) {
+			this.#resolveNativePrompt(prompt, "error");
+			throw error;
+		}
 	}
 
 	showSettingsSelector(): void {
 		if (this.#focusOpenMenu("settings")) return;
 		const menu = this.#claimMenu("settings");
+		const generation = this.#promptGeneration;
+		let prompt: NativePromptHandle | undefined;
 		getAvailableThemes()
 			.then(availableThemes => {
 				// Fullscreen settings editor on the alternate screen: the overlay
 				// enables mouse tracking (click/hover/wheel) for its lifetime and
 				// the transcript stays untouched underneath.
 				const done = () => {
+					this.#resolveNativePrompt(prompt, "cancelled");
 					menu.handle?.hide();
 					this.#releaseMenu("settings", menu);
 					this.focusActiveEditorArea();
@@ -356,7 +443,10 @@ export class SelectorController {
 						composerPreviewStatus: this.ctx.statusLine,
 					},
 					{
-						onChange: (id, value) => this.handleSettingChange(id, value),
+						onChange: (id, value) => {
+							if (prompt) prompt.run(() => this.handleSettingChange(id, value));
+							else this.handleSettingChange(id, value);
+						},
 						onThemePreview: async themeName => {
 							const result = await previewTheme(themeName);
 							if (result.success) {
@@ -416,11 +506,13 @@ export class SelectorController {
 						},
 					},
 				);
-				this.#mountMenu(menu, selector, () => this.#showFullscreenMenu(selector));
+				prompt = this.#beginNativePrompt("custom", generation);
+				this.#mountMenu(menu, selector, () => this.#showFullscreenMenu(selector), prompt);
 			})
 			.catch((error: unknown) => {
 				// A menu that never opened must not block the next `/settings`.
 				this.#releaseMenu("settings", menu);
+				this.#resolveNativePrompt(prompt, "error");
 				throw error;
 			});
 	}
@@ -481,6 +573,7 @@ export class SelectorController {
 	}
 
 	showAdvisorConfigure(): void {
+		const generation = this.#promptGeneration;
 		const cwd = this.ctx.sessionManager.getCwd();
 		const agentDir = getAgentDir() ?? getProjectDir();
 		const initialScope: AdvisorConfigScope = "project";
@@ -500,7 +593,9 @@ export class SelectorController {
 			}
 			// Fullscreen editor on the alternate screen (the /settings idiom): the
 			// overlay holds the alt buffer + mouse tracking; the transcript stays put.
+			let prompt: NativePromptHandle | undefined;
 			const done = () => {
+				this.#resolveNativePrompt(prompt, "completed");
 				overlayHandle?.hide();
 				this.focusActiveEditorArea();
 				this.ctx.ui.requestRender();
@@ -571,15 +666,19 @@ export class SelectorController {
 					return identity ? (report, limit) => limitMatchesActiveAccount(report, limit, identity) : undefined;
 				},
 			});
-			const overlayHandle = this.ctx.ui.showOverlay(overlay, {
-				anchor: "bottom-center",
-				width: "100%",
-				maxHeight: "100%",
-				margin: 0,
-				fullscreen: true,
+			prompt = this.#beginNativePrompt("custom", generation);
+			let overlayHandle: OverlayHandle | undefined;
+			this.#runNativePrompt(prompt, () => {
+				overlayHandle = this.ctx.ui.showOverlay(overlay, {
+					anchor: "bottom-center",
+					width: "100%",
+					maxHeight: "100%",
+					margin: 0,
+					fullscreen: true,
+				});
+				this.ctx.ui.setFocus(overlay);
+				this.ctx.ui.requestRender();
 			});
-			this.ctx.ui.setFocus(overlay);
-			this.ctx.ui.requestRender();
 		})();
 	}
 
@@ -596,7 +695,7 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				() => {
-					done();
+					done("cancelled");
 					this.ctx.ui.requestRender();
 				},
 			);
@@ -653,10 +752,27 @@ export class SelectorController {
 	 * to the editor when the user closes it.
 	 */
 	async showGitTui(revision?: string): Promise<void> {
+		const generation = this.#promptGeneration;
+		let prompt: NativePromptHandle | undefined;
+		let outcome: NativePromptOutcome = "cancelled";
 		try {
-			await showGitOverlay(this.ctx.ui, { cwd: getProjectDir(), revision });
+			await showGitOverlay(this.ctx.ui, {
+				cwd: getProjectDir(),
+				revision,
+				onInputModeChange: active => {
+					if (active) {
+						prompt ??= this.#beginNativePrompt("input", generation);
+					} else {
+						this.#resolveNativePrompt(prompt, "completed");
+						prompt = undefined;
+					}
+				},
+			});
 		} catch (error) {
+			outcome = "error";
 			this.ctx.showStatus(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.#resolveNativePrompt(prompt, outcome);
 		}
 		this.focusActiveEditorArea();
 		this.ctx.ui.requestRender();
@@ -669,11 +785,14 @@ export class SelectorController {
 	async showAgentsDashboard(): Promise<void> {
 		if (this.#focusOpenMenu("agents-dashboard")) return;
 		const menu = this.#claimMenu("agents-dashboard");
+		const generation = this.#promptGeneration;
+		let prompt: NativePromptHandle | undefined;
 		const activeModel = this.ctx.session.model;
 		const activeModelPattern = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
 		const defaultModelPattern = this.ctx.settings.getModelRole("default");
 		let closed = false;
 		const done = () => {
+			this.#resolveNativePrompt(prompt, "cancelled");
 			if (closed) return;
 			closed = true;
 			hub?.dispose();
@@ -695,14 +814,22 @@ export class SelectorController {
 					defaultModelPattern,
 					model => this.ctx.session.effectiveServiceTier(model),
 				),
-				{ onCancel: () => done() },
+				{
+					onCancel: () => done(),
+					onPromptChange: kind => {
+						if (prompt?.request.kind === kind) return;
+						this.#resolveNativePrompt(prompt, "completed");
+						prompt = kind ? this.#beginNativePrompt(kind, generation) : undefined;
+					},
+				},
 			);
 		} catch (error) {
 			// A dashboard that never opened must not block the next `/agents`.
 			this.#releaseMenu("agents-dashboard", menu);
+			this.#resolveNativePrompt(prompt, "error");
 			throw error;
 		}
-		this.#mountMenu(menu, hub, () => this.#showFullscreenMenu(hub));
+		this.#mountMenu(menu, hub, () => this.#showFullscreenMenu(hub), prompt);
 	}
 
 	/**
@@ -799,7 +926,10 @@ export class SelectorController {
 		const taskOverride = cfgTaskAgentModelOverrides.get(this.ctx.settings).task;
 		const taskSelector = (Array.isArray(taskOverride) ? taskOverride[0] : taskOverride) ?? currentSelector;
 		let closed = false;
-		const done = () => {
+		const generation = this.#promptGeneration;
+		let prompt: NativePromptHandle | undefined;
+		const done = (outcome: NativePromptOutcome = "completed") => {
+			this.#resolveNativePrompt(prompt, outcome);
 			if (closed) return;
 			closed = true;
 			menu.handle?.hide();
@@ -814,6 +944,7 @@ export class SelectorController {
 			this.ctx.session.scopedModels,
 			{
 				onPick: async (model, selector, { overContext }) => {
+					this.#resolveNativePrompt(prompt, "completed");
 					try {
 						// Over-context pick: close the picker first so the compaction
 						// loader is visible.
@@ -822,9 +953,11 @@ export class SelectorController {
 						if (!overContext) done();
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						if (!closed) prompt = this.#beginNativePrompt("select", generation);
 					}
 				},
 				onPickRole: async entry => {
+					this.#resolveNativePrompt(prompt, "completed");
 					try {
 						await this.ctx.session.applyRoleModel(entry);
 						this.ctx.statusLine.invalidate();
@@ -836,9 +969,11 @@ export class SelectorController {
 						done();
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						if (!closed) prompt = this.#beginNativePrompt("select", generation);
 					}
 				},
 				onPickTask: (_model, selector) => {
+					this.#resolveNativePrompt(prompt, "completed");
 					// Session-only: layer the Task override onto the runtime settings
 					// layer so it is never persisted, mirroring the session-model pick.
 					cfgTaskAgentModelOverrides.override(this.ctx.settings, {
@@ -848,7 +983,7 @@ export class SelectorController {
 					this.ctx.showStatus(`Task subagent model (session-only): ${selector}. Use /agents to persist.`);
 					done();
 				},
-				onCancel: done,
+				onCancel: () => done("cancelled"),
 			},
 			{
 				currentContextTokens,
@@ -861,6 +996,7 @@ export class SelectorController {
 			},
 		);
 		const menu = this.#claimMenu("model-picker");
+		prompt = this.#beginNativePrompt("select", generation);
 		this.#mountMenu(menu, picker, () => {
 			const handle = this.ctx.ui.showOverlay(picker, {
 				anchor: "bottom-center",
@@ -870,7 +1006,7 @@ export class SelectorController {
 			});
 			this.ctx.ui.setFocus(picker);
 			return handle;
-		});
+		}, prompt);
 		this.ctx.ui.requestRender();
 	}
 
@@ -884,7 +1020,9 @@ export class SelectorController {
 		if (this.#focusOpenMenu("model-hub")) return;
 		const { ModelHubComponent } = loadModelOverlayComponents();
 		let closed = false;
-		const done = () => {
+		let prompt: NativePromptHandle | undefined;
+		const done = (outcome: NativePromptOutcome = "completed") => {
+			this.#resolveNativePrompt(prompt, outcome);
 			// Re-entrant guard: cancel paths (Esc, login forward) may race;
 			// the overlay must hide exactly once.
 			if (closed) return;
@@ -1158,7 +1296,7 @@ export class SelectorController {
 						hub?.refreshAfterExternalMutation();
 					}
 				},
-				onCancel: () => done(),
+				onCancel: () => done("cancelled"),
 			},
 			{
 				initialProviderId: hubOptions.initialProviderId,
@@ -1168,7 +1306,8 @@ export class SelectorController {
 			},
 		);
 		const menu = this.#claimMenu("model-hub");
-		this.#mountMenu(menu, hub, () => this.#showFullscreenMenu(hub));
+		prompt = this.#beginNativePrompt("custom");
+		this.#mountMenu(menu, hub, () => this.#showFullscreenMenu(hub), prompt);
 	}
 
 	/** /login round-trip for a locked provider; reopen the hub on that provider only after a successful login. */
@@ -1221,7 +1360,7 @@ export class SelectorController {
 						this.ctx.ui.requestRender();
 					},
 					onCancel: () => {
-						done();
+						done("cancelled");
 						this.ctx.ui.requestRender();
 					},
 				});
@@ -1258,7 +1397,7 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				onCancel: () => {
-					done();
+					done("cancelled");
 					this.ctx.ui.requestRender();
 				},
 			});
@@ -1273,7 +1412,9 @@ export class SelectorController {
 			return;
 		}
 
-		const done = () => {
+		let prompt: NativePromptHandle | undefined;
+		const done = (outcome: NativePromptOutcome = "completed") => {
+			this.#resolveNativePrompt(prompt, outcome);
 			overlayHandle?.hide();
 			selector?.dispose();
 			this.focusActiveEditorArea();
@@ -1291,8 +1432,11 @@ export class SelectorController {
 			linkTargets: getAssistantMessageLinkTargets(this.ctx),
 			requestRender: () => this.ctx.ui.requestRender(),
 			siblingPaths: entryId => this.#siblingBranchPaths(entryId),
-			onSelect: entryId => void this.#rewindFromTranscript(entryId, done),
-			onCancel: done,
+			onSelect: entryId => {
+				this.#resolveNativePrompt(prompt, "completed");
+				void this.#rewindFromTranscript(entryId, done);
+			},
+			onCancel: () => done("cancelled"),
 		});
 		if (selector.targetCount === 0) {
 			selector.dispose();
@@ -1302,15 +1446,19 @@ export class SelectorController {
 		// Fullscreen alternate-screen overlay: the transcript replica draws over
 		// the live one, and the normal screen stays untouched until the rewind
 		// itself rewrites it.
-		const overlayHandle = this.ctx.ui.showOverlay(selector, {
-			anchor: "bottom-center",
-			width: "100%",
-			maxHeight: "100%",
-			margin: 0,
-			fullscreen: true,
+		prompt = this.#beginNativePrompt("select");
+		let overlayHandle: OverlayHandle | undefined;
+		this.#runNativePrompt(prompt, () => {
+			overlayHandle = this.ctx.ui.showOverlay(selector, {
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+			});
+			this.ctx.ui.setFocus(selector);
+			this.ctx.ui.requestRender();
 		});
-		this.ctx.ui.setFocus(selector);
-		this.ctx.ui.requestRender();
 	}
 
 	/**
@@ -1405,7 +1553,9 @@ export class SelectorController {
 			return;
 		}
 
-		const done = () => {
+		let prompt: NativePromptHandle | undefined;
+		const done = (outcome: NativePromptOutcome = "completed") => {
+			this.#resolveNativePrompt(prompt, outcome);
 			overlayHandle?.hide();
 			selector?.dispose();
 			this.focusActiveEditorArea();
@@ -1436,22 +1586,26 @@ export class SelectorController {
 				openPath(href);
 				this.ctx.showStatus(`Opening ${label}: ${href}`);
 			},
-			onCancel: done,
+			onCancel: () => done("cancelled"),
 		});
 		if (selector.targetCount === 0) {
 			selector.dispose();
 			this.ctx.showStatus("Nothing to copy yet.");
 			return;
 		}
-		const overlayHandle = this.ctx.ui.showOverlay(selector, {
-			anchor: "bottom-center",
-			width: "100%",
-			maxHeight: "100%",
-			margin: 0,
-			fullscreen: true,
+		prompt = this.#beginNativePrompt("select");
+		let overlayHandle: OverlayHandle | undefined;
+		this.#runNativePrompt(prompt, () => {
+			overlayHandle = this.ctx.ui.showOverlay(selector, {
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+			});
+			this.ctx.ui.setFocus(selector);
+			this.ctx.ui.requestRender();
 		});
-		this.ctx.ui.setFocus(selector);
-		this.ctx.ui.requestRender();
 	}
 
 	showTreeSelector(): void {
@@ -1622,7 +1776,7 @@ export class SelectorController {
 					}
 				},
 				() => {
-					done();
+					done("cancelled");
 					this.ctx.ui.requestRender();
 				},
 				(entryId, label) => {
@@ -1723,6 +1877,7 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(source?: ForeignSessionSource): Promise<void> {
+		const generation = this.#promptGeneration;
 		let sessions: SessionInfo[];
 		let onSelectSession: (session: SessionInfo) => Promise<boolean>;
 		let selectorOptions: SessionSelectorOptions<SessionInfo>;
@@ -1808,7 +1963,9 @@ export class SelectorController {
 
 		// Keep the fullscreen picker on the alternate buffer while a selected
 		// session is loaded and its transcript is rebuilt.
-		const done = () => {
+		let prompt: NativePromptHandle | undefined;
+		const done = (outcome: NativePromptOutcome = "completed") => {
+			this.#resolveNativePrompt(prompt, outcome);
 			overlayHandle?.hide();
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
@@ -1816,6 +1973,7 @@ export class SelectorController {
 		const selector = new SessionSelectorComponent(
 			sessions,
 			async (session: SessionInfo) => {
+				this.#resolveNativePrompt(prompt, "completed");
 				selector.lockInput();
 				let keepOpen = false;
 				try {
@@ -1823,6 +1981,7 @@ export class SelectorController {
 					if (!success) {
 						keepOpen = true;
 						selector.unlockInput();
+						prompt = this.#beginNativePrompt("select", generation);
 						this.ctx.ui.requestRender();
 					}
 				} catch (error) {
@@ -1831,11 +1990,11 @@ export class SelectorController {
 					if (!keepOpen) done();
 				}
 			},
-			done,
+			() => done("cancelled"),
 			() => {
 				// Release the alt buffer before teardown: shutdown() awaits flush/save/
 				// dispose/drain before stop() leaves the alt screen.
-				done();
+				done("cancelled");
 				void this.ctx.shutdown();
 			},
 			{
@@ -1845,15 +2004,19 @@ export class SelectorController {
 			},
 		);
 		selector.setOnRequestRender(() => this.ctx.ui.requestRender());
-		const overlayHandle = this.ctx.ui.showOverlay(selector, {
-			anchor: "top-left",
-			width: "100%",
-			maxHeight: "100%",
-			margin: 0,
-			fullscreen: true,
+		prompt = this.#beginNativePrompt("select", generation);
+		let overlayHandle: OverlayHandle | undefined;
+		this.#runNativePrompt(prompt, () => {
+			overlayHandle = this.ctx.ui.showOverlay(selector, {
+				anchor: "top-left",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+			});
+			this.ctx.ui.setFocus(selector);
+			this.ctx.ui.requestRender();
 		});
-		this.ctx.ui.setFocus(selector);
-		this.ctx.ui.requestRender();
 	}
 
 	#refreshSessionTerminalTitle(): void {
@@ -2025,6 +2188,7 @@ export class SelectorController {
 			if (restored) return;
 			restored = true;
 			this.ctx.editorContainer.clear();
+			this.endSelectorPrompts();
 			this.ctx.editorContainer.addChild(this.ctx.editor);
 			this.ctx.ui.setFocus(this.ctx.editor);
 			this.ctx.ui.requestRender();
@@ -2041,6 +2205,7 @@ export class SelectorController {
 			openPath,
 		);
 		this.ctx.editorContainer.clear();
+		this.endSelectorPrompts();
 		this.ctx.editorContainer.addChild(dialog);
 		this.ctx.ui.setFocus(dialog);
 		this.ctx.ui.requestRender();
@@ -2053,7 +2218,11 @@ export class SelectorController {
 					// opens the browser best-effort.
 					dialog.showAuth(info.url, info.instructions, info.launchUrl);
 				},
-				onPrompt: prompt => dialog.showPrompt(prompt),
+				onPrompt: prompt => {
+					const action = () => dialog.showPrompt(prompt);
+					const runner = this.ctx.session.extensionRunner;
+					return runner ? runner.observeNativePrompt("input", action, { signal: dialog.signal }) : action();
+				},
 				onProgress: (message: string) => {
 					dialog.showProgress(message);
 				},
@@ -2064,11 +2233,15 @@ export class SelectorController {
 				// editor's `/login <url>` path is unreachable while the dialog holds
 				// focus (#5339).
 				onManualCodeInput: useManualInput
-					? signal =>
-							dialog.showManualInput(
-								`Paste the authorization code (or full redirect URL), then press ${editorKey("tui.input.submit")}:`,
-								signal,
-							)
+					? signal => {
+							const action = () =>
+								dialog.showManualInput(
+									`Paste the authorization code (or full redirect URL), then press ${editorKey("tui.input.submit")}:`,
+									signal,
+								);
+							const runner = this.ctx.session.extensionRunner;
+							return runner ? runner.observeNativePrompt("input", action, { signal }) : action();
+						}
 					: undefined,
 			});
 			// Scope the post-login refresh to the just-authenticated provider with an
@@ -2178,7 +2351,7 @@ export class SelectorController {
 					void this.#handleCredentialLogout(providerId, account);
 				},
 				() => {
-					done();
+					done("cancelled");
 					this.ctx.ui.requestRender();
 				},
 			);
@@ -2224,7 +2397,7 @@ export class SelectorController {
 				},
 				() => {
 					selector.stopValidation();
-					done();
+					done("cancelled");
 					this.ctx.ui.requestRender();
 				},
 				{
@@ -2294,7 +2467,7 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				() => {
-					done();
+					done("cancelled");
 					this.ctx.ui.requestRender();
 				},
 			);
@@ -2340,7 +2513,7 @@ export class SelectorController {
 					void this.#redeemReset(account);
 				},
 				() => {
-					done();
+					done("cancelled");
 					this.ctx.ui.requestRender();
 				},
 			);
@@ -2399,7 +2572,7 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 				() => {
-					done();
+					done("cancelled");
 					this.ctx.ui.requestRender();
 				},
 			);

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- An explicitly registered trusted in-process controller can approve one pending tool request using immutable effective arguments, session directory, and a native request identity/fingerprint. Missing, multiple, invalid, stale, or unavailable controllers retain human approval; lifecycle listeners remain observers and provider safety checks cannot be bypassed.
+- Extensions can observe payload-free `native_prompt_requested` / `native_prompt_resolved` events and reconcile frozen pending snapshots, with native identities/timestamps across tool/provider approvals, awaited UI, explicitly owned settings/selector/hub/Git input lifetimes, RPC and ACP permission waits. Observation never answers prompts or changes approval grants.
+
+### Fixed
+
+- Cancelling native tool approval now cancels the actual approve/select dialog and pending approval observers. Cancelled calls cannot execute after resolution observers, and late observer UI cannot reopen the aborted approval.
+
 ## [18.10.4] - 2026-10-13
 
 ### Added

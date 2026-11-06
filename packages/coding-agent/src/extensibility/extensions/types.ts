@@ -34,6 +34,7 @@ import type {
 	ThinkingLevel,
 	ToolApproval,
 	ToolLoadMode,
+	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
@@ -277,6 +278,10 @@ export interface ExtensionUIContext {
 	timeoutStartsOnPresentation?: boolean;
 	/** True when pasteToEditor updates a local or remote composer; absent means unsupported. */
 	supportsEditor?: boolean;
+	/** Explicit false when dialog methods only return unsupported defaults, not user-response UI. */
+	supportsDialogs?: boolean;
+	/** Explicit false when custom TUI is unsupported even though standard dialogs exist. */
+	supportsCustom?: boolean;
 	/** Show a selector and return the selected label, even when an option also includes a description. */
 	select(
 		title: string,
@@ -686,6 +691,8 @@ export interface ExtensionContext {
 	 * or `undefined`. Lets an extension that loaded or reconnected after the event answer the review.
 	 */
 	getPendingPlanReview(): PlanReviewRequestedEvent | undefined;
+	/** Metadata-only snapshot of real currently pending native prompt lifetimes in this runner. */
+	getPendingNativePrompts(): readonly NativePromptRequest[];
 	/**
 	 * Open the interactive plan review on the newest plan file, like `/plan-review`, while the
 	 * session is idle. True once a review is awaiting an answer (an already-open review is kept,
@@ -1226,6 +1233,89 @@ export interface InputEvent {
 // Tool Events
 // ============================================================================
 
+/** Native observation only: these events never answer or approve a prompt. */
+export type NativePromptKind =
+	| "tool-approval"
+	| "provider-safety"
+	| "select"
+	| "confirm"
+	| "input"
+	| "ask"
+	| "editor"
+	| "custom";
+
+export interface NativePromptRequest {
+	readonly requestId: string;
+	/** Native Date.now() epoch milliseconds when this managed prompt became pending. */
+	readonly requestedAt: number;
+	readonly sessionId: string;
+	readonly kind: NativePromptKind;
+	readonly parentRequestId?: string;
+	readonly toolCallId?: string;
+	readonly toolName?: string;
+}
+
+export type NativePromptOutcome = "completed" | "cancelled" | "error";
+
+/** Native integration handle: settles observation, never the UI or an approval. */
+export interface NativePromptHandle {
+	readonly request: NativePromptRequest;
+	resolve(outcome?: NativePromptOutcome): void;
+	/** Propagate a known callback root into its actual nested UI calls. */
+	run<T>(action: () => T): T;
+}
+
+export interface NativePromptRequestedEvent {
+	type: "native_prompt_requested";
+	readonly request: NativePromptRequest;
+}
+
+export interface NativePromptResolvedEvent {
+	type: "native_prompt_resolved";
+	readonly requestId: string;
+	readonly sessionId: string;
+	readonly resolvedAt: number;
+	/** No answer, input, prompt text, payload or error detail is exposed. */
+	readonly outcome: NativePromptOutcome;
+}
+
+export type NativePromptEvent = NativePromptRequestedEvent | NativePromptResolvedEvent;
+
+/** Lossless JSON arguments, detached from execution input and recursively frozen. */
+export type ToolApprovalInput =
+	| null
+	| boolean
+	| number
+	| string
+	| readonly ToolApprovalInput[]
+	| { readonly [key: string]: ToolApprovalInput };
+
+/** A native, single-use approval request created after tool-call interceptors. */
+export interface ToolApprovalRequest {
+	readonly requestId: string;
+	/** Native epoch milliseconds, included in the exact request fingerprint. */
+	readonly requestedAt: number;
+	/** SHA-256 of the request identity, effective arguments and approval context. */
+	readonly fingerprint: string;
+	readonly sessionId: string;
+	readonly toolCallId: string;
+	readonly toolName: string;
+	readonly cwd: string;
+	readonly arguments: ToolApprovalInput;
+	readonly approvalMode: ApprovalMode;
+	readonly tier: ToolTier;
+}
+
+/** A trusted controller may approve only this request, or retain the human gate. */
+export type ToolApprovalDeciderResult =
+	| { decision: "approve-once"; requestId: string; fingerprint: string }
+	| { decision: "pass" };
+
+export type ToolApprovalDecider = (
+	request: ToolApprovalRequest,
+	ctx: ExtensionContext,
+) => ToolApprovalDeciderResult | void | Promise<ToolApprovalDeciderResult | void>;
+
 export interface ToolApprovalRequestedEvent {
 	type: "tool_approval_requested";
 	sessionId: string;
@@ -1233,6 +1323,12 @@ export interface ToolApprovalRequestedEvent {
 	toolName: string;
 	reason?: string;
 	approvalMode: ApprovalMode;
+	/** Absent when a lossless request is unavailable, including provider safety checks. */
+	readonly request?: ToolApprovalRequest;
+	/** Always supplied by the native wrapper, even when no decider snapshot is available. */
+	readonly prompt?: NativePromptRequest;
+	/** Owning native call cancellation; observers cannot keep it pending after abort. */
+	readonly signal?: AbortSignal;
 }
 
 export interface ToolApprovalResolvedEvent {
@@ -1242,6 +1338,9 @@ export interface ToolApprovalResolvedEvent {
 	toolName: string;
 	approved: boolean;
 	reason?: string;
+	/** Correlates resolution with the native request, when available. */
+	readonly requestId?: string;
+	readonly requestedAt?: number;
 }
 
 /** Stable ids for the interactive plan review's choices; labels may change (keep's label carries a token count). */
@@ -1466,6 +1565,8 @@ export type ExtensionEvent =
 	| ToolResultEvent
 	| ToolApprovalRequestedEvent
 	| ToolApprovalResolvedEvent
+	| NativePromptRequestedEvent
+	| NativePromptResolvedEvent
 	| PlanReviewRequestedEvent
 	| PlanReviewResolvedEvent;
 
@@ -1670,6 +1771,8 @@ export interface ExtensionAPI {
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
 	on(event: "tool_approval_requested", handler: ExtensionHandler<ToolApprovalRequestedEvent>): void;
 	on(event: "tool_approval_resolved", handler: ExtensionHandler<ToolApprovalResolvedEvent>): void;
+	on(event: "native_prompt_requested", handler: ExtensionHandler<NativePromptRequestedEvent>): void;
+	on(event: "native_prompt_resolved", handler: ExtensionHandler<NativePromptResolvedEvent>): void;
 	on(event: "plan_review_requested", handler: ExtensionHandler<PlanReviewRequestedEvent>): void;
 	on(event: "plan_review_resolved", handler: ExtensionHandler<PlanReviewResolvedEvent>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
@@ -1681,6 +1784,9 @@ export interface ExtensionAPI {
 	// =========================================================================
 	// Tool Registration
 	// =========================================================================
+
+	/** Register one trusted approval controller. Multiple controllers retain human approval. */
+	registerApprovalDecider(decider: ToolApprovalDecider): void;
 
 	/** Register a tool that the LLM can call. */
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void;
@@ -2166,6 +2272,7 @@ export interface Extension {
 	resolvedPath: string;
 	label?: string;
 	handlers: Map<string, HandlerFn[]>;
+	approvalDeciders?: ToolApprovalDecider[];
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];

@@ -1,7 +1,16 @@
 import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { type Component, Container, isFocusable, type OverlayOptions, setKeybindings } from "@oh-my-pi/pi-tui";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
-import type { ExtensionAskDialogQuestion, ExtensionUIContext } from "../../../src/extensibility/extensions";
+import type {
+	Extension,
+	ExtensionAskDialogQuestion,
+	ExtensionUIContext,
+	NativePromptEvent,
+} from "../../../src/extensibility/extensions";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
@@ -67,6 +76,7 @@ function makeHarness() {
 	const controller = new ExtensionUiController(ctx);
 
 	return {
+		ctx,
 		editor,
 		requestRender,
 		addAutocompleteProvider,
@@ -93,6 +103,186 @@ function makeHarness() {
 		},
 	};
 }
+
+async function makeObservedHarness(onEvent?: (event: NativePromptEvent) => Promise<void>) {
+	const harness = makeHarness();
+	const ui = await harness.init();
+	const events: NativePromptEvent[] = [];
+	const handlers: Extension["handlers"] = new Map();
+	const record = async (...args: unknown[]): Promise<void> => {
+		const event = args[0] as NativePromptEvent;
+		events.push(event);
+		await onEvent?.(event);
+	};
+	handlers.set("native_prompt_requested", [record]);
+	handlers.set("native_prompt_resolved", [record]);
+	const extension: Extension = {
+		path: "/test/native-prompt-observer.ts",
+		resolvedPath: "/test/native-prompt-observer.ts",
+		handlers,
+		tools: new Map(),
+		assistantThinkingRenderers: [],
+		fileWriteFallbackHandlers: [],
+		fileDeleteFallbackHandlers: [],
+		messageRenderers: new Map(),
+		composerShapes: new Map(),
+		commands: new Map(),
+		flags: new Map(),
+		shortcuts: new Map(),
+	};
+	const sessionManager = SessionManager.inMemory();
+	const runner = new ExtensionRunner(
+		[extension],
+		new ExtensionRuntime(),
+		sessionManager.getCwd(),
+		sessionManager,
+		{} as ModelRegistry,
+	);
+	Object.defineProperty(harness.ctx.session, "extensionRunner", { value: runner });
+	return { ...harness, events, runner, ui: runner.observeUIContext(ui), sessionId: sessionManager.getSessionId() };
+}
+
+describe("ExtensionUiController native prompt lifecycle", () => {
+	it("observes a direct managed confirmation once without exposing its payload or answer", async () => {
+		const harness = await makeObservedHarness();
+		const before = Date.now();
+		const pending = harness.controller.showHookConfirm("private title", "private question");
+		expect(harness.events).toHaveLength(1);
+		const requested = harness.events[0];
+		if (requested?.type !== "native_prompt_requested") throw new Error("Expected a pending prompt");
+		expect(requested.request).toEqual({
+			requestId: expect.any(String),
+			requestedAt: expect.any(Number),
+			sessionId: harness.sessionId,
+			kind: "confirm",
+		});
+		expect(requested.request.requestedAt).toBeGreaterThanOrEqual(before);
+		harness.handleInput("\r");
+		expect(await pending).toBe(true);
+		expect(harness.events).toHaveLength(2);
+		expect(harness.events[1]).toEqual({
+			type: "native_prompt_resolved",
+			requestId: requested.request.requestId,
+			sessionId: harness.sessionId,
+			resolvedAt: expect.any(Number),
+			outcome: "completed",
+		});
+		expect(JSON.stringify(harness.events)).not.toContain("private");
+	});
+
+	it("keeps wrapped extension selectors and their raw TUI await in one root", async () => {
+		const harness = await makeObservedHarness();
+		const pending = harness.ui.select("private selector", ["private answer"]);
+		expect(harness.events).toHaveLength(1);
+		expect(harness.events[0]).toMatchObject({ type: "native_prompt_requested", request: { kind: "select" } });
+		harness.handleInput("\r");
+		expect(await pending).toBe("private answer");
+		expect(harness.events.map(event => event.type)).toEqual(["native_prompt_requested", "native_prompt_resolved"]);
+		expect(JSON.stringify(harness.events)).not.toContain("private");
+	});
+
+	it("settles an independently queued input on abort without settling the active selector", async () => {
+		const harness = await makeObservedHarness();
+		const active = new AbortController();
+		const queued = new AbortController();
+		const first = harness.controller.showHookSelector("active", ["one"], { signal: active.signal });
+		const second = harness.controller.showHookInput("queued", undefined, { signal: queued.signal });
+		const [firstRequest, secondRequest] = harness.events;
+		if (firstRequest?.type !== "native_prompt_requested" || secondRequest?.type !== "native_prompt_requested") {
+			throw new Error("Expected concurrent pending prompts");
+		}
+		expect(firstRequest.request.kind).toBe("select");
+		expect(secondRequest.request.kind).toBe("input");
+		expect(firstRequest.request.requestId).not.toBe(secondRequest.request.requestId);
+		queued.abort();
+		expect(await second).toBeUndefined();
+		expect(harness.events).toHaveLength(3);
+		expect(harness.events[2]).toMatchObject({
+			type: "native_prompt_resolved",
+			requestId: secondRequest.request.requestId,
+			outcome: "cancelled",
+		});
+		active.abort();
+		expect(await first).toBeUndefined();
+		expect(harness.events[3]).toMatchObject({
+			type: "native_prompt_resolved",
+			requestId: firstRequest.request.requestId,
+			outcome: "cancelled",
+		});
+	});
+
+	it("observes raw editor and ask awaits while preserving signal cancellation", async () => {
+		const harness = await makeObservedHarness();
+		for (const kind of ["editor", "ask"] as const) {
+			const abort = new AbortController();
+			const pending = kind === "editor"
+				? harness.controller.showHookEditor("private editor", "private prefill", { signal: abort.signal })
+				: harness.controller.showAskDialog(
+						[{ id: "private id", question: "private question", options: [{ label: "private option" }] }],
+						{ signal: abort.signal },
+					);
+			expect(harness.events.at(-1)).toMatchObject({ type: "native_prompt_requested", request: { kind } });
+			abort.abort();
+			expect(await pending).toBeUndefined();
+			expect(harness.events.at(-1)).toMatchObject({ type: "native_prompt_resolved", outcome: "cancelled" });
+		}
+		expect(harness.events).toHaveLength(4);
+		expect(JSON.stringify(harness.events)).not.toContain("private");
+	});
+
+	it("observes one approval root and preserves denial on signal abort", async () => {
+		const harness = await makeObservedHarness();
+		const abort = new AbortController();
+		const pending = harness.controller.showCollabAwareApproval(
+			{ compact: "private compact prompt", full: "private full prompt" },
+			{ signal: abort.signal },
+		);
+		expect(harness.events).toHaveLength(1);
+		expect(harness.events[0]).toMatchObject({
+			type: "native_prompt_requested",
+			request: { kind: "tool-approval" },
+		});
+		abort.abort();
+		expect(await pending).toBe(false);
+		expect(harness.events).toHaveLength(2);
+		expect(harness.events[1]).toMatchObject({ type: "native_prompt_resolved", outcome: "cancelled" });
+		expect(JSON.stringify(harness.events)).not.toContain("private");
+	});
+
+	it("does not wait for a subscribed observer before presenting or settling UI", async () => {
+		const observed = Promise.withResolvers<void>();
+		const harness = await makeObservedHarness(() => observed.promise);
+		try {
+			const pending = harness.controller.showHookConfirm("Confirm", "Continue?");
+			expect(harness.events).toHaveLength(1);
+			harness.handleInput("\r");
+			expect(await pending).toBe(true);
+			expect(harness.events).toHaveLength(2);
+		} finally {
+			observed.resolve();
+		}
+	});
+
+	it("observes custom completion and factory failure without treating all component presence as pending", async () => {
+		const harness = await makeObservedHarness();
+		const result = { answer: "private result" };
+		const pending = harness.ui.custom<typeof result>((_tui, _theme, _keys, done) => {
+			done(result);
+			return new Container();
+		});
+		expect(await pending).toBe(result);
+		expect(harness.events).toHaveLength(2);
+		expect(harness.events[0]).toMatchObject({ type: "native_prompt_requested", request: { kind: "custom" } });
+		expect(harness.events[1]).toMatchObject({ type: "native_prompt_resolved", outcome: "completed" });
+		const failure = new Error("private failure");
+		await expect(harness.controller.showHookCustom(() => {
+			throw failure;
+		})).rejects.toBe(failure);
+		expect(harness.events).toHaveLength(4);
+		expect(harness.events[3]).toMatchObject({ type: "native_prompt_resolved", outcome: "error" });
+		expect(JSON.stringify(harness.events)).not.toContain("private");
+	});
+});
 
 describe("ExtensionUiController Ask dialog input", () => {
 	const questions: ExtensionAskDialogQuestion[] = [

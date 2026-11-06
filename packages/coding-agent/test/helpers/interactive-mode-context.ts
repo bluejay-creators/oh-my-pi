@@ -205,10 +205,14 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 			? undefined
 			: createSessionStub(sessionManager, contextSettings, overrides.viewSession);
 	const chatContainer = new TranscriptContainer();
+	let focused: Component | null = null;
 	const ui = {
 		requestRender: vi.fn(),
 		requestComponentRender: vi.fn(),
-		setFocus: vi.fn(),
+		setFocus: vi.fn((component: Component | null) => {
+			focused = component;
+		}),
+		getFocused: () => focused,
 		terminal: { setProgress: vi.fn() },
 		imageBudget: undefined,
 		overlayStack: [],
@@ -230,6 +234,7 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 			markActivityStart: vi.fn(),
 			markActivityEnd: vi.fn(),
 			setSession: vi.fn(),
+			updateSettings: vi.fn(),
 		},
 		session,
 		get viewSession() {
