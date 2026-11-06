@@ -216,6 +216,8 @@ export interface MCPStartupStatus {
 
 /** Options for discovering and connecting to MCP servers */
 export interface MCPDiscoverOptions {
+	/** Discover only servers eligible for automatic subagent inheritance. */
+	forSubagent?: boolean;
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
@@ -295,6 +297,7 @@ export class MCPManager {
 
 	#connections = new Map<string, MCPServerConnection>();
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
+	#subagentToolViews = new WeakMap<CustomTool<TSchema, MCPToolDetails>, CustomTool<TSchema, MCPToolDetails>>();
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
 	#startupUpdates = new Map<string, Promise<void>>();
@@ -654,6 +657,7 @@ export class MCPManager {
 		let loadedConfigs: LoadMCPConfigsResult;
 		try {
 			loadedConfigs = await this.loadConfigs(this.cwd, {
+				forSubagent: options?.forSubagent,
 				enableProjectConfig: options?.enableProjectConfig,
 				filterExa: options?.filterExa,
 				filterBrowser: options?.filterBrowser,
@@ -701,6 +705,7 @@ export class MCPManager {
 		if (!options || (options.enableProjectConfig ?? true) === enabled) return;
 		this.#discoverOptions = { ...options, enableProjectConfig: enabled };
 		const loaded = await this.loadConfigs(this.cwd, {
+			forSubagent: options.forSubagent,
 			enableProjectConfig: enabled,
 			filterExa: options.filterExa,
 			filterBrowser: options.filterBrowser,
@@ -735,6 +740,7 @@ export class MCPManager {
 	async #applyBrowserFilter(enabled: boolean): Promise<void> {
 		const options = this.#discoverOptions;
 		const loaded = await this.loadConfigs(this.cwd, {
+			forSubagent: options?.forSubagent,
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: false,
@@ -1173,10 +1179,29 @@ export class MCPManager {
 	}
 
 	/**
-	 * Get all loaded tools.
+	 * Get loaded tools, optionally limited to automatic subagent inheritance.
 	 */
-	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
-		return this.#tools;
+	getTools(forSubagent = false): CustomTool<TSchema, MCPToolDetails>[] {
+		if (!forSubagent) return this.#tools;
+		const tools: CustomTool<TSchema, MCPToolDetails>[] = [];
+		for (const tool of this.#tools) {
+			if (!this.isServerInherited(tool.mcpServerName ?? "")) continue;
+			let guarded = this.#subagentToolViews.get(tool);
+			if (!guarded) {
+				guarded = {
+					...tool,
+					execute: (...args) => {
+						if (!this.isServerInherited(tool.mcpServerName ?? "")) {
+							throw new Error(`MCP server "${tool.mcpServerName}" is not inherited by subagents`);
+						}
+						return tool.execute(...args);
+					},
+				};
+				this.#subagentToolViews.set(tool, guarded);
+			}
+			tools.push(guarded);
+		}
+		return tools;
 	}
 
 	/**
@@ -1259,6 +1284,11 @@ export class MCPManager {
 	 */
 	getServerConfig(name: string): MCPServerConfig | undefined {
 		return this.#connections.get(name)?.config ?? this.#serverConfigs.get(name);
+	}
+
+	/** Whether this server may be exposed through automatic subagent inheritance. */
+	isServerInherited(name: string): boolean {
+		return this.getServerConfig(name)?.inheritInSubagents !== false;
 	}
 
 	/**
@@ -1998,9 +2028,10 @@ export class MCPManager {
 	/**
 	 * Get server instructions allowed by config (for prompt injection and rebuild signatures).
 	 */
-	getServerInstructions(): Map<string, string> {
+	getServerInstructions(forSubagent = false): Map<string, string> {
 		const instructions = new Map<string, string>();
 		for (const [name, connection] of this.#connections) {
+			if (forSubagent && !this.isServerInherited(name)) continue;
 			if (connection.config.instructions !== false && connection.instructions) {
 				instructions.set(name, connection.instructions);
 			}

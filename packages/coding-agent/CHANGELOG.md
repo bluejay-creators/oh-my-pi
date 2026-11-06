@@ -10,6 +10,7 @@
 ### Fixed
 
 - Cancelling native tool approval now cancels the actual approve/select dialog and pending approval observers. Cancelled calls cannot execute after resolution observers, and late observer UI cannot reopen the aborted approval.
+- Added per-server `inheritInSubagents: false` to keep an MCP server available to the parent without exposing its tools or resources to Task children.
 
 ## [18.10.4] - 2026-10-13
 

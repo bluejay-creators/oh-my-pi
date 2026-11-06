@@ -116,6 +116,11 @@
           "type": "boolean",
           "description": "Whether OMP should try to connect this server."
         },
+        "inheritInSubagents": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically expose this server to subagents. Set false to retain parent access without inheriting its tools or resources. OMP-specific: native config, standalone mcp.json/.mcp.json, and OMP extension packages; imported tool configs ignore it."
+        },
         "timeout": {
           "type": "number",
           "minimum": 0,
@@ -150,6 +155,7 @@
           "required": ["command"],
           "properties": {
             "enabled": {},
+            "inheritInSubagents": {},
             "timeout": {},
             "requestIdFormat": {},
             "instructions": {},
@@ -198,6 +204,7 @@
           "required": ["type", "url"],
           "properties": {
             "enabled": {},
+            "inheritInSubagents": {},
             "timeout": {},
             "requestIdFormat": {},
             "instructions": {},
@@ -235,6 +242,7 @@
           "required": ["type", "url"],
           "properties": {
             "enabled": {},
+            "inheritInSubagents": {},
             "timeout": {},
             "requestIdFormat": {},
             "instructions": {},

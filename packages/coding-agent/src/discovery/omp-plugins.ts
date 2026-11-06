@@ -277,6 +277,7 @@ const MCP_FILENAMES = [".mcp.json", "mcp.json"] as const;
 
 interface RawMcpServer {
 	enabled?: boolean;
+	inheritInSubagents?: boolean;
 	timeout?: number;
 	requestIdFormat?: unknown;
 	instructions?: unknown;
@@ -349,6 +350,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 			items.push({
 				name: serverName,
 				...(cfg.enabled !== undefined && { enabled: cfg.enabled }),
+				inheritInSubagents: cfg.inheritInSubagents,
 				...(cfg.timeout !== undefined && { timeout: cfg.timeout }),
 				...(requestIdFormat !== undefined && { requestIdFormat }),
 				...(instructions !== undefined && { instructions }),

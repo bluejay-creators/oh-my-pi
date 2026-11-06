@@ -12,7 +12,8 @@ import { AuthStorage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
+import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
+import type { CustomTool, CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { type CreateAgentSessionOptions, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -85,6 +86,81 @@ describe("subagent session MCP tools follow the shared manager", () => {
 			skipPythonPreflight: true,
 		};
 	}
+
+	it("keeps excluded servers out of changed-cwd children, refreshes, and revived snapshots without removing parent access", async () => {
+		await connectReady({
+			alpha: { ...fixtureConfig(), inheritInSubagents: false },
+			bravo: { ...fixtureConfig(), inheritInSubagents: true },
+			charlie: fixtureConfig(),
+		});
+		const childCwd = path.join(dir, "child");
+		fs.mkdirSync(childCwd);
+		const proxies = createMCPProxyTools(manager);
+		const oldBravo = proxies.find(tool => tool.mcpServerName === "bravo")!;
+		const guardedBravo = manager.getTools(true).find(tool => tool.mcpServerName === "bravo")!;
+		const follower = followMCPTools(manager);
+		const { session: child } = await createAgentSession({
+			...sessionOptions(),
+			cwd: childCwd,
+			mcpManager: manager,
+			mcpTools: proxies,
+			parentTaskPrefix: "ParentOnly-1",
+		});
+		sessions.push(child);
+		follower.bind(child);
+		expect(serversOf(child)).toEqual(["bravo", "charlie"]);
+		expect([...new Set(manager.getTools().map(tool => tool.mcpServerName))].sort()).toEqual([
+			"alpha",
+			"bravo",
+			"charlie",
+		]);
+		const hiddenName = manager.getTools().find(tool => tool.mcpServerName === "alpha")!.name;
+		await expect(callSessionTool(hiddenName, {}, {
+			session: {
+				cwd: childCwd,
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				getToolForEvalBridge: name => child.getToolForEvalBridge(name),
+			},
+		})).rejects.toThrow("Unknown tool");
+
+		// Even a held tool checks current policy before dispatch, not only at
+		// spawn/refresh. Mutate the exposed live config to isolate that boundary.
+		manager.getServerConfig("bravo")!.inheritInSubagents = false;
+		const denied = await oldBravo.execute("revoked-call", {}, undefined, {} as CustomToolContext, undefined);
+		expect(denied.details).toMatchObject({ isError: true, serverName: "bravo" });
+		expect(() => guardedBravo.execute("revoked-direct", {}, undefined, {} as CustomToolContext, undefined)).toThrow(
+			"not inherited",
+		);
+		const parentBravo = manager.getTools().find(tool => tool.mcpServerName === "bravo")!;
+		const parentResult = await parentBravo.execute("parent-call", {}, undefined, {} as CustomToolContext, undefined);
+		expect(parentResult.content).toEqual([{ type: "text", text: "fixture tool called" }]);
+		expect(manager.getConnectedServers().sort()).toEqual(["alpha", "bravo", "charlie"]);
+
+		await manager.disconnectAll();
+		await connectReady({
+			alpha: { ...fixtureConfig(), inheritInSubagents: true },
+			bravo: { ...fixtureConfig(), inheritInSubagents: false },
+			charlie: fixtureConfig(),
+		});
+		await child.runToolRegistryMutation(async () => undefined);
+		expect(serversOf(child)).toEqual(["alpha", "charlie"]);
+		// Kept-alive revival mints its proxies from the current manager snapshot.
+		expect([...new Set(createMCPProxyTools(manager).map(tool => tool.mcpServerName))].sort()).toEqual([
+			"alpha",
+			"charlie",
+		]);
+
+		await manager.disconnectAll();
+		await connectReady({
+			alpha: { ...fixtureConfig(), inheritInSubagents: false },
+			bravo: fixtureConfig(),
+		});
+		await child.runToolRegistryMutation(async () => undefined);
+		expect(serversOf(child)).toEqual(["bravo"]);
+	}, 20_000);
 
 	it("adds and removes a live child's MCP tools across parent reloads", async () => {
 		await connectReady({ alpha: fixtureConfig() });

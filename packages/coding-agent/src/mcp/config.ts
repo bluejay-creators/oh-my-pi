@@ -14,6 +14,8 @@ import type { MCPConfigFile, MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
+	/** Suppress servers that opt out of automatic subagent inheritance. */
+	forSubagent?: boolean;
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
@@ -42,6 +44,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 	const transport = server.transport ?? (server.command ? "stdio" : server.url ? "http" : "stdio");
 	const shared = {
 		enabled: server.enabled,
+		inheritInSubagents: server.inheritInSubagents,
 		timeout: server.timeout,
 		requestIdFormat: server.requestIdFormat,
 		instructions: server.instructions,
@@ -140,6 +143,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	// removed downstream and starve the surviving connection.
 	const suppressServer = (server: MCPServer & { _source: SourceMeta }): boolean => {
 		if (disabledServers.has(server.name)) return true;
+		if (options?.forSubagent && server.inheritInSubagents === false) return true;
 		if (server.enabled === false && !forcedEnabled.has(server.name)) return true;
 		return false;
 	};
@@ -150,6 +154,8 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		filter: includeServer,
 		suppress: suppressServer,
 	});
+	// Invalid server definitions must be reported, not silently discarded.
+	for (const warning of result.warnings) logger.warn(warning);
 
 	// Convert to legacy format and preserve source metadata.
 	let configs: Record<string, MCPServerConfig> = {};
@@ -333,6 +339,9 @@ export function filterExaMCPServers(
  */
 export function validateServerConfig(name: string, config: MCPServerConfig): string[] {
 	const errors: string[] = [];
+	if (config.inheritInSubagents !== undefined && typeof config.inheritInSubagents !== "boolean") {
+		errors.push(`Server "${name}": inheritInSubagents must be a boolean`);
+	}
 
 	const serverType = config.type ?? "stdio";
 

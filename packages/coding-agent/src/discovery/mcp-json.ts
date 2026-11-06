@@ -25,6 +25,7 @@ interface MCPConfigFile {
 		string,
 		{
 			enabled?: boolean;
+			inheritInSubagents?: boolean;
 			timeout?: number;
 			requestIdFormat?: "string" | "number";
 			instructions?: boolean;
@@ -104,6 +105,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 			const server: MCPServer = {
 				name,
 				enabled,
+				inheritInSubagents: serverConfig.inheritInSubagents,
 				timeout,
 				requestIdFormat,
 				instructions,

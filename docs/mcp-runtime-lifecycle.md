@@ -35,6 +35,8 @@ Both paths:
 
 If `enableMCP` is false or the session restricts tool names, MCP discovery and manager inheritance are skipped entirely. ACP sessions disable on-disk discovery because their MCP definitions come from the ACP client.
 
+Per-server `inheritInSubagents: false` retains parent access but removes the server's automatically inherited child tools, resources, instructions, and notifications. Task proxy creation, live refresh, reconnect, and revival use the filtered tool snapshot and recheck policy at execution. Child-owned SDK discovery suppresses excluded entries before connecting, including project/browser rediscovery. Standard Read and Eval resource routes bind to the caller's manager and enforce policy on catalog selection, retry, dispatch, and error listings; a child with no ready manager never falls back to a process-global parent manager. This preserves the existing in-process `MCPManager` without adding worker-thread machinery. See [Parent-only servers](./mcp-config.md#parent-only-servers).
+
 ### Config discovery and filtering
 
 `loadAllMCPConfigs()` (`src/mcp/config.ts`) loads canonical MCP server items through capability discovery, then converts to legacy `MCPServerConfig`.

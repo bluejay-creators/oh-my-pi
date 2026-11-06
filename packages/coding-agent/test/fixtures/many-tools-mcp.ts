@@ -48,10 +48,12 @@ function buildResult(method: string): Record<string, unknown> {
 			return {
 				tools: Array.from({ length: MANY_TOOL_COUNT }, (_, i) => ({
 					name: manyToolName(i),
-					description: `Fixture tool #${i}; never actually called by the test.`,
+					description: `Fixture tool #${i}.`,
 					inputSchema: { type: "object", properties: {}, additionalProperties: false },
 				})),
 			};
+		case "tools/call":
+			return { content: [{ type: "text", text: "fixture tool called" }] };
 		default:
 			return {};
 	}

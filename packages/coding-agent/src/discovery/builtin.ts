@@ -182,6 +182,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 			result.push({
 				name: serverName,
 				enabled,
+				inheritInSubagents: serverConfig.inheritInSubagents as boolean | undefined,
 				timeout,
 				requestIdFormat,
 				instructions,

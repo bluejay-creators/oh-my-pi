@@ -103,6 +103,7 @@ The config writer accepts names up to 100 characters containing letters, numbers
 Shared fields for every transport:
 
 - `enabled?: boolean` — skip this server when `false`, unless the active-profile user `enabledServers` allowlist names it
+- `inheritInSubagents?: boolean` — automatically expose this server to subagents (default: `true`). Set `false` to retain parent access without automatically giving its tools, resources, instructions, or notifications to Task children. Supported in OMP-native files (including named profiles), standalone `mcp.json` / `.mcp.json`, and OMP extension packages; imported tool configs ignore this OMP-specific key.
 - `timeout?: number` — MCP request timeout in milliseconds; `0` disables client-side MCP timeouts
 - `requestIdFormat?: "number" | "string"` — outgoing JSON-RPC request-id encoding; defaults to per-transport integers. `"string"` uses collision-resistant snowflake IDs. This OMP-specific field is read only from OMP-native files, root `mcp.json` / `.mcp.json`, and OMP extension packages; configs translated from other tools ignore it.
 - `instructions?: boolean` — include server-provided instructions in the system prompt (default: `true`). Set `false` to omit that server's instructions without disabling its tools. Like `requestIdFormat`, this is OMP-specific and is ignored in configs translated from other tools.
@@ -120,6 +121,30 @@ Initial MCP discovery returns after a 250 ms window while slower connections con
 Client-generated remote protocol headers take precedence over configured headers case-insensitively. Streamable HTTP owns `MCP-Protocol-Version`: it ignores configured copies and sends the negotiated version after initialization. Portable Agent Plugins' configured headers are origin-locked and are not forwarded to another origin on redirects.
 
 Remote HTTP and SSE transports do not impose an additional socket-idle timeout. Without an applicable MCP deadline, a silent connection can wait indefinitely; cancel the call or close the transport to stop it. A quiet stream alone does not prove that its peer is still reachable.
+
+### Parent-only servers
+
+Set `inheritInSubagents: false` on the server entry that wins discovery:
+
+```json
+{
+	"mcpServers": {
+		"parent-only": {
+			"type": "http",
+			"url": "https://example.com/mcp",
+			"inheritInSubagents": false
+		}
+	}
+}
+```
+
+The parent keeps its connection and tools. Automatically inherited Task tools omit this server, including when a child uses a different working directory, revives, or follows a parent reload/reconnect. Child tool execution rechecks the current policy, so a previously minted proxy cannot call the server after inheritance is disabled. Other servers keep their existing behavior. Apply file edits with `/mcp reload`.
+
+Standard child Read and Eval calls also enforce the setting for `mcp://` resources, native resource URIs, and MCP-backed `skill://` fallbacks. Resource routing uses the caller's manager; a child with no ready manager never falls back to the parent's process-global singleton. Resource matching, catalog retries, dispatch, and available-resource error listings apply the current policy.
+
+Only boolean values are accepted. A malformed value (for example, `"false"` or `null`) rejects that server with an invalid-config warning instead of silently enabling inheritance. Config add/update and auth writeback preserve the option; invalid writes fail validation. Like `instructions`, it does not split aliases of the same endpoint into distinct connections, so configure the winning entry.
+
+This controls standard MCP tool and resource inheritance, not process isolation, arbitrary code execution, or explicitly parent-created custom forwarding tools. Task's `tools` argument selects extra Eval tools; it is not an MCP exclusion list.
 
 ### `stdio` transport
 

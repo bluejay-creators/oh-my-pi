@@ -2317,6 +2317,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return prewalk !== undefined || deferredPrewalk !== undefined;
 			},
 			taskDepth: options.taskDepth ?? 0,
+			parentTaskPrefix: options.parentTaskPrefix,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
@@ -2517,6 +2518,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				configuredLevel: settings.extensionsSourceLevel(),
 			}));
 		const mcpDiscoverOptions = {
+			forSubagent: isSubagentSession,
 			onStatus: onMCPStatus,
 			startupTimeoutMs: cfgMcpStartupTimeoutMs.get(settings),
 			enableProjectConfig: cfgMcpEnableProjectConfig.get(settings),
@@ -2559,13 +2561,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							// Connected MCP tools (and cached routes of servers still connecting) are
 							// enabled and mounted under xd:// devices right away, so a turn whose
 							// wait runs out still carries them.
-							await liveSession.refreshMCPTools(mcpResult.tools);
+							await liveSession.refreshMCPTools(deferredMCPManager.getTools(isSubagentSession));
 							// Discovery returns after the startup window while slower servers keep
 							// connecting. Give them the first turn's wait budget, then publish the
 							// final snapshot so that turn's prompt carries their instructions too.
 							await deferredMCPManager.waitForStartup(MCP_DISCOVERY_TURN_WAIT_MS);
 							if (liveSession.isDisposed) return;
-							await liveSession.refreshMCPTools(deferredMCPManager.getTools());
+							await liveSession.refreshMCPTools(deferredMCPManager.getTools(isSubagentSession));
 						} catch (error) {
 							logger.error("MCP tool load failed", {
 								path: ".mcp.json",
@@ -2594,9 +2596,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					logger.error("MCP tool load failed", { path, error });
 				}
 
-				// MCP tools are LoadedCustomTool, extract the tool property while
-				// retaining their origins for initial registry ownership.
-				const loadedMcpTools = mcpResult.tools.map(loaded => loaded.tool);
+				// Child-owned discovery uses the same live policy as borrowed proxies.
+				const loadedMcpTools = mcpManager.getTools(isSubagentSession);
 				customTools.push(...loadedMcpTools);
 				initialMcpManagerTools.push(...loadedMcpTools);
 			}
@@ -2605,7 +2606,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// receive the parent's manager via `options.mcpManager`, and reassigning
 		// the singleton to the same value is a no-op — keep the gate explicit
 		// to mirror the AsyncJobManager ownership rule.
-		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
+		if (mcpManager && !isSubagentSession) MCPManager.setInstance(mcpManager);
 
 		const builtInToolNames = [...toolRegistry.keys()];
 		let customToolPaths: ToolPathWithSource[] = [];
@@ -3377,7 +3378,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const explicitCustomToolNames = new Set(explicitCustomTools.map(tool => tool.name));
 		const sdkMcpTools = restrictToolNames
 			? []
-			: (options.mcpTools ?? []).filter(tool => !explicitCustomToolNames.has(tool.name));
+			: (options.mcpTools ?? []).filter(
+					tool =>
+						!explicitCustomToolNames.has(tool.name) &&
+						(!isSubagentSession || !mcpManager || mcpManager.isServerInherited(tool.mcpServerName ?? "")),
+				);
 		initialMcpManagerTools.push(...sdkMcpTools);
 		const sdkCustomTools = [...sdkMcpTools, ...explicitCustomTools];
 		const sdkCustomToolNames = new Set(sdkCustomTools.map(tool => tool.name));
@@ -3843,7 +3848,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// `getServerInstructions()` are empty until the background connect
 			// completes; the rebuild that `refreshMCPTools` triggers post-discovery
 			// then picks up the mounted routes and any connected-server instructions.
-			const serverInstructions = mcpManager?.getServerInstructions();
+			const serverInstructions = mcpManager?.getServerInstructions(isSubagentSession);
 			// Drive guidance off the auto-learn BUILTINS currently registered (provenance,
 			// not just an active name): a custom/extension tool that merely shares the
 			// name is not built-in, and the settings reconcile adds/removes the built-ins
@@ -4618,7 +4623,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			reconcileBrowserMcpFilter: mcpManager
 				? async enabled => {
 						await mcpManager.reconcileBrowserFilter(enabled);
-						return mcpManager.getTools();
+						return mcpManager.getTools(isSubagentSession);
 					}
 				: undefined,
 			memoryEnabled: !restrictToolNames,
@@ -4663,7 +4668,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			reconcileSettingsGatedTools,
 			getMcpServerInstructions: mcpManager
 				? () => {
-						const raw = mcpManager.getServerInstructions();
+						const raw = mcpManager.getServerInstructions(isSubagentSession);
 						if (!raw || raw.size === 0) return raw;
 						const out = new Map<string, string>();
 						for (const [name, text] of raw) {
@@ -5282,9 +5287,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		//     `extensionRunner` so extensions loaded in that session receive frames.
 		//     Guarded only by `mcpManager` (see the second `if` below).
 		if (mcpManager && !options.mcpManager) {
-			mcpManager.setOnToolsChanged(async tools => {
+			mcpManager.setOnToolsChanged(async () => {
 				try {
-					await session.refreshMCPTools(tools);
+					await session.refreshMCPTools(mcpManager.getTools(isSubagentSession));
 				} catch (error) {
 					logger.warn("MCP tool refresh failed", {
 						error: error instanceof Error ? error.message : String(error),
@@ -5304,6 +5309,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			};
 			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
 			mcpManager.setOnResourcesChanged((serverName, uri) => {
+				if (isSubagentSession && !mcpManager.isServerInherited(serverName)) return;
 				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
 				if (!cfgMcpNotifications.get(settings)) return;
 				const debounceMs = cfgMcpNotificationDebounceMs.get(settings);
@@ -5316,6 +5322,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						notificationDebounceTimers.delete(key);
 						// Re-check: user may have disabled notifications during the debounce window
 						if (!cfgMcpNotifications.get(settings)) return;
+						if (isSubagentSession && !mcpManager.isServerInherited(serverName)) return;
 						session.yieldQueue.enqueue<McpNotificationEntry>("mcp-notification", { serverName, uri });
 					}, debounceMs),
 				);
@@ -5338,6 +5345,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// buffers frames received before `initialize()` and drains them on
 			// init. Both drop-oldest under pressure at cap 100.
 			unsubscribeMcpNotifications = mcpManager.addNotificationListener((server, method, params) => {
+				if (isSubagentSession && !mcpManager.isServerInherited(server)) return;
 				void extensionRunner.emitMcpNotification({ server, method, params });
 			});
 			// postmortem.register returns a cancel function; capture it so explicit
@@ -5356,12 +5364,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				if (owningSession.isDisposed) return;
 				await ownedMCPManager.reconcileProjectConfig(enabled);
 				if (owningSession.isDisposed) return;
-				await owningSession.refreshMCPTools(ownedMCPManager.getTools());
+				await owningSession.refreshMCPTools(ownedMCPManager.getTools(isSubagentSession));
 			});
 		}
 
 		if (ownedMcpManager && !deferMCPDiscoveryForUI) {
-			const currentMcpManagerTools = ownedMcpManager.getTools();
+			const currentMcpManagerTools = ownedMcpManager.getTools(isSubagentSession);
 			let sameMcpManagerTools = currentMcpManagerTools.length === initialMcpManagerTools.length;
 			for (let i = 0; sameMcpManagerTools && i < currentMcpManagerTools.length; i++) {
 				sameMcpManagerTools = currentMcpManagerTools[i] === initialMcpManagerTools[i];

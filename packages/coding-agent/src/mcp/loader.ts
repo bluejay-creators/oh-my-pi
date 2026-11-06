@@ -27,6 +27,8 @@ export interface MCPToolsLoadResult {
 
 /** Options for loading MCP tools */
 export interface MCPToolsLoadOptions {
+	/** Discover only servers eligible for automatic subagent inheritance. */
+	forSubagent?: boolean;
 	/** Called when MCP server connection state changes. */
 	onStatus?: (event: McpConnectionStatusEvent) => void;
 	/** Initial non-blocking discovery window in milliseconds (environment override wins). */
@@ -71,6 +73,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 	let result: MCPLoadResult;
 	try {
 		result = await manager.discoverAndConnect({
+			forSubagent: options?.forSubagent,
 			onStatus: options?.onStatus,
 			startupTimeoutMs: options?.startupTimeoutMs,
 			enableProjectConfig: options?.enableProjectConfig,

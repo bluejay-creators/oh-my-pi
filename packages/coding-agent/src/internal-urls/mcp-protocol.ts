@@ -7,7 +7,22 @@ import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, Sc
 export interface McpResourceReadOptions {
 	/** Match advertised resource URIs only, never URI templates. */
 	exact?: boolean;
+	/** Apply the caller's per-server subagent inheritance policy. */
+	forSubagent?: boolean;
 	signal?: AbortSignal;
+}
+
+/** Resolve MCP through the caller, never an unrelated global manager for a child. */
+export async function loadMcpResourceContext(
+	context?: ResolveContext,
+): Promise<{ manager: MCPManager | undefined; forSubagent: boolean }> {
+	const session = context?.session;
+	const forSubagent = (session?.taskDepth ?? 0) > 0 || Boolean(session?.parentTaskPrefix);
+	if (session?.enableMCP === false || session?.restrictToolNames === true) {
+		return { manager: undefined, forSubagent };
+	}
+	if (session?.mcpManager) return { manager: session.mcpManager, forSubagent };
+	return { manager: forSubagent ? undefined : await MCPManager.load(), forSubagent };
 }
 
 function escapeRegex(text: string): string {
@@ -48,9 +63,10 @@ function extractResourceUri(url: InternalUrl): string {
 	return uri;
 }
 
-function resolveTargetServer(mcpManager: MCPManager, uri: string, exact: boolean): string | undefined {
+function resolveTargetServer(mcpManager: MCPManager, uri: string, exact: boolean, forSubagent: boolean): string | undefined {
 	const servers = mcpManager.getConnectedServers();
 	for (const name of servers) {
+		if (forSubagent && !mcpManager.isServerInherited(name)) continue;
 		const serverResources = mcpManager.getServerResources(name);
 		if (serverResources?.resources.some(r => r.uri === uri)) {
 			return name;
@@ -69,6 +85,7 @@ function resolveTargetServer(mcpManager: MCPManager, uri: string, exact: boolean
 		| undefined;
 
 	for (const [serverIndex, name] of servers.entries()) {
+		if (forSubagent && !mcpManager.isServerInherited(name)) continue;
 		const serverResources = mcpManager.getServerResources(name);
 		if (!serverResources) continue;
 
@@ -101,10 +118,11 @@ function resolveTargetServer(mcpManager: MCPManager, uri: string, exact: boolean
 	return bestTemplateMatch?.serverName;
 }
 
-function formatAvailableResources(mcpManager: MCPManager): string {
+function formatAvailableResources(mcpManager: MCPManager, forSubagent: boolean): string {
 	const available = mcpManager
 		.getConnectedServers()
 		.flatMap(name => {
+			if (forSubagent && !mcpManager.isServerInherited(name)) return [];
 			const serverResources = mcpManager.getServerResources(name);
 			if (!serverResources) return [];
 			const concrete = serverResources.resources.map(r => `  ${r.uri} (${name})`);
@@ -128,8 +146,9 @@ export async function readMcpResource(
 ): Promise<InternalResource | undefined> {
 	const exact = options?.exact === true;
 	const signal = options?.signal;
+	const forSubagent = options?.forSubagent === true;
 	const uri = extractResourceUri(url);
-	let targetServer = resolveTargetServer(mcpManager, uri, exact);
+	let targetServer = resolveTargetServer(mcpManager, uri, exact, forSubagent);
 	if (!targetServer) {
 		// A configured server may still be handshaking when discovery returned
 		// (the `connectServers` startup race deliberately leaves slow servers in
@@ -139,11 +158,15 @@ export async function readMcpResource(
 		await untilAborted(signal, mcpManager.waitForPendingConnections());
 		await untilAborted(
 			signal,
-			Promise.allSettled(mcpManager.getConnectedServers().map(name => mcpManager.ensureServerResources(name))),
+			Promise.allSettled(
+				mcpManager.getConnectedServers()
+					.filter(name => !forSubagent || mcpManager.isServerInherited(name))
+					.map(name => mcpManager.ensureServerResources(name)),
+			),
 		);
-		targetServer = resolveTargetServer(mcpManager, uri, exact);
+		targetServer = resolveTargetServer(mcpManager, uri, exact, forSubagent);
 	}
-	if (!targetServer) return undefined;
+	if (!targetServer || (forSubagent && !mcpManager.isServerInherited(targetServer))) return undefined;
 
 	let result: MCPResourceReadResult | undefined;
 	try {
@@ -198,14 +221,14 @@ export class McpProtocolHandler implements ProtocolHandler {
 	}
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
-		const mcpManager = await MCPManager.load();
+		const { manager: mcpManager, forSubagent } = await loadMcpResourceContext(context);
 		if (!mcpManager) {
 			throw new Error("No MCP manager available. MCP servers may not be configured.");
 		}
-		const resource = await readMcpResource(mcpManager, url, { signal: context?.signal });
+		const resource = await readMcpResource(mcpManager, url, { signal: context?.signal, forSubagent });
 		if (resource) return resource;
 		throw new Error(
-			`No MCP server has resource "${extractResourceUri(url)}".\n\nAvailable resources:\n${formatAvailableResources(mcpManager)}`,
+			`No MCP server has resource "${extractResourceUri(url)}".\n\nAvailable resources:\n${formatAvailableResources(mcpManager, forSubagent)}`,
 		);
 	}
 }

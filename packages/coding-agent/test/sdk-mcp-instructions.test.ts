@@ -121,6 +121,102 @@ describe("createAgentSession MCP server instructions (deferred UI)", () => {
 		mock.restore();
 	});
 
+	it("keeps parent-only tools and instructions in the parent but not in a borrowed child session", async () => {
+		await Bun.write(
+			path.join(tempDir, ".mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH], inheritInSubagents: false },
+				},
+			}),
+		);
+		const options = {
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.startupTimeoutMs": 0 }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableLsp: false,
+			skipPythonPreflight: true,
+			enableMCP: true,
+		};
+		const parent = await createAgentSession(options);
+		try {
+			expect(parent.session.systemPrompt.join("\n")).toContain(SERVER_INSTRUCTIONS);
+			const { session: child } = await createAgentSession({
+				...options,
+				sessionManager: SessionManager.inMemory(),
+				mcpManager: parent.mcpManager,
+				mcpTools: parent.mcpManager!.getTools(),
+				parentTaskPrefix: "ParentOnlyInstructions-1",
+			});
+			try {
+				expect(child.getEnabledToolNames()).not.toContain(MCP_TOOL_NAME);
+				expect(child.systemPrompt.join("\n")).not.toContain(SERVER_INSTRUCTIONS);
+			} finally {
+				await child.dispose();
+			}
+			expect(parent.mcpManager!.getConnectedServers()).toEqual(["instr"]);
+			const result = await parent.session.getToolByName(MCP_TOOL_NAME)!.execute("parent-retained", {});
+			expect(result.content.find(part => part.type === "text")?.text).toBe(TOOL_RESULT);
+		} finally {
+			await parent.session.dispose();
+		}
+	}, 20_000);
+
+	for (const hasUI of [false, true]) {
+		it(`does not rediscover parent-only servers in a ${hasUI ? "deferred" : "blocking"} child session`, async () => {
+			await Bun.write(
+				path.join(tempDir, ".mcp.json"),
+				JSON.stringify({
+					mcpServers: {
+						instr: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH], inheritInSubagents: false },
+						shared: { type: "stdio", command: process.execPath, args: [FIXTURE_PATH, "--shared"] },
+					},
+				}),
+			);
+			const { session, mcpManager } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				modelRegistry,
+				sessionManager: SessionManager.inMemory(),
+				settings: Settings.isolated({ "mcp.startupTimeoutMs": 0 }),
+				model: getBundledModel("openai", "gpt-4o-mini"),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				skipPythonPreflight: true,
+				enableMCP: true,
+				taskDepth: 1,
+				hasUI,
+			});
+			try {
+				expect(
+					await eventually(
+						() => session.getEnabledToolNames().includes("mcp__shared_do_thing"),
+						value => value,
+					),
+				).toBe(true);
+				expect(session.getEnabledToolNames()).not.toContain(MCP_TOOL_NAME);
+				expect(mcpManager?.getConnectedServers()).toEqual(["shared"]);
+				expect(session.systemPrompt.join("\n")).not.toContain("xd://mcp__instr_do_thing");
+				const result = await session.getToolByName("mcp__shared_do_thing")!.execute("shared-call", {});
+				expect(result.content.find(part => part.type === "text")?.text).toBe(TOOL_RESULT);
+			} finally {
+				await session.dispose();
+			}
+		}, 20_000);
+	}
+
 	it("omits an opted-out server's instructions and the empty heading, and keeps its tools", async () => {
 		await Bun.write(
 			path.join(tempDir, ".mcp.json"),

@@ -24,7 +24,7 @@ import {
 	UrlContainmentError,
 	validateRelativePath,
 } from "./filesystem-resource";
-import { readMcpResource } from "./mcp-protocol";
+import { loadMcpResourceContext, readMcpResource } from "./mcp-protocol";
 import type {
 	InternalResource,
 	InternalUrl,
@@ -134,15 +134,16 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			// exactly this URI (Figma's `skill://figma/figma-use/SKILL.md`). Templates stay behind `mcp://`.
 			// A deferred MCP startup that fails cannot change the diagnosis: the skill is still unknown.
 			let mcpManager: MCPManager | undefined;
+			let forSubagent = false;
 			try {
-				mcpManager = await MCPManager.load();
+				({ manager: mcpManager, forSubagent } = await loadMcpResourceContext(context));
 			} catch (loadError) {
 				if (context?.signal?.aborted) throw loadError;
 				logger.debug("MCP startup failed while resolving an unknown skill", { url: url.href, error: loadError });
 				throw error;
 			}
 			const resource =
-				mcpManager && (await readMcpResource(mcpManager, url, { exact: true, signal: context?.signal }));
+				mcpManager && (await readMcpResource(mcpManager, url, { exact: true, signal: context?.signal, forSubagent }));
 			if (!resource) throw error;
 			// The server, not a loaded skill, sizes this text: keep `read`'s normal result limits.
 			return { ...resource, unbounded: false };
@@ -188,7 +189,11 @@ export class SkillProtocolHandler implements ProtocolHandler {
 		try {
 			targetPath = await skillTargetPath(url, skills, options?.directory === true, options?.create === true);
 		} catch (error) {
-			if (error instanceof UnknownSkillError && !options?.localOnly && MCPManager.available()) return null;
+			if (
+				error instanceof UnknownSkillError &&
+				!options?.localOnly &&
+				(context?.session?.mcpManager || MCPManager.available())
+			) return null;
 			throw error;
 		}
 		if (options?.create) return targetPath;

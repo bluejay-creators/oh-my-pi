@@ -17,6 +17,8 @@ export interface MCPServer {
 	name: string;
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/** Automatically expose this server to subagents (default: true). */
+	inheritInSubagents?: boolean;
 	/** Connection timeout in milliseconds */
 	timeout?: number;
 	/** Encoding for outgoing JSON-RPC request ids (default: `"number"`) */
@@ -115,6 +117,9 @@ export const mcpCapability = defineCapability<MCPServer>({
 	validate: server => {
 		if (!server.name) return "Missing server name";
 		if (!server.command && !server.url) return "Must have command or url";
+		if (server.inheritInSubagents !== undefined && typeof server.inheritInSubagents !== "boolean") {
+			return "inheritInSubagents must be a boolean";
+		}
 
 		// Validate transport-endpoint pairing
 		if (server.transport === "stdio" && !server.command) {
