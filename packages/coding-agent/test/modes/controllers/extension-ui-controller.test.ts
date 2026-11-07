@@ -215,12 +215,13 @@ describe("ExtensionUiController native prompt lifecycle", () => {
 		const harness = await makeObservedHarness();
 		for (const kind of ["editor", "ask"] as const) {
 			const abort = new AbortController();
-			const pending = kind === "editor"
-				? harness.controller.showHookEditor("private editor", "private prefill", { signal: abort.signal })
-				: harness.controller.showAskDialog(
-						[{ id: "private id", question: "private question", options: [{ label: "private option" }] }],
-						{ signal: abort.signal },
-					);
+			const pending =
+				kind === "editor"
+					? harness.controller.showHookEditor("private editor", "private prefill", { signal: abort.signal })
+					: harness.controller.showAskDialog(
+							[{ id: "private id", question: "private question", options: [{ label: "private option" }] }],
+							{ signal: abort.signal },
+						);
 			expect(harness.events.at(-1)).toMatchObject({ type: "native_prompt_requested", request: { kind } });
 			abort.abort();
 			expect(await pending).toBeUndefined();
@@ -275,9 +276,11 @@ describe("ExtensionUiController native prompt lifecycle", () => {
 		expect(harness.events[0]).toMatchObject({ type: "native_prompt_requested", request: { kind: "custom" } });
 		expect(harness.events[1]).toMatchObject({ type: "native_prompt_resolved", outcome: "completed" });
 		const failure = new Error("private failure");
-		await expect(harness.controller.showHookCustom(() => {
-			throw failure;
-		})).rejects.toBe(failure);
+		await expect(
+			harness.controller.showHookCustom(() => {
+				throw failure;
+			}),
+		).rejects.toBe(failure);
 		expect(harness.events).toHaveLength(4);
 		expect(harness.events[3]).toMatchObject({ type: "native_prompt_resolved", outcome: "error" });
 		expect(JSON.stringify(harness.events)).not.toContain("private");

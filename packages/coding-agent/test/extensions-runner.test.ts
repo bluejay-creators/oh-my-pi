@@ -2911,25 +2911,33 @@ describe("ExtensionRunner", () => {
 			// Bun promise matchers may wait while evaluated. Attach an ordinary
 			// rejection handler before driving a deferred request, then assert its result.
 			const captureFailure = (operation: Promise<unknown>): Promise<unknown> =>
-				operation.then(() => undefined, (error: unknown) => error);
+				operation.then(
+					() => undefined,
+					(error: unknown) => error,
+				);
 
 			const createHarness = async (factory: ExtensionFactory | ExtensionFactory[], withUI = true) => {
 				const runtime = new ExtensionRuntime();
 				const factories = Array.isArray(factory) ? factory : [factory];
-				const extensions = await Promise.all(factories.map(initialize =>
-					loadExtensionFromFactory(initialize, tempDir.path(), new EventBus(), runtime),
-				));
+				const extensions = await Promise.all(
+					factories.map(initialize =>
+						loadExtensionFromFactory(initialize, tempDir.path(), new EventBus(), runtime),
+					),
+				);
 				const runner = new ExtensionRunner(extensions, runtime, tempDir.path(), sessionManager, modelRegistry);
 				const select = vi.fn(async (_title: string, _options: string[]) => "Deny");
 				if (withUI) initializeRunner(runner, select);
 				const execute = vi.fn(async (_id: string, _args: { command: string }) => ({
 					content: [{ type: "text" as const, text: "ok" }],
 				}));
-				const wrapper = new ExtensionToolWrapper({
-					...approvalTool,
-					parameters: Type.Object({ command: Type.String() }),
-					execute,
-				}, runner);
+				const wrapper = new ExtensionToolWrapper(
+					{
+						...approvalTool,
+						parameters: Type.Object({ command: Type.String() }),
+						execute,
+					},
+					runner,
+				);
 				const context: AgentToolContext = {
 					sessionManager,
 					modelRegistry,
@@ -2984,8 +2992,9 @@ describe("ExtensionRunner", () => {
 
 			it("retains the human prompt without a decision handler", async () => {
 				const harness = await createHarness(() => {});
-				await expect(harness.wrapper.execute("default", { command: "original" }, undefined, undefined, harness.context))
-					.rejects.toThrow("denied by user");
+				await expect(
+					harness.wrapper.execute("default", { command: "original" }, undefined, undefined, harness.context),
+				).rejects.toThrow("denied by user");
 				expect(harness.select).toHaveBeenCalledTimes(1);
 				expect(harness.execute).not.toHaveBeenCalled();
 			});
@@ -3003,8 +3012,9 @@ describe("ExtensionRunner", () => {
 						} as unknown as undefined;
 					});
 				});
-				await expect(harness.wrapper.execute("observer", { command: "same" }, undefined, undefined, harness.context))
-					.rejects.toThrow("denied by user");
+				await expect(
+					harness.wrapper.execute("observer", { command: "same" }, undefined, undefined, harness.context),
+				).rejects.toThrow("denied by user");
 				expect(observer).toHaveBeenCalledTimes(1);
 				expect(harness.select).toHaveBeenCalledTimes(1);
 				expect(harness.execute).not.toHaveBeenCalled();
@@ -3013,10 +3023,14 @@ describe("ExtensionRunner", () => {
 			it("invokes one authority probe and one observer for a request", async () => {
 				const observer = vi.fn();
 				const decider = vi.fn((request: ToolApprovalRequest): ToolApprovalDeciderResult => ({
-					decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint,
+					decision: "approve-once",
+					requestId: request.requestId,
+					fingerprint: request.fingerprint,
 				}));
 				const harness = await createHarness(pi => {
-					pi.on("tool_approval_requested", () => { observer(); });
+					pi.on("tool_approval_requested", () => {
+						observer();
+					});
 					pi.registerApprovalDecider(decider);
 				});
 				await harness.wrapper.execute("single-probe", { command: "same" }, undefined, undefined, harness.context);
@@ -3028,17 +3042,28 @@ describe("ExtensionRunner", () => {
 
 			it("retains human approval with a diagnostic for controllers in multiple extensions", async () => {
 				const decider = vi.fn((request: ToolApprovalRequest): ToolApprovalDeciderResult => ({
-					decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint,
+					decision: "approve-once",
+					requestId: request.requestId,
+					fingerprint: request.fingerprint,
 				}));
 				const harness = await createHarness([
-					pi => { pi.registerApprovalDecider(decider); },
-					pi => { pi.registerApprovalDecider(decider); },
+					pi => {
+						pi.registerApprovalDecider(decider);
+					},
+					pi => {
+						pi.registerApprovalDecider(decider);
+					},
 				]);
 				const errors: ExtensionError[] = [];
-				harness.runner.onError(error => { errors.push(error); });
-				await expect(harness.wrapper.execute("ambiguous", { command: "same" }, undefined, undefined, harness.context))
-					.rejects.toThrow("denied by user");
-				expect(errors).toEqual([expect.objectContaining({ error: expect.stringContaining("Multiple approval deciders") })]);
+				harness.runner.onError(error => {
+					errors.push(error);
+				});
+				await expect(
+					harness.wrapper.execute("ambiguous", { command: "same" }, undefined, undefined, harness.context),
+				).rejects.toThrow("denied by user");
+				expect(errors).toEqual([
+					expect.objectContaining({ error: expect.stringContaining("Multiple approval deciders") }),
+				]);
 				expect(decider).not.toHaveBeenCalled();
 				expect(harness.select).toHaveBeenCalledTimes(1);
 				expect(harness.execute).not.toHaveBeenCalled();
@@ -3063,8 +3088,9 @@ describe("ExtensionRunner", () => {
 							} as ToolApprovalDeciderResult;
 						});
 					});
-					await expect(harness.wrapper.execute("fallback", { command: "original" }, undefined, undefined, harness.context))
-						.rejects.toThrow("denied by user");
+					await expect(
+						harness.wrapper.execute("fallback", { command: "original" }, undefined, undefined, harness.context),
+					).rejects.toThrow("denied by user");
 					expect(harness.select).toHaveBeenCalledTimes(1);
 					expect(harness.execute).not.toHaveBeenCalled();
 				});
@@ -3085,8 +3111,9 @@ describe("ExtensionRunner", () => {
 					});
 				});
 				await harness.wrapper.execute("same-call", { command: "same" }, undefined, undefined, harness.context);
-				await expect(harness.wrapper.execute("same-call", { command: "same" }, undefined, undefined, harness.context))
-					.rejects.toThrow("denied by user");
+				await expect(
+					harness.wrapper.execute("same-call", { command: "same" }, undefined, undefined, harness.context),
+				).rejects.toThrow("denied by user");
 				expect(requests[0].requestId).not.toBe(requests[1].requestId);
 				expect(requests[0].fingerprint).not.toBe(requests[1].fingerprint);
 				expect(harness.execute).toHaveBeenCalledTimes(1);
@@ -3116,7 +3143,9 @@ describe("ExtensionRunner", () => {
 				for (let index = 0; index < 2; index++) {
 					const other = requests[1 - index];
 					decisions[index].resolve({
-						decision: "approve-once", requestId: other.requestId, fingerprint: other.fingerprint,
+						decision: "approve-once",
+						requestId: other.requestId,
+						fingerprint: other.fingerprint,
 					});
 				}
 				for (const failure of await Promise.all(rejected)) {
@@ -3139,8 +3168,9 @@ describe("ExtensionRunner", () => {
 						};
 					});
 				});
-				await expect(harness.wrapper.execute("changed", input, undefined, undefined, harness.context))
-					.rejects.toThrow("denied by user");
+				await expect(
+					harness.wrapper.execute("changed", input, undefined, undefined, harness.context),
+				).rejects.toThrow("denied by user");
 				expect(harness.select).toHaveBeenCalledTimes(1);
 				expect(harness.execute).not.toHaveBeenCalled();
 			});
@@ -3158,8 +3188,9 @@ describe("ExtensionRunner", () => {
 						};
 					});
 				});
-				await expect(harness.wrapper.execute("moved", { command: "same" }, undefined, undefined, harness.context))
-					.rejects.toThrow("denied by user");
+				await expect(
+					harness.wrapper.execute("moved", { command: "same" }, undefined, undefined, harness.context),
+				).rejects.toThrow("denied by user");
 				expect(harness.select).toHaveBeenCalledTimes(1);
 				expect(harness.execute).not.toHaveBeenCalled();
 			});
@@ -3174,10 +3205,16 @@ describe("ExtensionRunner", () => {
 						entered.resolve(request);
 						return late.promise;
 					});
-					pi.on("tool_approval_resolved", event => { resolutions.push(event); });
+					pi.on("tool_approval_resolved", event => {
+						resolutions.push(event);
+					});
 				});
 				const execution = harness.wrapper.execute(
-					"cancelled", { command: "same" }, controller.signal, undefined, harness.context,
+					"cancelled",
+					{ command: "same" },
+					controller.signal,
+					undefined,
+					harness.context,
 				);
 				const request = await entered.promise;
 				const rejection = captureFailure(execution);
@@ -3185,9 +3222,13 @@ describe("ExtensionRunner", () => {
 				expect(await rejection).toBe(controller.signal.reason);
 				late.resolve({ decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint });
 				await late.promise;
-				expect(resolutions).toMatchObject([{
-					requestId: request.requestId, approved: false, reason: "approval cancelled",
-				}]);
+				expect(resolutions).toMatchObject([
+					{
+						requestId: request.requestId,
+						approved: false,
+						reason: "approval cancelled",
+					},
+				]);
 				expect(harness.select).not.toHaveBeenCalled();
 				expect(harness.execute).not.toHaveBeenCalled();
 			});
@@ -3207,12 +3248,18 @@ describe("ExtensionRunner", () => {
 						await release.promise;
 						late.resolve(await captureFailure(ctx.ui.input("late observer input")));
 					});
-					pi.on("tool_approval_resolved", event => { resolutions.push(event); });
+					pi.on("tool_approval_resolved", event => {
+						resolutions.push(event);
+					});
 				});
 				const input = vi.fn(async () => undefined);
 				harness.runner.getUIContext().input = input;
 				const execution = harness.wrapper.execute(
-					"observer-cancelled", { command: "same" }, controller.signal, undefined, harness.context,
+					"observer-cancelled",
+					{ command: "same" },
+					controller.signal,
+					undefined,
+					harness.context,
 				);
 				const failure = captureFailure(execution);
 				await entered.promise;
@@ -3260,7 +3307,11 @@ describe("ExtensionRunner", () => {
 						};
 					}
 					const execution = harness.wrapper.execute(
-						"visible-cancelled", { command: "same" }, controller.signal, undefined, harness.context,
+						"visible-cancelled",
+						{ command: "same" },
+						controller.signal,
+						undefined,
+						harness.context,
 					);
 					const failure = captureFailure(execution);
 					try {
@@ -3289,7 +3340,9 @@ describe("ExtensionRunner", () => {
 					const harness = await createHarness(pi => {
 						if (approval === "native") {
 							pi.registerApprovalDecider(request => ({
-								decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint,
+								decision: "approve-once",
+								requestId: request.requestId,
+								fingerprint: request.fingerprint,
 							}));
 						}
 						pi.on("tool_approval_resolved", async () => {
@@ -3299,10 +3352,17 @@ describe("ExtensionRunner", () => {
 						});
 					});
 					if (approval === "human") {
-						initializeRunner(harness.runner, async () => { prompted++; return "Approve"; });
+						initializeRunner(harness.runner, async () => {
+							prompted++;
+							return "Approve";
+						});
 					}
 					const execution = harness.wrapper.execute(
-						"resolution-cancelled", { command: "same" }, controller.signal, undefined, harness.context,
+						"resolution-cancelled",
+						{ command: "same" },
+						controller.signal,
+						undefined,
+						harness.context,
 					);
 					const failure = captureFailure(execution);
 					await entered.promise;
@@ -3327,10 +3387,13 @@ describe("ExtensionRunner", () => {
 						requestId: request.requestId,
 						fingerprint: request.fingerprint,
 					}));
-					pi.on("tool_approval_resolved", () => { input.command = "changed"; });
+					pi.on("tool_approval_resolved", () => {
+						input.command = "changed";
+					});
 				});
-				await expect(harness.wrapper.execute("resolved-change", input, undefined, undefined, harness.context))
-					.rejects.toThrow("changed or was cancelled");
+				await expect(
+					harness.wrapper.execute("resolved-change", input, undefined, undefined, harness.context),
+				).rejects.toThrow("changed or was cancelled");
 				expect(harness.execute).not.toHaveBeenCalled();
 			});
 
@@ -3338,13 +3401,20 @@ describe("ExtensionRunner", () => {
 				let request: ToolApprovalRequest | undefined;
 				const decider = vi.fn(() => ({ decision: "pass" as const }));
 				const harness = await createHarness(pi => {
-					pi.on("tool_approval_requested", event => { request = event.request; });
+					pi.on("tool_approval_requested", event => {
+						request = event.request;
+					});
 					pi.registerApprovalDecider(decider);
 				});
-				await expect(harness.wrapper.execute(
-					"unsupported", { command: "same", extra: undefined } as { command: string },
-					undefined, undefined, harness.context,
-				)).rejects.toThrow("denied by user");
+				await expect(
+					harness.wrapper.execute(
+						"unsupported",
+						{ command: "same", extra: undefined } as { command: string },
+						undefined,
+						undefined,
+						harness.context,
+					),
+				).rejects.toThrow("denied by user");
 				expect(request).toBeUndefined();
 				expect(decider).not.toHaveBeenCalled();
 				expect(harness.select).toHaveBeenCalledTimes(1);
@@ -3354,7 +3424,9 @@ describe("ExtensionRunner", () => {
 			it("never converts provider safety checks into an extension approval", async () => {
 				let request: ToolApprovalRequest | undefined;
 				const harness = await createHarness(pi => {
-					pi.on("tool_approval_requested", event => { request = event.request; });
+					pi.on("tool_approval_requested", event => {
+						request = event.request;
+					});
 					pi.registerApprovalDecider(() => {
 						throw new Error("Provider safety must not reach an approval controller");
 					});
@@ -3371,8 +3443,9 @@ describe("ExtensionRunner", () => {
 						pendingSafetyChecks: [{ id: "check", code: "sensitive", message: "Review required" }],
 					},
 				};
-				await expect(harness.wrapper.execute("safety", { command: "same" }, undefined, undefined, harness.context))
-					.rejects.toThrow("denied by user");
+				await expect(
+					harness.wrapper.execute("safety", { command: "same" }, undefined, undefined, harness.context),
+				).rejects.toThrow("denied by user");
 				expect(request).toBeUndefined();
 				expect(harness.select).toHaveBeenCalledTimes(1);
 				expect(harness.execute).not.toHaveBeenCalled();
@@ -3386,33 +3459,49 @@ describe("ExtensionRunner", () => {
 					const requests: NativePromptRequest[] = [];
 					let approvalPrompt: NativePromptRequest | undefined;
 					const harness = await createHarness(pi => {
-						pi.on("tool_approval_requested", event => { approvalPrompt = event.prompt; });
+						pi.on("tool_approval_requested", event => {
+							approvalPrompt = event.prompt;
+						});
 						pi.on("native_prompt_requested", event => {
 							requests.push(event.request);
 							entered.resolve(event.request);
 						});
-						pi.on("native_prompt_resolved", event => { completed.resolve(event); });
+						pi.on("native_prompt_resolved", event => {
+							completed.resolve(event);
+						});
 					});
 					initializeRunner(harness.runner, async () => answer.promise);
 					if (kind === "provider-safety") {
 						harness.context.toolCall = {
-							batchId: "native-safety", index: 0, total: 1,
+							batchId: "native-safety",
+							index: 0,
+							total: 1,
 							toolCalls: [{ id: "native-prompt", name: approvalTool.name }],
 							providerMetadata: {
-								type: "computer", providerItemId: "native-computer", actions: [],
+								type: "computer",
+								providerItemId: "native-computer",
+								actions: [],
 								pendingSafetyChecks: [{ id: "check", code: "sensitive", message: "secret-safety-payload" }],
 							},
 						};
 					}
 					const started = Date.now();
 					const execution = harness.wrapper.execute(
-						"native-prompt", { command: "secret-command-payload" }, undefined, undefined, harness.context,
+						"native-prompt",
+						{ command: "secret-command-payload" },
+						undefined,
+						undefined,
+						harness.context,
 					);
 					const rejected = captureFailure(execution);
 					const pending = await entered.promise;
 					expect(pending).toMatchObject({
-						kind, requestId: approvalPrompt?.requestId, requestedAt: approvalPrompt?.requestedAt,
-						sessionId: sessionManager.getSessionId(), toolCallId: "native-prompt", toolName: approvalTool.name,
+						kind,
+						requestId: approvalPrompt?.requestId,
+						requestedAt: approvalPrompt?.requestedAt,
+						sessionId: sessionManager.getSessionId(),
+						toolCallId: "native-prompt",
+						toolName: approvalTool.name,
 					});
 					expect(pending.requestedAt).toBeGreaterThanOrEqual(started);
 					expect(pending.requestedAt).toBeLessThanOrEqual(Date.now());
@@ -3420,7 +3509,9 @@ describe("ExtensionRunner", () => {
 					answer.resolve("Deny");
 					expect(await rejected).toMatchObject({ message: expect.stringContaining("denied by user") });
 					expect(await completed.promise).toMatchObject({
-						requestId: pending.requestId, sessionId: pending.sessionId, outcome: "completed",
+						requestId: pending.requestId,
+						sessionId: pending.sessionId,
+						outcome: "completed",
 					});
 					expect(requests).toHaveLength(1);
 					expect(harness.execute).not.toHaveBeenCalled();
@@ -3431,7 +3522,9 @@ describe("ExtensionRunner", () => {
 				it(`does not invent native waits for explicitly unsupported ${unsupported} UI`, async () => {
 					const requested = vi.fn();
 					const harness = await createHarness(pi => {
-						pi.on("native_prompt_requested", () => { requested(); });
+						pi.on("native_prompt_requested", () => {
+							requested();
+						});
 					});
 					const ui = harness.runner.observeUIContext({
 						...harness.runner.getUIContext(),
@@ -3439,7 +3532,9 @@ describe("ExtensionRunner", () => {
 						custom: async <T>() => undefined as T,
 						select: async () => undefined,
 					});
-					const factory = vi.fn(() => { throw new Error("Unsupported custom UI must not invoke its factory"); });
+					const factory = vi.fn(() => {
+						throw new Error("Unsupported custom UI must not invoke its factory");
+					});
 					expect(await ui.custom(factory)).toBeUndefined();
 					if (unsupported === "dialogs") expect(await ui.select("secret-title", [])).toBeUndefined();
 					expect(factory).not.toHaveBeenCalled();
@@ -3451,11 +3546,14 @@ describe("ExtensionRunner", () => {
 			it("retains fail-closed approval defaults without announcing a nonexistent dialog surface", async () => {
 				const requested = vi.fn();
 				const harness = await createHarness(pi => {
-					pi.on("native_prompt_requested", () => { requested(); });
+					pi.on("native_prompt_requested", () => {
+						requested();
+					});
 				});
 				harness.runner.getUIContext().supportsDialogs = false;
-				await expect(harness.wrapper.execute("unsupported-ui", { command: "same" }, undefined, undefined, harness.context))
-					.rejects.toThrow("denied by user");
+				await expect(
+					harness.wrapper.execute("unsupported-ui", { command: "same" }, undefined, undefined, harness.context),
+				).rejects.toThrow("denied by user");
 				expect(harness.select).toHaveBeenCalledTimes(1);
 				expect(harness.execute).not.toHaveBeenCalled();
 				expect(requested).not.toHaveBeenCalled();
@@ -3466,7 +3564,11 @@ describe("ExtensionRunner", () => {
 				{ method: "select", kind: "select", args: ["secret-title", ["secret-choice"]] },
 				{ method: "confirm", kind: "confirm", args: ["secret-title", "secret-question"] },
 				{ method: "input", kind: "input", args: ["secret-title", "secret-placeholder"] },
-				{ method: "askDialog", kind: "ask", args: [[{ id: "secret-question", question: "secret-question", options: [] }]] },
+				{
+					method: "askDialog",
+					kind: "ask",
+					args: [[{ id: "secret-question", question: "secret-question", options: [] }]],
+				},
 				{ method: "editor", kind: "editor", args: ["secret-title", "secret-prefill"] },
 				{ method: "custom", kind: "custom", args: [() => undefined] },
 			] as const) {
@@ -3475,8 +3577,12 @@ describe("ExtensionRunner", () => {
 					const completed = Promise.withResolvers<NativePromptResolvedEvent>();
 					const answer = Promise.withResolvers<unknown>();
 					const harness = await createHarness(pi => {
-						pi.on("native_prompt_requested", event => { entered.resolve(event.request); });
-						pi.on("native_prompt_resolved", event => { completed.resolve(event); });
+						pi.on("native_prompt_requested", event => {
+							entered.resolve(event.request);
+						});
+						pi.on("native_prompt_resolved", event => {
+							completed.resolve(event);
+						});
 					});
 					const ui = harness.runner.observeUIContext({
 						...harness.runner.getUIContext(),
@@ -3493,7 +3599,13 @@ describe("ExtensionRunner", () => {
 					expect(await operation).toBe(secretAnswer);
 					const resolution = await completed.promise;
 					expect(resolution).toMatchObject({ requestId: pending.requestId, outcome: "completed" });
-					expect(Object.keys(resolution).sort()).toEqual(["outcome", "requestId", "resolvedAt", "sessionId", "type"]);
+					expect(Object.keys(resolution).sort()).toEqual([
+						"outcome",
+						"requestId",
+						"resolvedAt",
+						"sessionId",
+						"type",
+					]);
 					expect(JSON.stringify([pending, resolution])).not.toContain("secret-");
 				});
 			}
@@ -3538,8 +3650,12 @@ describe("ExtensionRunner", () => {
 					const answer = Promise.withResolvers<string | undefined>();
 					const controller = new AbortController();
 					const harness = await createHarness(pi => {
-						pi.on("native_prompt_requested", event => { entered.resolve(event.request); });
-						pi.on("native_prompt_resolved", event => { completed.resolve(event); });
+						pi.on("native_prompt_requested", event => {
+							entered.resolve(event.request);
+						});
+						pi.on("native_prompt_resolved", event => {
+							completed.resolve(event);
+						});
 					});
 					const ui = harness.runner.observeUIContext({
 						...harness.runner.getUIContext(),
@@ -3559,7 +3675,8 @@ describe("ExtensionRunner", () => {
 					}
 					const resolution = await completed.promise;
 					expect(resolution).toMatchObject({
-						requestId: pending.requestId, outcome: failure === "cancel" ? "cancelled" : "error",
+						requestId: pending.requestId,
+						outcome: failure === "cancel" ? "cancelled" : "error",
 					});
 					expect(JSON.stringify(resolution)).not.toContain("secret-");
 				});
@@ -3569,7 +3686,9 @@ describe("ExtensionRunner", () => {
 				const observer = Promise.withResolvers<void>();
 				const invoked = vi.fn(async () => "human-result");
 				const harness = await createHarness(pi => {
-					pi.on("native_prompt_requested", async () => { await observer.promise; });
+					pi.on("native_prompt_requested", async () => {
+						await observer.promise;
+					});
 				});
 				const ui = harness.runner.observeUIContext({ ...harness.runner.getUIContext(), select: invoked });
 				try {
@@ -3585,11 +3704,20 @@ describe("ExtensionRunner", () => {
 				const received = Promise.withResolvers<NativePromptRequest>();
 				const answer = Promise.withResolvers<string | undefined>();
 				const harness = await createHarness([
-					pi => { pi.on("native_prompt_requested", async () => { await heldObserver.promise; }); },
-					pi => { pi.on("native_prompt_requested", event => { received.resolve(event.request); }); },
+					pi => {
+						pi.on("native_prompt_requested", async () => {
+							await heldObserver.promise;
+						});
+					},
+					pi => {
+						pi.on("native_prompt_requested", event => {
+							received.resolve(event.request);
+						});
+					},
 				]);
 				const ui = harness.runner.observeUIContext({
-					...harness.runner.getUIContext(), input: async () => answer.promise,
+					...harness.runner.getUIContext(),
+					input: async () => answer.promise,
 				});
 				const operation = ui.input("secret-title");
 				try {
@@ -3608,7 +3736,8 @@ describe("ExtensionRunner", () => {
 				const answer = Promise.withResolvers<string | undefined>();
 				const harness = await createHarness(() => {});
 				const ui = harness.runner.observeUIContext({
-					...harness.runner.getUIContext(), input: async () => answer.promise,
+					...harness.runner.getUIContext(),
+					input: async () => answer.promise,
 				});
 				const operation = ui.input("secret-title", "secret-prefill");
 				// A receiver joining after the requested event can query live native state.
@@ -3637,7 +3766,8 @@ describe("ExtensionRunner", () => {
 					});
 				});
 				const ui = harness.runner.observeUIContext({
-					...harness.runner.getUIContext(), input: async () => answer.promise,
+					...harness.runner.getUIContext(),
+					input: async () => answer.promise,
 				});
 				const operation = ui.input("secret-title");
 				const request = harness.runner.getPendingNativePrompts()[0];
@@ -3655,17 +3785,24 @@ describe("ExtensionRunner", () => {
 				const resolved = Promise.withResolvers<NativePromptResolvedEvent>();
 				const answer = Promise.withResolvers<string | undefined>();
 				const harness = await createHarness(pi => {
-					pi.on("native_prompt_requested", event => { requests.push(event.request); });
-					pi.on("native_prompt_resolved", event => { resolved.resolve(event); });
+					pi.on("native_prompt_requested", event => {
+						requests.push(event.request);
+					});
+					pi.on("native_prompt_resolved", event => {
+						resolved.resolve(event);
+					});
 				});
 				const ui = harness.runner.observeUIContext({
-					...harness.runner.getUIContext(), input: async () => answer.promise,
+					...harness.runner.getUIContext(),
+					input: async () => answer.promise,
 				});
 				const menu = harness.runner.beginNativePrompt("select");
 				const subform = menu.run(() => ui.input("secret-field", "secret-value"));
 				answer.resolve("secret-answer");
 				expect(await subform).toBe("secret-answer");
-				expect(harness.runner.getPendingNativePrompts().map(request => request.requestId)).toEqual([menu.request.requestId]);
+				expect(harness.runner.getPendingNativePrompts().map(request => request.requestId)).toEqual([
+					menu.request.requestId,
+				]);
 				menu.resolve("cancelled");
 				expect(await resolved.promise).toMatchObject({ requestId: menu.request.requestId, outcome: "cancelled" });
 				expect(requests).toHaveLength(1);
@@ -3685,12 +3822,15 @@ describe("ExtensionRunner", () => {
 				const child = parent.run(() => harness.runner.beginNativePrompt("input"));
 				expect(child.request.parentRequestId).toBe(parent.request.requestId);
 				parent.resolve("completed");
-				expect(harness.runner.getPendingNativePrompts().map(request => request.requestId)).toEqual([child.request.requestId]);
+				expect(harness.runner.getPendingNativePrompts().map(request => request.requestId)).toEqual([
+					child.request.requestId,
+				]);
 				child.resolve("cancelled");
 				child.resolve("error");
 				await completed.promise;
 				expect(resolutions.map(event => [event.requestId, event.outcome])).toEqual([
-					[parent.request.requestId, "completed"], [child.request.requestId, "cancelled"],
+					[parent.request.requestId, "completed"],
+					[child.request.requestId, "cancelled"],
 				]);
 				expect(harness.runner.getPendingNativePrompts()).toEqual([]);
 			});

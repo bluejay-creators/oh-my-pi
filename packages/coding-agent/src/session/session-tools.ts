@@ -959,9 +959,14 @@ export class SessionTools {
 						const runner = this.#host.extensionRunner();
 						raced = runner
 							? await runner.observeNativePrompt("tool-approval", requestPermission, {
-									request: createNativePromptRequest(this.#host.sessionManager.getSessionId(), "tool-approval", {
-										toolCallId, toolName: target.name,
-									}),
+									request: createNativePromptRequest(
+										this.#host.sessionManager.getSessionId(),
+										"tool-approval",
+										{
+											toolCallId,
+											toolName: target.name,
+										},
+									),
 									signal,
 								})
 							: await requestPermission();

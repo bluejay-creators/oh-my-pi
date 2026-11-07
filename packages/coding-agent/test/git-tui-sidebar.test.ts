@@ -65,7 +65,9 @@ class SidebarHarness {
 			onAction: action => this.actions.push(action),
 			onFocusDiff: () => {},
 			requestRender: () => {},
-			onInputModeChange: active => { this.inputModes.push(active); },
+			onInputModeChange: active => {
+				this.inputModes.push(active);
+			},
 		});
 	}
 

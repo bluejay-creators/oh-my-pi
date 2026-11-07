@@ -4,7 +4,11 @@ import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import type { Extension, NativePromptEvent, NativePromptOutcome } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type {
+	Extension,
+	NativePromptEvent,
+	NativePromptOutcome,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { Container, Text } from "@oh-my-pi/pi-tui";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
@@ -276,9 +280,11 @@ describe("single-instance menus", () => {
 		finish("cancelled");
 		expect(events[3]).toMatchObject({ type: "native_prompt_resolved", outcome: "cancelled" });
 		const failure = new Error("private construction error");
-		expect(() => controller.showSelector(() => {
-			throw failure;
-		})).toThrow(failure);
+		expect(() =>
+			controller.showSelector(() => {
+				throw failure;
+			}),
+		).toThrow(failure);
 		expect(events[5]).toMatchObject({ type: "native_prompt_resolved", outcome: "error" });
 		expect(runner.getPendingNativePrompts()).toEqual([]);
 		expect(JSON.stringify(events)).not.toContain("private");
@@ -325,10 +331,9 @@ describe("single-instance menus", () => {
 		if (!finishFirst) throw new Error("Expected first completion");
 		finishFirst();
 		expect(runner.getPendingNativePrompts()).toEqual([]);
-		expect(events.slice(2).map(event => event.type === "native_prompt_resolved" ? event.outcome : event.type)).toEqual([
-			"cancelled",
-			"completed",
-		]);
+		expect(
+			events.slice(2).map(event => (event.type === "native_prompt_resolved" ? event.outcome : event.type)),
+		).toEqual(["cancelled", "completed"]);
 	});
 
 	it("settles a displaced selector at actual raw-dialog presentation, not at arbitrary component presence", async () => {

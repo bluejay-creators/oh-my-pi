@@ -368,40 +368,50 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				this.runner.hasApprovalDecider();
 			const pendingApproval =
 				pendingSafetyChecks.length === 0 && hasApprovalHandlers
-					? new PendingToolApproval(() => {
-							const currentSettings = resolveApprovalFromContext(
-								context ?? (this.runner.sessionSettings ? { settings: this.runner.sessionSettings } : undefined),
-							);
-							const currentArgs = approvalArgs(effectiveParams, context);
-							const currentApproval = resolveApproval(
-								this.tool, currentArgs, currentSettings.approvalMode, currentSettings.userPolicies,
-							);
-							if (currentApproval.policy !== "prompt") throw new Error("Approval policy changed");
-							return {
-								sessionId: context?.sessionManager?.getSessionId() ?? "",
-								toolCallId,
-								toolName: this.tool.name,
-								cwd: context?.sessionManager?.getCwd() ?? "",
-								arguments: currentArgs,
-								approvalMode: currentSettings.approvalMode,
-								tier: currentApproval.tier,
-							};
-						}, signal, prompt)
+					? new PendingToolApproval(
+							() => {
+								const currentSettings = resolveApprovalFromContext(
+									context ??
+										(this.runner.sessionSettings ? { settings: this.runner.sessionSettings } : undefined),
+								);
+								const currentArgs = approvalArgs(effectiveParams, context);
+								const currentApproval = resolveApproval(
+									this.tool,
+									currentArgs,
+									currentSettings.approvalMode,
+									currentSettings.userPolicies,
+								);
+								if (currentApproval.policy !== "prompt") throw new Error("Approval policy changed");
+								return {
+									sessionId: context?.sessionManager?.getSessionId() ?? "",
+									toolCallId,
+									toolName: this.tool.name,
+									cwd: context?.sessionManager?.getCwd() ?? "",
+									arguments: currentArgs,
+									approvalMode: currentSettings.approvalMode,
+									tier: currentApproval.tier,
+								};
+							},
+							signal,
+							prompt,
+						)
 					: undefined;
 			let automaticallyApproved = false;
 			try {
 				if (hasApprovalHandlers) {
-					await this.runner.emit(Object.freeze({
-						type: "tool_approval_requested",
-						sessionId,
-						toolName: this.tool.name,
-						toolCallId,
-						...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
-						approvalMode,
-						...(pendingApproval?.request ? { request: pendingApproval.request } : {}),
-						prompt,
-						...(signal ? { signal } : {}),
-					}));
+					await this.runner.emit(
+						Object.freeze({
+							type: "tool_approval_requested",
+							sessionId,
+							toolName: this.tool.name,
+							toolCallId,
+							...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+							approvalMode,
+							...(pendingApproval?.request ? { request: pendingApproval.request } : {}),
+							prompt,
+							...(signal ? { signal } : {}),
+						}),
+					);
 					if (pendingApproval?.request) {
 						const decision = await this.runner.decideToolApproval(pendingApproval.request, signal, this.#agent);
 						automaticallyApproved = pendingApproval.consume(decision);
@@ -467,7 +477,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 				const uiContext = this.runner.getUIContext();
 				const safetyAppendix =
-					pendingSafetyChecks.length > 0 ? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)] : [];
+					pendingSafetyChecks.length > 0
+						? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)]
+						: [];
 				let approved: boolean;
 				try {
 					const currentArgs = approvalArgs(effectiveParams, context);
@@ -475,15 +487,20 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						context ?? (this.runner.sessionSettings ? { settings: this.runner.sessionSettings } : undefined),
 					);
 					const currentApproval = resolveApproval(
-						this.tool, currentArgs, currentSettings.approvalMode, currentSettings.userPolicies,
+						this.tool,
+						currentArgs,
+						currentSettings.approvalMode,
+						currentSettings.userPolicies,
 					);
 					if (currentApproval.policy === "deny") throw denyError(currentApproval, this.tool.name);
-					const showApproval = () => untilAborted(signal, () =>
-						requestApproval(uiContext, this.tool, currentArgs, currentApproval.reason, safetyAppendix, signal),
-					);
-					approved = uiContext.supportsDialogs === false
-						? await showApproval()
-						: await this.runner.observeNativePrompt(prompt.kind, showApproval, { request: prompt, signal });
+					const showApproval = () =>
+						untilAborted(signal, () =>
+							requestApproval(uiContext, this.tool, currentArgs, currentApproval.reason, safetyAppendix, signal),
+						);
+					approved =
+						uiContext.supportsDialogs === false
+							? await showApproval()
+							: await this.runner.observeNativePrompt(prompt.kind, showApproval, { request: prompt, signal });
 				} catch (err) {
 					await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 					cancelPreflight();

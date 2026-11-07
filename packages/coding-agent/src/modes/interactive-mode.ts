@@ -1976,7 +1976,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#tanCommandController = new TanCommandController(this);
 		this.#omfgController = new OmfgController(this);
 		this.#cleanseController = new CleanseCommandController(this);
-		this.#extensionUiController = new ExtensionUiController(this, () => this.#selectorController.endSelectorPrompts());
+		this.#extensionUiController = new ExtensionUiController(this, () =>
+			this.#selectorController.endSelectorPrompts(),
+		);
 		this.#eventController = new EventController(this);
 		this.#commandController = new CommandController(this);
 		this.#todoCommandController = new TodoCommandController(this);

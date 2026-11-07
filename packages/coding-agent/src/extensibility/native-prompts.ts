@@ -134,8 +134,10 @@ export class NativePromptObserver {
 				const definition = Object.hasOwn(UI_PROMPTS, property)
 					? UI_PROMPTS[property as keyof ExtensionUIContext]
 					: undefined;
-				const available = definition !== undefined &&
-					target.supportsDialogs !== false && (property !== "custom" || target.supportsCustom !== false);
+				const available =
+					definition !== undefined &&
+					target.supportsDialogs !== false &&
+					(property !== "custom" || target.supportsCustom !== false);
 				const cache = definition && !available ? (unsupportedMethods ??= new Map()) : methods;
 				const cachedMethod = cache.get(property);
 				if (cachedMethod) return cachedMethod;
@@ -144,8 +146,13 @@ export class NativePromptObserver {
 				const bound = prompt
 					? (...args: unknown[]) => {
 							const options: unknown = args[prompt.optionsIndex];
-							const signal = options !== null && typeof options === "object" && "signal" in options &&
-								options.signal instanceof AbortSignal ? options.signal : undefined;
+							const signal =
+								options !== null &&
+								typeof options === "object" &&
+								"signal" in options &&
+								options.signal instanceof AbortSignal
+									? options.signal
+									: undefined;
 							return this.observe(prompt.kind, () => method.apply(target, args), { signal });
 						}
 					: method.bind(target);

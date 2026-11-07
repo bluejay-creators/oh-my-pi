@@ -126,11 +126,12 @@ async function createSession(
 	if (options?.extensionFactory) {
 		const runtime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
-			options.extensionFactory, tempDir.path(), new EventBus(), runtime,
+			options.extensionFactory,
+			tempDir.path(),
+			new EventBus(),
+			runtime,
 		);
-		extensionRunner = new ExtensionRunner(
-			[extension], runtime, tempDir.path(), sessionManager, {} as ModelRegistry,
-		);
+		extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, {} as ModelRegistry);
 	}
 	const sess = new AgentSession({
 		agent,
@@ -825,27 +826,46 @@ for (const outcome of ["complete", "cancel"] as const) {
 			capabilities: { requestPermission: true },
 			requestPermission: async () => pending.promise,
 		};
-		session = await createSession([bashTool], bridge, {}, {
-			extensionFactory: pi => {
-				pi.registerApprovalDecider(() => { decisions++; return { decision: "pass" }; });
-				pi.on("native_prompt_requested", event => {
-					requests.push(event.request);
-					entered.resolve(event.request);
-				});
-				pi.on("native_prompt_resolved", event => { completed.resolve(event); });
+		session = await createSession(
+			[bashTool],
+			bridge,
+			{},
+			{
+				extensionFactory: pi => {
+					pi.registerApprovalDecider(() => {
+						decisions++;
+						return { decision: "pass" };
+					});
+					pi.on("native_prompt_requested", event => {
+						requests.push(event.request);
+						entered.resolve(event.request);
+					});
+					pi.on("native_prompt_resolved", event => {
+						completed.resolve(event);
+					});
+				},
 			},
-		});
+		);
 		await session.setActiveToolsByName(["bash"]);
 		const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash")!;
 		const controller = new AbortController();
 		const started = Date.now();
 		const execution = wrappedBash.execute(
-			"native-acp", { command: "secret-command-payload" }, controller.signal, undefined as never, undefined as never,
+			"native-acp",
+			{ command: "secret-command-payload" },
+			controller.signal,
+			undefined as never,
+			undefined as never,
 		);
-		const result = execution.then(() => undefined, (error: unknown) => error);
+		const result = execution.then(
+			() => undefined,
+			(error: unknown) => error,
+		);
 		const request = await entered.promise;
 		expect(request).toMatchObject({
-			kind: "tool-approval", toolCallId: "native-acp", toolName: "bash",
+			kind: "tool-approval",
+			toolCallId: "native-acp",
+			toolName: "bash",
 		});
 		expect(request.requestedAt).toBeGreaterThanOrEqual(started);
 		expect(request.requestedAt).toBeLessThanOrEqual(Date.now());
@@ -860,7 +880,8 @@ for (const outcome of ["complete", "cancel"] as const) {
 		}
 		const resolution = await completed.promise;
 		expect(resolution).toMatchObject({
-			requestId: request.requestId, outcome: outcome === "cancel" ? "cancelled" : "completed",
+			requestId: request.requestId,
+			outcome: outcome === "cancel" ? "cancelled" : "completed",
 		});
 		expect(JSON.stringify([request, resolution])).not.toContain("secret-");
 		expect(requests).toHaveLength(1);

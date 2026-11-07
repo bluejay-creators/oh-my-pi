@@ -134,11 +134,7 @@ export class ExtensionUiController {
 
 	// Managed commands also call raw dialogs without ExtensionUIContext. Observe
 	// their shared awaits; the runner suppresses nested extension/collab roots.
-	#observeNativePrompt<T>(
-		kind: NativePromptKind,
-		action: () => Promise<T>,
-		signal?: AbortSignal,
-	): Promise<T> {
+	#observeNativePrompt<T>(kind: NativePromptKind, action: () => Promise<T>, signal?: AbortSignal): Promise<T> {
 		const runner = this.ctx.session?.extensionRunner;
 		return runner ? runner.observeNativePrompt(kind, action, { signal }) : action();
 	}
@@ -720,7 +716,11 @@ export class ExtensionUiController {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
-		return this.#observeNativePrompt("ask", () => this.#showAskDialog(questions, dialogOptions), dialogOptions?.signal);
+		return this.#observeNativePrompt(
+			"ask",
+			() => this.#showAskDialog(questions, dialogOptions),
+			dialogOptions?.signal,
+		);
 	}
 
 	async #showAskDialog(
@@ -894,11 +894,7 @@ export class ExtensionUiController {
 		signal: AbortSignal | undefined,
 		local: (signal: AbortSignal | undefined) => Promise<string | undefined>,
 	): Promise<string | undefined> {
-		return this.#observeNativePrompt(
-			kind,
-			() => this.#raceUnobservedCollabDialog(request, signal, local),
-			signal,
-		);
+		return this.#observeNativePrompt(kind, () => this.#raceUnobservedCollabDialog(request, signal, local), signal);
 	}
 
 	async #raceUnobservedCollabDialog(

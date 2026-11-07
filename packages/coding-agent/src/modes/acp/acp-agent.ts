@@ -2045,14 +2045,15 @@ export class AcpAgent implements Agent {
 		const previewLines = planContent.split("\n").slice(0, 12).join("\n");
 		const ellipsis = planContent.split("\n").length > 12 ? "\n…" : "";
 		const message = `Approve plan "${title}" and start implementation?\n\n${previewLines}${ellipsis}`;
-		const choose = () => elicitFromAcpClient(
-			this.#connection,
-			sessionId,
-			"select",
-			message,
-			{ type: "string", enum: [APPROVE_OPTION, REFINE_OPTION] },
-			undefined,
-		);
+		const choose = () =>
+			elicitFromAcpClient(
+				this.#connection,
+				sessionId,
+				"select",
+				message,
+				{ type: "string", enum: [APPROVE_OPTION, REFINE_OPTION] },
+				undefined,
+			);
 		const runner = this.#sessions.get(sessionId)?.session.extensionRunner;
 		const value = runner ? await runner.observeNativePrompt("select", choose) : await choose();
 		// Approve ONLY on the explicit approve selection. Dismissal, cancel,

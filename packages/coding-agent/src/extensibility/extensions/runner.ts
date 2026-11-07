@@ -757,7 +757,9 @@ export class ExtensionRunner {
 			() => this.sessionManager.getSessionId(),
 			event => {
 				// Never await observers before UI; no reply authority or payload-bearing failure log.
-				void this.emit(event).catch(() => logger.warn("Native prompt event observer failed", { event: event.type }));
+				void this.emit(event).catch(() =>
+					logger.warn("Native prompt event observer failed", { event: event.type }),
+				);
 			},
 		);
 		this.#getMemoryFn = getMemory;
@@ -1648,7 +1650,8 @@ export class ExtensionRunner {
 		// cancellation so a late observer cannot open a dialog for an aborted call.
 		const eventSignal =
 			(event.type === "session_stop" || event.type === "tool_approval_requested") &&
-			"signal" in event && event.signal instanceof AbortSignal
+			"signal" in event &&
+			event.signal instanceof AbortSignal
 				? event.signal
 				: undefined;
 		const signals = [outerSignal, eventSignal].filter((s): s is AbortSignal => s !== undefined);

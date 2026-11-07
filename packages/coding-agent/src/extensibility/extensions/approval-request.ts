@@ -42,7 +42,9 @@ function snapshotInput(value: unknown, ancestors = new Set<object>()): ToolAppro
 }
 
 function fingerprint(requestId: string, requestedAt: number, context: ApprovalContext): string {
-	return new Bun.CryptoHasher("sha256").update(stableStringifyJson({ requestId, requestedAt, ...context })).digest("hex");
+	return new Bun.CryptoHasher("sha256")
+		.update(stableStringifyJson({ requestId, requestedAt, ...context }))
+		.digest("hex");
 }
 
 /** Internal lifecycle: no registry, reusable token, or externally callable resolver. */
@@ -61,7 +63,10 @@ export class PendingToolApproval {
 			const snapshot = { ...context, arguments: snapshotInput(context.arguments) };
 			const { requestId, requestedAt } = identity;
 			this.request = Object.freeze({
-				...snapshot, requestId, requestedAt, fingerprint: fingerprint(requestId, requestedAt, snapshot),
+				...snapshot,
+				requestId,
+				requestedAt,
+				fingerprint: fingerprint(requestId, requestedAt, snapshot),
 			});
 		} catch {
 			// Unsupported execution arguments retain the ordinary human approval path.
@@ -72,10 +77,13 @@ export class PendingToolApproval {
 		if (!this.request || this.signal?.aborted) return false;
 		try {
 			const context = this.current();
-			return this.request.fingerprint === fingerprint(this.request.requestId, this.request.requestedAt, {
-				...context,
-				arguments: snapshotInput(context.arguments),
-			});
+			return (
+				this.request.fingerprint ===
+				fingerprint(this.request.requestId, this.request.requestedAt, {
+					...context,
+					arguments: snapshotInput(context.arguments),
+				})
+			);
 		} catch {
 			return false;
 		}
@@ -84,8 +92,14 @@ export class PendingToolApproval {
 	consume(result: ToolApprovalDeciderResult | undefined): boolean {
 		const pending = this.#pending;
 		this.close();
-		return pending && result?.decision === "approve-once" && this.request !== undefined &&
-			result.requestId === this.request.requestId && result.fingerprint === this.request.fingerprint && this.matches();
+		return (
+			pending &&
+			result?.decision === "approve-once" &&
+			this.request !== undefined &&
+			result.requestId === this.request.requestId &&
+			result.fingerprint === this.request.fingerprint &&
+			this.matches()
+		);
 	}
 
 	close(): void {

@@ -193,12 +193,16 @@ describe("AgentsHub prompt observation", () => {
 	test("reports actual choice/input stages and ends before persisting a pattern, not on passive hub presence", async () => {
 		const settings = new TestSettings();
 		const events: Array<"input" | "select" | "confirm" | undefined> = [];
-		const { hub, type } = await createHub(settings, { onPromptChange: kind => events.push(kind) }, {
-			setAgentOverride: (property, name, value) => {
-				expect(events.at(-1)).toBeUndefined();
-				settings.setEntry(OVERRIDE_KEYS[property], name, value);
+		const { hub, type } = await createHub(
+			settings,
+			{ onPromptChange: kind => events.push(kind) },
+			{
+				setAgentOverride: (property, name, value) => {
+					expect(events.at(-1)).toBeUndefined();
+					settings.setEntry(OVERRIDE_KEYS[property], name, value);
+				},
 			},
-		});
+		);
 		expect(events).toEqual([]);
 		hub.handleNativeEvent({ type: "action", key: "", act: "model", mods: [] });
 		expect(events).toEqual(["select"]);
@@ -238,25 +242,31 @@ describe("AgentsHub prompt observation", () => {
 		const events: Array<"input" | "select" | "confirm" | undefined> = [];
 		const generation = Promise.withResolvers<string>();
 		const save = Promise.withResolvers<string>();
-		const { hub, type } = await createHub(new TestSettings(), { onPromptChange: kind => events.push(kind) }, {
-			generateAgent: async () => {
-				expect(events.at(-1)).toBeUndefined();
-				return generation.promise;
+		const { hub, type } = await createHub(
+			new TestSettings(),
+			{ onPromptChange: kind => events.push(kind) },
+			{
+				generateAgent: async () => {
+					expect(events.at(-1)).toBeUndefined();
+					return generation.promise;
+				},
+				saveAgent: async () => {
+					expect(events.at(-1)).toBeUndefined();
+					return save.promise;
+				},
 			},
-			saveAgent: async () => {
-				expect(events.at(-1)).toBeUndefined();
-				return save.promise;
-			},
-		});
+		);
 		hub.handleNativeEvent({ type: "action", key: "", act: "new", mods: [] });
 		type("private agent description");
 		hub.handleInput("\x11");
 		expect(events).toEqual(["input", undefined]);
-		generation.resolve(JSON.stringify({
-			identifier: "test-helper",
-			whenToUse: "Use this agent when testing.",
-			systemPrompt: "Private generated content.",
-		}));
+		generation.resolve(
+			JSON.stringify({
+				identifier: "test-helper",
+				whenToUse: "Use this agent when testing.",
+				systemPrompt: "Private generated content.",
+			}),
+		);
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 		expect(events).toEqual(["input", undefined, "confirm"]);
 		hub.handleInput("\r");
@@ -270,9 +280,13 @@ describe("AgentsHub prompt observation", () => {
 	test("rearms the actual editor after generation fails, but never rearms a disposed hub", async () => {
 		const events: Array<"input" | "select" | "confirm" | undefined> = [];
 		let generation = Promise.withResolvers<string>();
-		const { hub, type } = await createHub(new TestSettings(), { onPromptChange: kind => events.push(kind) }, {
-			generateAgent: async () => generation.promise,
-		});
+		const { hub, type } = await createHub(
+			new TestSettings(),
+			{ onPromptChange: kind => events.push(kind) },
+			{
+				generateAgent: async () => generation.promise,
+			},
+		);
 		hub.handleNativeEvent({ type: "action", key: "", act: "new", mods: [] });
 		type("private description");
 		hub.handleInput("\x11");
@@ -282,11 +296,13 @@ describe("AgentsHub prompt observation", () => {
 		generation = Promise.withResolvers<string>();
 		hub.handleInput("\x11");
 		hub.dispose();
-		generation.resolve(JSON.stringify({
-			identifier: "test-helper",
-			whenToUse: "Use this agent when testing.",
-			systemPrompt: "Private generated content.",
-		}));
+		generation.resolve(
+			JSON.stringify({
+				identifier: "test-helper",
+				whenToUse: "Use this agent when testing.",
+				systemPrompt: "Private generated content.",
+			}),
+		);
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 		expect(events).toEqual(["input", undefined, "input", undefined]);
 	});
@@ -294,7 +310,9 @@ describe("AgentsHub prompt observation", () => {
 	test("ignores observer failures without changing native input or persistence", async () => {
 		const settings = new TestSettings();
 		const { hub, type } = await createHub(settings, {
-			onPromptChange: () => { throw new Error("observer failure"); },
+			onPromptChange: () => {
+				throw new Error("observer failure");
+			},
 		});
 		hub.handleNativeEvent({ type: "action", key: "", act: "model", mods: [] });
 		hub.handleNativeEvent({ type: "action", key: "", act: "strip", value: "1", mods: [] });

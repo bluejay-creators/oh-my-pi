@@ -319,12 +319,7 @@ export class SelectorController {
 	}
 
 	/** Mount `component` as `menu`'s overlay through `mount`, which also raises it later. */
-	#mountMenu(
-		menu: OpenMenu,
-		component: Component,
-		mount: () => OverlayHandle,
-		prompt?: NativePromptHandle,
-	): void {
+	#mountMenu(menu: OpenMenu, component: Component, mount: () => OverlayHandle, prompt?: NativePromptHandle): void {
 		menu.component = component;
 		menu.mount = mount;
 		menu.handle = this.#runNativePrompt(prompt, mount);
@@ -997,16 +992,21 @@ export class SelectorController {
 		);
 		const menu = this.#claimMenu("model-picker");
 		prompt = this.#beginNativePrompt("select", generation);
-		this.#mountMenu(menu, picker, () => {
-			const handle = this.ctx.ui.showOverlay(picker, {
-				anchor: "bottom-center",
-				width: "100%",
-				maxHeight: "100%",
-				margin: 0,
-			});
-			this.ctx.ui.setFocus(picker);
-			return handle;
-		}, prompt);
+		this.#mountMenu(
+			menu,
+			picker,
+			() => {
+				const handle = this.ctx.ui.showOverlay(picker, {
+					anchor: "bottom-center",
+					width: "100%",
+					maxHeight: "100%",
+					margin: 0,
+				});
+				this.ctx.ui.setFocus(picker);
+				return handle;
+			},
+			prompt,
+		);
 		this.ctx.ui.requestRender();
 	}
 

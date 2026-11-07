@@ -434,5 +434,8 @@ export async function requestApproval(
 		return (signal ? await ui.approve({ full, compact }, { signal }) : await ui.approve({ full, compact })) === true;
 	}
 	signal?.throwIfAborted();
-	return (signal ? await ui.select(full, ["Approve", "Deny"], { signal }) : await ui.select(full, ["Approve", "Deny"])) === "Approve";
+	return (
+		(signal ? await ui.select(full, ["Approve", "Deny"], { signal }) : await ui.select(full, ["Approve", "Deny"])) ===
+		"Approve"
+	);
 }

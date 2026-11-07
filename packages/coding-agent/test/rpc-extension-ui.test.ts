@@ -204,20 +204,22 @@ await runRpcMode(session, {
 		expect(requested).toHaveLength(2);
 		expect(resolved).toHaveLength(2);
 		const pending = requested.map(event => event.request);
-		expect(pending).toEqual(expect.arrayContaining([
-			{
-				requestId: expect.any(String),
-				requestedAt: expect.any(Number),
-				sessionId: expect.any(String),
-				kind: "select",
-			},
-			{
-				requestId: expect.any(String),
-				requestedAt: expect.any(Number),
-				sessionId: expect.any(String),
-				kind: "input",
-			},
-		]));
+		expect(pending).toEqual(
+			expect.arrayContaining([
+				{
+					requestId: expect.any(String),
+					requestedAt: expect.any(Number),
+					sessionId: expect.any(String),
+					kind: "select",
+				},
+				{
+					requestId: expect.any(String),
+					requestedAt: expect.any(Number),
+					sessionId: expect.any(String),
+					kind: "input",
+				},
+			]),
+		);
 		expect(new Set(pending.map(request => isRecord(request) && request.requestId)).size).toBe(2);
 		expect(resolved.map(event => event.outcome)).toEqual(["completed", "cancelled"]);
 		for (const event of resolved) {
