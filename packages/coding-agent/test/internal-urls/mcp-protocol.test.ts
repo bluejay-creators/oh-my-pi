@@ -38,10 +38,11 @@ function createMockManager(opts: {
 	} as unknown as MCPManager;
 }
 
-function createToolSession(): ToolSession {
+function createToolSession(mcpManager?: MCPManager): ToolSession {
 	return {
 		cwd: os.tmpdir(),
 		hasUI: false,
+		mcpManager,
 		settings: Settings.isolated(),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
@@ -174,7 +175,7 @@ describe("McpProtocolHandler", () => {
 		await expect(read.execute("excluded-again", { path: "private-fixture://doc" })).rejects.toThrow();
 	});
 
-	it("uses the caller's manager and never falls back to an unrelated singleton for manager-less children", async () => {
+	it("uses the caller's manager and never borrows an unrelated singleton for an owned session", async () => {
 		const globalResources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>([
 			["global", { resources: [{ uri: "global-fixture://doc", name: "global" }], templates: [] }],
 		]);
@@ -212,6 +213,7 @@ describe("McpProtocolHandler", () => {
 		expect(skill.content.some(part => part.type === "text" && part.text.includes("caller resource"))).toBe(true);
 		MCPManager.setInstance(global);
 		for (const session of [
+			{ ...createToolSession(), enableMCP: true },
 			{ ...createToolSession(), taskDepth: 1, enableMCP: true },
 			{ ...createToolSession(), parentTaskPrefix: "prefix-only-child", enableMCP: true },
 			{ ...createToolSession(), taskDepth: 1, enableMCP: false, mcpManager: global },
@@ -313,7 +315,7 @@ describe("McpProtocolHandler", () => {
 		});
 		MCPManager.setInstance(manager);
 
-		const result = await new ReadTool(createToolSession()).execute("read-semicolon-resource", {
+		const result = await new ReadTool(createToolSession(manager)).execute("read-semicolon-resource", {
 			path: `mcp://${uri}`,
 		});
 		const output = result.content.find(block => block.type === "text");
@@ -339,7 +341,7 @@ describe("McpProtocolHandler", () => {
 		});
 		MCPManager.setInstance(manager);
 
-		const result = await new ReadTool(createToolSession()).execute("read-ags-resource", {
+		const result = await new ReadTool(createToolSession(manager)).execute("read-ags-resource", {
 			path: "ags://capabilities/current-host",
 		});
 		const output = result.content.find(block => block.type === "text");
@@ -368,7 +370,7 @@ describe("McpProtocolHandler", () => {
 		});
 		MCPManager.setInstance(manager);
 
-		const result = await new ReadTool(createToolSession()).execute("read-delayed-ags-resource", {
+		const result = await new ReadTool(createToolSession(manager)).execute("read-delayed-ags-resource", {
 			path: "ags://capabilities/current-host",
 		});
 		const output = result.content.find(block => block.type === "text");
@@ -411,7 +413,7 @@ describe("McpProtocolHandler", () => {
 		});
 		MCPManager.setInstance(manager);
 
-		const result = await new ReadTool(createToolSession()).execute("read-opaque-resource", {
+		const result = await new ReadTool(createToolSession(manager)).execute("read-opaque-resource", {
 			path: "urn:example:document",
 		});
 		const output = result.content.find(block => block.type === "text");
@@ -716,8 +718,8 @@ describe("skill:// falls back to an MCP resource with the same URI", () => {
 	}
 
 	it("applies line/raw selectors to MCP skill text through ReadTool", async () => {
-		MCPManager.setInstance(figmaManager("L1\nL2\nL3\nL4"));
-		const result = await new ReadTool(createToolSession()).execute("read-skill-range", {
+		const manager = figmaManager("L1\nL2\nL3\nL4");
+		const result = await new ReadTool(createToolSession(manager)).execute("read-skill-range", {
 			path: `${skillUri}:2-3:raw`,
 		});
 		const text = textOf(result);
@@ -729,20 +731,18 @@ describe("skill:// falls back to an MCP resource with the same URI", () => {
 	it("reads a skill resource while its only MCP server is still connecting", async () => {
 		const servers: string[] = [];
 		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
-		MCPManager.setInstance(
-			createMockManager({
-				servers,
-				resources,
-				waitForPendingConnections: async () => {
-					servers.push("figma");
-				},
-				ensureResources: async () => {
-					resources.set("figma", { resources: [{ uri: skillUri, name: "figma-use" }], templates: [] });
-				},
-				readResult: { contents: [{ uri: skillUri, text: "L1\nL2\nL3\nL4" }] },
-			}),
-		);
-		const result = await new ReadTool(createToolSession()).execute("read-connecting-skill", {
+		const manager = createMockManager({
+			servers,
+			resources,
+			waitForPendingConnections: async () => {
+				servers.push("figma");
+			},
+			ensureResources: async () => {
+				resources.set("figma", { resources: [{ uri: skillUri, name: "figma-use" }], templates: [] });
+			},
+			readResult: { contents: [{ uri: skillUri, text: "L1\nL2\nL3\nL4" }] },
+		});
+		const result = await new ReadTool(createToolSession(manager)).execute("read-connecting-skill", {
 			path: `${skillUri}:2-3:raw`,
 		});
 		const text = textOf(result);
@@ -757,14 +757,12 @@ describe("skill:// falls back to an MCP resource with the same URI", () => {
 			resources: [],
 			templates: [{ uriTemplate: "skill://{+path}", name: "all-skills" }],
 		});
-		MCPManager.setInstance(
-			createMockManager({
-				servers: ["figma"],
-				resources,
-				readResult: { contents: [{ uri: skillUri, text: "template instruction" }] },
-			}),
-		);
-		const read = new ReadTool(createToolSession());
+		const manager = createMockManager({
+			servers: ["figma"],
+			resources,
+			readResult: { contents: [{ uri: skillUri, text: "template instruction" }] },
+		});
+		const read = new ReadTool(createToolSession(manager));
 		await expect(read.execute("read-template-skill", { path: skillUri })).rejects.toThrow("Unknown skill: figma");
 		const result = await read.execute("read-explicit-template", { path: `mcp://${skillUri}` });
 		expect(textOf(result)).toContain("template instruction");
@@ -831,8 +829,8 @@ describe("skill:// falls back to an MCP resource with the same URI", () => {
 
 	it("keeps read result limits for MCP skill text, unlike local skill instructions", async () => {
 		const lines = Array.from({ length: 20_000 }, (_, index) => `L${index + 1}`);
-		MCPManager.setInstance(figmaManager(lines.join("\n")));
-		const result = await new ReadTool(createToolSession()).execute("read-skill-limits", { path: skillUri });
+		const manager = figmaManager(lines.join("\n"));
+		const result = await new ReadTool(createToolSession(manager)).execute("read-skill-limits", { path: skillUri });
 		const text = textOf(result);
 		expect(text).toContain("L1\n");
 		expect(text).not.toContain("L20000");
