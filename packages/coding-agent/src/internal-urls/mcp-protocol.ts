@@ -63,7 +63,12 @@ function extractResourceUri(url: InternalUrl): string {
 	return uri;
 }
 
-function resolveTargetServer(mcpManager: MCPManager, uri: string, exact: boolean, forSubagent: boolean): string | undefined {
+function resolveTargetServer(
+	mcpManager: MCPManager,
+	uri: string,
+	exact: boolean,
+	forSubagent: boolean,
+): string | undefined {
 	const servers = mcpManager.getConnectedServers();
 	for (const name of servers) {
 		if (forSubagent && !mcpManager.isServerInherited(name)) continue;
@@ -159,7 +164,8 @@ export async function readMcpResource(
 		await untilAborted(
 			signal,
 			Promise.allSettled(
-				mcpManager.getConnectedServers()
+				mcpManager
+					.getConnectedServers()
 					.filter(name => !forSubagent || mcpManager.isServerInherited(name))
 					.map(name => mcpManager.ensureServerResources(name)),
 			),

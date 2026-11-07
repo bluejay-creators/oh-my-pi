@@ -101,13 +101,16 @@ describe("McpProtocolHandler", () => {
 	});
 	it("blocks child Read and Eval resource routes for excluded servers without hiding parent or default-server access", async () => {
 		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>([
-			["hidden", {
-				resources: [
-					{ uri: "private-fixture://doc", name: "private-doc" },
-					{ uri: "skill://private-fixture/instructions.md", name: "private-skill" },
-				],
-				templates: [{ uriTemplate: "private-fixture://items/{id}", name: "private-template" }],
-			}],
+			[
+				"hidden",
+				{
+					resources: [
+						{ uri: "private-fixture://doc", name: "private-doc" },
+						{ uri: "skill://private-fixture/instructions.md", name: "private-skill" },
+					],
+					templates: [{ uriTemplate: "private-fixture://items/{id}", name: "private-template" }],
+				},
+			],
 			["shared", { resources: [{ uri: "shared-fixture://doc", name: "shared-doc" }], templates: [] }],
 		]);
 		const inheritance = { hidden: false };
@@ -118,7 +121,9 @@ describe("McpProtocolHandler", () => {
 			resources,
 			inheritInSubagents: inheritance,
 			onRead: name => reads.push(name),
-			ensureResources: async name => { ensured.push(name); },
+			ensureResources: async name => {
+				ensured.push(name);
+			},
 			readResult: { contents: [{ uri: "fixture://result", text: "resource content" }] },
 		});
 		MCPManager.setInstance(manager);
@@ -183,20 +188,27 @@ describe("McpProtocolHandler", () => {
 		MCPManager.setInstance(global);
 		const caller = createMockManager({
 			servers: ["caller"],
-			resources: new Map([["caller", {
-				resources: [
-					{ uri: "caller-fixture://doc", name: "caller" },
-					{ uri: "skill://caller-fixture/instructions.md", name: "caller-skill" },
+			resources: new Map([
+				[
+					"caller",
+					{
+						resources: [
+							{ uri: "caller-fixture://doc", name: "caller" },
+							{ uri: "skill://caller-fixture/instructions.md", name: "caller-skill" },
+						],
+						templates: [],
+					},
 				],
-				templates: [],
-			}]]),
+			]),
 			readResult: { contents: [{ uri: "caller-fixture://doc", text: "caller resource" }] },
 		});
 		const child = { ...createToolSession(), taskDepth: 1, enableMCP: true, mcpManager: caller, skills: [] };
 		const result = await new ReadTool(child).execute("caller-read", { path: "caller-fixture://doc" });
 		expect(result.content.some(part => part.type === "text" && part.text.includes("caller resource"))).toBe(true);
 		MCPManager.setInstance(undefined);
-		const skill = await new ReadTool(child).execute("caller-skill", { path: "skill://caller-fixture/instructions.md" });
+		const skill = await new ReadTool(child).execute("caller-skill", {
+			path: "skill://caller-fixture/instructions.md",
+		});
 		expect(skill.content.some(part => part.type === "text" && part.text.includes("caller resource"))).toBe(true);
 		MCPManager.setInstance(global);
 		for (const session of [
@@ -205,7 +217,9 @@ describe("McpProtocolHandler", () => {
 			{ ...createToolSession(), taskDepth: 1, enableMCP: false, mcpManager: global },
 			child,
 		]) {
-			await expect(new ReadTool(session).execute("no-global-fallback", { path: "mcp://global-fixture://doc" })).rejects.toThrow();
+			await expect(
+				new ReadTool(session).execute("no-global-fallback", { path: "mcp://global-fixture://doc" }),
+			).rejects.toThrow();
 		}
 		expect(globalReads).toBe(0);
 	});
@@ -219,7 +233,10 @@ describe("McpProtocolHandler", () => {
 			servers: ["late"],
 			resources,
 			inheritInSubagents: inheritance,
-			waitForPendingConnections: () => { started.resolve(); return release.promise; },
+			waitForPendingConnections: () => {
+				started.resolve();
+				return release.promise;
+			},
 			onRead: () => reads++,
 			readResult: { contents: [{ uri: "late-fixture://doc", text: "late resource" }] },
 		});
@@ -232,11 +249,12 @@ describe("McpProtocolHandler", () => {
 		release.resolve();
 		await expect(reading).rejects.toThrow("No MCP server has resource");
 		expect(reads).toBe(0);
-		await new ReadTool({ ...createToolSession(), enableMCP: true, mcpManager: manager })
-			.execute("parent-late-resource", { path: "mcp://late-fixture://doc" });
+		await new ReadTool({ ...createToolSession(), enableMCP: true, mcpManager: manager }).execute(
+			"parent-late-resource",
+			{ path: "mcp://late-fixture://doc" },
+		);
 		expect(reads).toBe(1);
 	});
-
 
 	it("reads resource by exact URI match", async () => {
 		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();

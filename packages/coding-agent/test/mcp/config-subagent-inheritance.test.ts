@@ -50,32 +50,35 @@ for (const [provider, relativePath] of [
 	["plugin", "plugin/mcp.json"],
 	["user", "../agent/mcp.json"],
 ] as const) {
-	test(provider + " config retains parent access, filters child discovery, and rejects malformed inheritance policy", async () => {
-		await Bun.write(
-			path.join(cwd, relativePath),
-			JSON.stringify({
-				mcpServers: {
-					hidden: { command: "fixture", args: ["hidden"], inheritInSubagents: false },
-					retained: { command: "fixture", args: ["retained"], inheritInSubagents: true },
-					defaulted: { command: "fixture", args: ["defaulted"] },
-					invalid: { command: "fixture", args: ["invalid"], inheritInSubagents: "false" },
-					nullable: { command: "fixture", args: ["nullable"], inheritInSubagents: null },
+	test(
+		provider + " config retains parent access, filters child discovery, and rejects malformed inheritance policy",
+		async () => {
+			await Bun.write(
+				path.join(cwd, relativePath),
+				JSON.stringify({
+					mcpServers: {
+						hidden: { command: "fixture", args: ["hidden"], inheritInSubagents: false },
+						retained: { command: "fixture", args: ["retained"], inheritInSubagents: true },
+						defaulted: { command: "fixture", args: ["defaulted"] },
+						invalid: { command: "fixture", args: ["invalid"], inheritInSubagents: "false" },
+						nullable: { command: "fixture", args: ["nullable"], inheritInSubagents: null },
+					},
+				}),
+			);
+			const options: LoadMCPConfigsOptions = {
+				extensionRoots: {
+					explicit: provider === "plugin" ? [path.join(cwd, "plugin")] : [],
+					mode: "explicit-only",
+					configured: [],
+					configuredLevel: "project",
 				},
-			}),
-		);
-		const options: LoadMCPConfigsOptions = {
-			extensionRoots: {
-				explicit: provider === "plugin" ? [path.join(cwd, "plugin")] : [],
-				mode: "explicit-only",
-				configured: [],
-				configuredLevel: "project",
-			},
-		};
-		const parent = await loadAllMCPConfigs(cwd, options);
-		expect(Object.keys(parent.configs).sort()).toEqual(["defaulted", "hidden", "retained"]);
-		const child = await loadAllMCPConfigs(cwd, { ...options, forSubagent: true });
-		expect(Object.keys(child.configs).sort()).toEqual(["defaulted", "retained"]);
-	});
+			};
+			const parent = await loadAllMCPConfigs(cwd, options);
+			expect(Object.keys(parent.configs).sort()).toEqual(["defaulted", "hidden", "retained"]);
+			const child = await loadAllMCPConfigs(cwd, { ...options, forSubagent: true });
+			expect(Object.keys(child.configs).sort()).toEqual(["defaulted", "retained"]);
+		},
+	);
 }
 
 test("native writes preserve child exclusion through auth updates and reject malformed changes", async () => {
@@ -93,8 +96,14 @@ test("native writes preserve child exclusion through auth updates and reject mal
 });
 
 test("an excluded project entry keeps its name instead of falling through to a same-name user server", async () => {
-	await Bun.write(path.join(root, "agent", "mcp.json"), JSON.stringify({ mcpServers: { shared: { command: "user-fixture" } } }));
-	await Bun.write(path.join(cwd, ".omp", "mcp.json"), JSON.stringify({ mcpServers: { shared: { command: "project-fixture", inheritInSubagents: false } } }));
+	await Bun.write(
+		path.join(root, "agent", "mcp.json"),
+		JSON.stringify({ mcpServers: { shared: { command: "user-fixture" } } }),
+	);
+	await Bun.write(
+		path.join(cwd, ".omp", "mcp.json"),
+		JSON.stringify({ mcpServers: { shared: { command: "project-fixture", inheritInSubagents: false } } }),
+	);
 	const parent = await loadAllMCPConfigs(cwd);
 	expect(parent.configs.shared).toMatchObject({ command: "project-fixture", inheritInSubagents: false });
 	const child = await loadAllMCPConfigs(cwd, { forSubagent: true });
@@ -108,10 +117,12 @@ for (const server of [
 ]) {
 	test(server.type + " schema accepts child opt-out and rejects non-boolean policy", () => {
 		expect(
-			validateJsonSchemaValue(mcpSchema, { mcpServers: { fixture: { ...server, inheritInSubagents: false } } }).success,
+			validateJsonSchemaValue(mcpSchema, { mcpServers: { fixture: { ...server, inheritInSubagents: false } } })
+				.success,
 		).toBe(true);
 		expect(
-			validateJsonSchemaValue(mcpSchema, { mcpServers: { fixture: { ...server, inheritInSubagents: "false" } } }).success,
+			validateJsonSchemaValue(mcpSchema, { mcpServers: { fixture: { ...server, inheritInSubagents: "false" } } })
+				.success,
 		).toBe(false);
 	});
 }

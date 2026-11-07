@@ -115,16 +115,22 @@ describe("subagent session MCP tools follow the shared manager", () => {
 			"charlie",
 		]);
 		const hiddenName = manager.getTools().find(tool => tool.mcpServerName === "alpha")!.name;
-		await expect(callSessionTool(hiddenName, {}, {
-			session: {
-				cwd: childCwd,
-				hasUI: false,
-				settings: Settings.isolated(),
-				getSessionFile: () => null,
-				getSessionSpawns: () => "*",
-				getToolForEvalBridge: name => child.getToolForEvalBridge(name),
-			},
-		})).rejects.toThrow("Unknown tool");
+		await expect(
+			callSessionTool(
+				hiddenName,
+				{},
+				{
+					session: {
+						cwd: childCwd,
+						hasUI: false,
+						settings: Settings.isolated(),
+						getSessionFile: () => null,
+						getSessionSpawns: () => "*",
+						getToolForEvalBridge: name => child.getToolForEvalBridge(name),
+					},
+				},
+			),
+		).rejects.toThrow("Unknown tool");
 
 		// Even a held tool checks current policy before dispatch, not only at
 		// spawn/refresh. Mutate the exposed live config to isolate that boundary.

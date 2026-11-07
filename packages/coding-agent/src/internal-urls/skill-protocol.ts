@@ -143,7 +143,8 @@ export class SkillProtocolHandler implements ProtocolHandler {
 				throw error;
 			}
 			const resource =
-				mcpManager && (await readMcpResource(mcpManager, url, { exact: true, signal: context?.signal, forSubagent }));
+				mcpManager &&
+				(await readMcpResource(mcpManager, url, { exact: true, signal: context?.signal, forSubagent }));
 			if (!resource) throw error;
 			// The server, not a loaded skill, sizes this text: keep `read`'s normal result limits.
 			return { ...resource, unbounded: false };
@@ -193,7 +194,8 @@ export class SkillProtocolHandler implements ProtocolHandler {
 				error instanceof UnknownSkillError &&
 				!options?.localOnly &&
 				(context?.session?.mcpManager || MCPManager.available())
-			) return null;
+			)
+				return null;
 			throw error;
 		}
 		if (options?.create) return targetPath;
