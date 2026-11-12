@@ -111,6 +111,7 @@ import type {
 	UserPythonEvent,
 	UserPythonEventResult,
 } from "./types";
+import { TOOL_APPROVAL_RECEIPT_PATTERN } from "./types";
 
 import { cfgExtensionHandlersToolCallTimeoutMs } from "../settings";
 
@@ -1128,7 +1129,16 @@ export class ExtensionRunner {
 				"fingerprint" in result &&
 				result.fingerprint === request.fingerprint
 			) {
-				return { decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint };
+				const approved = {
+					decision: "approve-once" as const,
+					requestId: request.requestId,
+					fingerprint: request.fingerprint,
+				};
+				if (!("receipt" in result) || result.receipt === undefined) return approved;
+				const receipt: unknown = result.receipt;
+				// A receipt the host cannot deliver verbatim must not degrade into a receipt-less approval.
+				if (typeof receipt !== "string" || !TOOL_APPROVAL_RECEIPT_PATTERN.test(receipt)) return undefined;
+				return { ...approved, receipt };
 			}
 		} catch {
 			// A malformed controller return cannot authorize execution.

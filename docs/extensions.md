@@ -598,6 +598,17 @@ UI that gate continues to fail closed. The controller is not invoked and
 unavailable, or provider safety checks are pending. Those safety checks always
 require their existing human approval. Native policy denies remain authoritative.
 
+An `approve-once` result may also carry an opaque one-use `receipt` matching
+`/^[A-Za-z0-9._:-]{16,256}$/`. A receipt of any other shape makes the whole result
+non-authorizing. After the final pre-execution request check, native code hands an
+admitted receipt only to that one call's tool context as `approvalLaunchEnv`. The
+bash tool then places it in that single foreground launch's environment as
+`OMP_APPROVAL_RECEIPT`, `OMP_APPROVAL_REQUEST_ID` and `OMP_APPROVAL_FINGERPRINT`.
+Every other launch gets those keys blanked, so an inherited value never reaches a
+command. A receipt is refused for async or service launches. Human, xdev and ACP
+approvals never produce one. A program can redeem the receipt with its issuer to
+prove it was started by that native approval rather than replayed.
+
 The decision is consumed once, never saved as an allow rule, and cannot approve
 another call, even one reusing the same tool-call id and arguments. Cancellation
 while a controller is pending discards its eventual result and never runs the

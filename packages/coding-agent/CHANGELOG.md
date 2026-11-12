@@ -7,6 +7,8 @@
 - An explicitly registered trusted in-process controller can approve one pending tool request using immutable effective arguments, session directory, and a native request identity/fingerprint. Missing, multiple, invalid, stale, or unavailable controllers retain human approval; lifecycle listeners remain observers and provider safety checks cannot be bypassed.
 - Extensions can observe payload-free `native_prompt_requested` / `native_prompt_resolved` events and reconcile frozen pending snapshots, with native identities/timestamps across tool/provider approvals, awaited UI, explicitly owned settings/selector/hub/Git input lifetimes, RPC and ACP permission waits. Observation never answers prompts or changes approval grants.
 
+- A trusted approval controller's `approve-once` can carry a one-use launch receipt that OMP delivers only to the approved foreground bash launch (`OMP_APPROVAL_RECEIPT`, `OMP_APPROVAL_REQUEST_ID`, `OMP_APPROVAL_FINGERPRINT`). Other launches get the keys blanked, async and service launches refuse a receipt, and a malformed receipt keeps the human prompt.
+
 ### Fixed
 
 - Cancelling native tool approval now cancels the actual approve/select dialog and pending approval observers. Cancelled calls cannot execute after resolution observers, and late observer UI cannot reopen the aborted approval.

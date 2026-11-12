@@ -1,6 +1,6 @@
 import type { AgentToolContext, ToolCallContext } from "@oh-my-pi/pi-agent-core";
 import type { CustomToolContext } from "../extensibility/custom-tools/types";
-import type { ExtensionUIContext } from "../extensibility/extensions/types";
+import type { ExtensionUIContext, ToolApprovalLaunchEnv } from "../extensibility/extensions/types";
 
 declare module "@oh-my-pi/pi-agent-core" {
 	interface AgentToolContext extends CustomToolContext {
@@ -21,6 +21,11 @@ declare module "@oh-my-pi/pi-agent-core" {
 		xdevTierResolved?(tier: "read" | "write" | "exec"): void;
 		/** Set only after an interactive prompt approves provider computer safety checks. */
 		providerSafetyApproved?: boolean;
+		/** Set by the extension wrapper, after its final pre-execution request check,
+		 *  only when an approval decider's approve-once carried a one-use receipt.
+		 *  The bash tool places it in the environment of that one foreground launch
+		 *  and refuses it for background or service launches. Never set otherwise. */
+		approvalLaunchEnv?: Readonly<ToolApprovalLaunchEnv>;
 	}
 }
 

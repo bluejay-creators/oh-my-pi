@@ -1306,10 +1306,26 @@ export interface ToolApprovalRequest {
 	readonly tier: ToolTier;
 }
 
-/** A trusted controller may approve only this request, or retain the human gate. */
+/** Shape of an optional approve-once launch receipt (opaque to OMP). */
+export const TOOL_APPROVAL_RECEIPT_PATTERN = /^[A-Za-z0-9._:-]{16,256}$/;
+
+/**
+ * A trusted controller may approve only this request, or retain the human gate.
+ * An approve-once may carry an opaque one-use `receipt` (matching
+ * {@link TOOL_APPROVAL_RECEIPT_PATTERN}); OMP delivers it only to the
+ * environment of the single foreground launch it approved. A malformed receipt
+ * makes the whole result non-authorizing.
+ */
 export type ToolApprovalDeciderResult =
-	| { decision: "approve-once"; requestId: string; fingerprint: string }
+	| { decision: "approve-once"; requestId: string; fingerprint: string; receipt?: string }
 	| { decision: "pass" };
+
+/** Environment OMP sets on the one launch a receipt-bearing approve-once admitted. */
+export interface ToolApprovalLaunchEnv {
+	OMP_APPROVAL_RECEIPT: string;
+	OMP_APPROVAL_REQUEST_ID: string;
+	OMP_APPROVAL_FINGERPRINT: string;
+}
 
 export type ToolApprovalDecider = (
 	request: ToolApprovalRequest,

@@ -531,6 +531,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			cancelPreflight();
 			throw new Error("Tool approval request changed or was cancelled before execution");
 		}
+		// Only this point may hand a decider's one-use receipt to the launch it
+		// approved; anything a caller placed on the context is discarded first.
+		const launchEnv = consumedApproval?.launchEnv();
+		if (context) delete context.approvalLaunchEnv;
+		if (launchEnv) {
+			if (!context) {
+				cancelPreflight();
+				throw new Error("Tool approval receipt has no launch context to deliver it to");
+			}
+			context.approvalLaunchEnv = launchEnv;
+		}
 
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;
@@ -552,6 +563,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				content: [{ type: "text", text: executionError.message }],
 				details: undefined as TDetails,
 			};
+		} finally {
+			if (context) delete context.approvalLaunchEnv;
 		}
 		if (!loopDispatchedToolCall) {
 			const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);

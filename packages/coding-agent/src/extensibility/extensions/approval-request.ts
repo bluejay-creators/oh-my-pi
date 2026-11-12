@@ -1,5 +1,11 @@
 import { stableStringifyJson } from "@oh-my-pi/pi-utils";
-import type { NativePromptRequest, ToolApprovalDeciderResult, ToolApprovalInput, ToolApprovalRequest } from "./types";
+import type {
+	NativePromptRequest,
+	ToolApprovalDeciderResult,
+	ToolApprovalInput,
+	ToolApprovalLaunchEnv,
+	ToolApprovalRequest,
+} from "./types";
 
 type ApprovalContext = Omit<ToolApprovalRequest, "requestId" | "requestedAt" | "fingerprint" | "arguments"> & {
 	arguments: unknown;
@@ -51,6 +57,7 @@ function fingerprint(requestId: string, requestedAt: number, context: ApprovalCo
 export class PendingToolApproval {
 	readonly request: ToolApprovalRequest | undefined;
 	#pending = true;
+	#receipt: string | undefined;
 
 	constructor(
 		private readonly current: () => ApprovalContext,
@@ -92,14 +99,28 @@ export class PendingToolApproval {
 	consume(result: ToolApprovalDeciderResult | undefined): boolean {
 		const pending = this.#pending;
 		this.close();
-		return (
+		const approved =
 			pending &&
 			result?.decision === "approve-once" &&
 			this.request !== undefined &&
 			result.requestId === this.request.requestId &&
 			result.fingerprint === this.request.fingerprint &&
-			this.matches()
-		);
+			this.matches();
+		if (approved && result?.decision === "approve-once") this.#receipt = result.receipt;
+		return approved;
+	}
+
+	/**
+	 * Environment for the single approved launch, or undefined when the admitted
+	 * decision carried no receipt. Only the wrapper's final pre-execution check reads it.
+	 */
+	launchEnv(): Readonly<ToolApprovalLaunchEnv> | undefined {
+		if (this.#receipt === undefined || !this.request) return undefined;
+		return Object.freeze({
+			OMP_APPROVAL_RECEIPT: this.#receipt,
+			OMP_APPROVAL_REQUEST_ID: this.request.requestId,
+			OMP_APPROVAL_FINGERPRINT: this.request.fingerprint,
+		});
 	}
 
 	close(): void {

@@ -497,6 +497,13 @@ function formatTimeoutClampNotice(
  *
  * Executes bash commands with optional timeout and working directory.
  */
+
+/** Approval-receipt keys blanked on every launch that was not handed a receipt. */
+const NO_APPROVAL_RECEIPT_ENV: Readonly<Record<string, string>> = Object.freeze({
+	OMP_APPROVAL_RECEIPT: "",
+	OMP_APPROVAL_REQUEST_ID: "",
+	OMP_APPROVAL_FINGERPRINT: "",
+});
 export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly name = "bash";
 	/** Bash reads `skill://` paths through its shell filesystem, including as a working directory. */
@@ -868,6 +875,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				try {
 					const result = await executeBash(options.command, {
 						cwd: options.commandCwd,
+						// Background jobs never carry an approval receipt (see execute).
+						env: { ...NO_APPROVAL_RECEIPT_ENV },
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
@@ -993,6 +1002,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (asyncRequested && !cfgAsyncEnabled.get(this.session.settings)) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
+		// A decider's one-use approval receipt belongs to exactly one foreground
+		// launch. The keys are always set (empty without a receipt) so a value
+		// inherited by OMP's own process can never reach a command.
+		const receipt = ctx?.approvalLaunchEnv;
+		if (receipt && (asyncRequested || name !== undefined)) {
+			throw new ToolError("An approval receipt is valid only for one foreground launch, not async or service mode.");
+		}
+		const approvalEnv: Record<string, string> = receipt ? { ...receipt } : { ...NO_APPROVAL_RECEIPT_ENV };
 
 		// Check both the original command and the cwd-normalized command so
 		// leading `cd ... &&` wrappers do not hide either shell-navigation rules
@@ -1294,15 +1311,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				// direnv-transformed command (carries any `unset -v` prefix) + direnv
 				// env; falls back to the raw command when direnv is off/absent.
 				const bridgeCommand = backendPreflight?.command ?? command;
-				const bridgeEnv = backendPreflight?.env;
+				const bridgeEnv = { ...backendPreflight?.env, ...approvalEnv };
 				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
 				const createP = clientBridge.createTerminal({
 					command: shellSpawn.command,
 					args: shellSpawn.args,
 					cwd: commandCwd,
-					env: bridgeEnv
-						? Object.entries(bridgeEnv).map(([name, value]) => ({ name, value: value as string }))
-						: undefined,
+					env: Object.entries(bridgeEnv).map(([name, value]) => ({ name, value: value as string })),
 					outputByteLimit: DEFAULT_MAX_BYTES,
 				});
 				const createRaced = await Promise.race([
@@ -1520,7 +1535,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					cwd: commandCwd,
 					timeoutMs,
 					signal,
-					env: backendPreflight?.env,
+					env: { ...backendPreflight?.env, ...approvalEnv },
 					artifactPath,
 					artifactId,
 				})
@@ -1528,6 +1543,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				// command here so the unset prefix is not applied twice.
 				await executeBash(command, {
 					cwd: commandCwd,
+					env: approvalEnv,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					timeout: timeoutMs ?? 0,
 					signal,

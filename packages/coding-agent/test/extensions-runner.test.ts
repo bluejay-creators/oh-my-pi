@@ -2990,6 +2990,110 @@ describe("ExtensionRunner", () => {
 				expect(harness.select).not.toHaveBeenCalled();
 			});
 
+			describe("one-use launch receipts", () => {
+				const RECEIPT = "r".repeat(32);
+				const seenEnv = (harness: { execute: ReturnType<typeof vi.fn> }) => {
+					const seen: unknown[] = [];
+					harness.execute.mockImplementation(async (...args: unknown[]) => {
+						seen.push((args[4] as AgentToolContext | undefined)?.approvalLaunchEnv);
+						return { content: [{ type: "text" as const, text: "ok" }] };
+					});
+					return seen;
+				};
+
+				it("delivers an admitted receipt to that one execution and nowhere after it", async () => {
+					const requests: ToolApprovalRequest[] = [];
+					let calls = 0;
+					const harness = await createHarness(pi => {
+						pi.registerApprovalDecider(request => {
+							requests.push(request);
+							calls++;
+							return calls === 1
+								? {
+										decision: "approve-once",
+										requestId: request.requestId,
+										fingerprint: request.fingerprint,
+										receipt: RECEIPT,
+									}
+								: { decision: "approve-once", requestId: request.requestId, fingerprint: request.fingerprint };
+						});
+					}, false);
+					const seen = seenEnv(harness);
+					await harness.wrapper.execute("first", { command: "x" }, undefined, undefined, harness.context);
+					await harness.wrapper.execute("second", { command: "x" }, undefined, undefined, harness.context);
+					expect(seen[0]).toEqual({
+						OMP_APPROVAL_RECEIPT: RECEIPT,
+						OMP_APPROVAL_REQUEST_ID: requests[0].requestId,
+						OMP_APPROVAL_FINGERPRINT: requests[0].fingerprint,
+					});
+					expect(Object.isFrozen(seen[0])).toBe(true);
+					expect(seen[1]).toBeUndefined();
+					expect(harness.context.approvalLaunchEnv).toBeUndefined();
+				});
+
+				it("treats a malformed receipt as no approval at all", async () => {
+					for (const receipt of ["short", "has space in it here!!", 42, null]) {
+						const harness = await createHarness(pi => {
+							pi.registerApprovalDecider(
+								request =>
+									({
+										decision: "approve-once",
+										requestId: request.requestId,
+										fingerprint: request.fingerprint,
+										receipt,
+									}) as unknown as ToolApprovalDeciderResult,
+							);
+						});
+						await expect(
+							harness.wrapper.execute("bad", { command: "x" }, undefined, undefined, harness.context),
+						).rejects.toThrow("denied by user");
+						expect(harness.select).toHaveBeenCalledTimes(1);
+						expect(harness.execute).not.toHaveBeenCalled();
+					}
+				});
+
+				it("never forwards a caller-supplied receipt", async () => {
+					const forged = {
+						OMP_APPROVAL_RECEIPT: RECEIPT,
+						OMP_APPROVAL_REQUEST_ID: "x",
+						OMP_APPROVAL_FINGERPRINT: "y",
+					};
+					const harness = await createHarness(pi => {
+						pi.registerApprovalDecider(request => ({
+							decision: "approve-once",
+							requestId: request.requestId,
+							fingerprint: request.fingerprint,
+						}));
+					}, false);
+					const seen = seenEnv(harness);
+					await harness.wrapper.execute("forged", { command: "x" }, undefined, undefined, {
+						...harness.context,
+						approvalLaunchEnv: forged,
+					});
+					expect(seen).toEqual([undefined]);
+				});
+
+				it("withholds the receipt and execution when the request changes before launch", async () => {
+					const input = { command: "original" };
+					const harness = await createHarness(pi => {
+						pi.registerApprovalDecider(request => ({
+							decision: "approve-once",
+							requestId: request.requestId,
+							fingerprint: request.fingerprint,
+							receipt: RECEIPT,
+						}));
+						pi.on("tool_approval_resolved", () => {
+							input.command = "changed";
+						});
+					}, false);
+					await expect(
+						harness.wrapper.execute("drift", input, undefined, undefined, harness.context),
+					).rejects.toThrow("changed or was cancelled");
+					expect(harness.execute).not.toHaveBeenCalled();
+					expect(harness.context.approvalLaunchEnv).toBeUndefined();
+				});
+			});
+
 			it("retains the human prompt without a decision handler", async () => {
 				const harness = await createHarness(() => {});
 				await expect(
