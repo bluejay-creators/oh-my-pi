@@ -520,6 +520,277 @@ function segmentMutatesShellState(segmentText: string, literal: LiteralShellComm
 	return false;
 }
 
+// Parameter expansion can change these commands' safety surface even when the
+// command name is literal. Never infer an allow for their expanded arguments.
+const APPROVAL_EXPANSION_SENSITIVE_COMMANDS: Record<string, true> = {
+	rm: true,
+	mv: true,
+	cp: true,
+	chmod: true,
+	chown: true,
+	dd: true,
+	find: true,
+	curl: true,
+	wget: true,
+	ssh: true,
+	scp: true,
+	eval: true,
+	exec: true,
+	sudo: true,
+	sh: true,
+	bash: true,
+	dash: true,
+	ash: true,
+	ksh: true,
+	zsh: true,
+	env: true,
+	python: true,
+	node: true,
+	bun: true,
+	perl: true,
+	ruby: true,
+	awk: true,
+	gawk: true,
+	mawk: true,
+	nawk: true,
+	sed: true,
+	gsed: true,
+	xargs: true,
+	rsync: true,
+	make: true,
+	psql: true,
+	sqlite: true,
+	mysql: true,
+	osascript: true,
+	lua: true,
+	luajit: true,
+	julia: true,
+	deno: true,
+	pypy: true,
+};
+
+function parseApprovalShellSegment(text: string): LiteralShellCommandSegment | null {
+	let literalText = "";
+	let quote: "'" | '"' | undefined;
+	let expanded = false;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i]!;
+		if (quote === "'") {
+			literalText += ch;
+			if (ch === "'") quote = undefined;
+			continue;
+		}
+		if (ch === "\\") {
+			literalText += text.slice(i, i + 2);
+			i++;
+			continue;
+		}
+		if (ch === "$") {
+			// Only simple double-quoted argument expansions preserve argv boundaries.
+			const variable = quote === '"' ? /^\$[A-Za-z_][A-Za-z0-9_]*/u.exec(text.slice(i)) : null;
+			if (!variable) return null;
+			literalText += "expanded-argument";
+			expanded = true;
+			i += variable[0].length - 1;
+			continue;
+		}
+		if (!quote && (i === 0 || /[ \t]/u.test(text[i - 1]!))) {
+			// Discard only descriptor swaps and /dev/null output, never file writes.
+			const redirect = /^(?:[12]?>&[12]|[12]?>[ \t]*\/dev\/null)(?=[ \t]|$)/u.exec(text.slice(i));
+			if (redirect) {
+				literalText += " ";
+				i += redirect[0].length - 1;
+				continue;
+			}
+		}
+		literalText += ch;
+		if (ch === quote) quote = undefined;
+		else if (!quote && (ch === "'" || ch === '"')) quote = ch;
+	}
+	const words = tokenizeShellSegments(literalText);
+	if (words.length !== 1 || words[0]!.length === 0) return null;
+	const argv = words[0]!;
+	let commandIndex = 0;
+	while (commandIndex < argv.length && isShellEnvironmentAssignment(argv[commandIndex]!)) commandIndex++;
+	const executable = argv[commandIndex]?.split("/").pop()?.toLowerCase().replace(/(?:[-.]?\d[\d.]*)?(?:\.exe)?$/u, "");
+	if (!executable) return null;
+	if (
+		expanded &&
+		(argv[commandIndex]!.includes("expanded-argument") ||
+			Object.hasOwn(APPROVAL_EXPANSION_SENSITIVE_COMMANDS, executable) ||
+			(executable === "git" && argv.some(word => /^(?:push|reset|clean|checkout|restore|-c|--config(?:=|$))/u.test(word))))
+	) return null;
+	// printf -v and %n write shell variables; an expanded format could hide %n.
+	const printf =
+		/^printf[ \t]/u.test(literalText) &&
+		!argv.some(word => word.startsWith("-v") || word.includes("%n")) &&
+		!argv[1]?.includes("expanded-argument");
+	const literal = parseLiteralShellCommandSegment(printf ? literalText.replace(/^printf/u, "echo") : literalText);
+	if (!literal) return null;
+	if (printf) literal.argv[0] = "printf";
+	literal.argv = tokenizeShellSegments(text)[0] ?? literal.argv;
+	return literal;
+}
+
+/** An approval unit; opaque units retain their complete source, including heredoc bodies. */
+export interface ApprovalShellSegment {
+	text: string;
+	literal: LiteralShellCommandSegment | null;
+}
+
+/**
+ * Split shell lists, pipelines, subshells and simple loops without treating data as commands.
+ * Unsupported grammar, substitutions and incomplete syntax decline segmentation. Stateful
+ * commands and heredocs remain opaque: restrictions can inspect them, but allows cannot.
+ */
+export function extractApprovalShellSegments(command: string): ApprovalShellSegment[] | null {
+	const pieces: string[] = [];
+	const heredocs = new Set<number>();
+	const pending: { delimiter: string; stripTabs: boolean; owner: number }[] = [];
+	let start = 0;
+	let quote: "'" | '"' | undefined;
+	const push = (end: number) => {
+		const text = command.slice(start, end).trim();
+		if (text) pieces.push(text);
+	};
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!;
+		if (quote === "'") {
+			if (ch === "'") quote = undefined;
+			continue;
+		}
+		if (ch === "\\") {
+			if (i + 1 >= command.length || command[i + 1] === "\n" || command[i + 1] === "\r") return null;
+			i++;
+			continue;
+		}
+		if (ch === "`" || (ch === "$" && command[i + 1] === "(")) return null;
+		if (quote === '"') {
+			if (ch === '"') quote = undefined;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "#" && (i === start || /[ \t]/u.test(command[i - 1]!))) return null;
+		if (ch === "<" && command[i + 1] === "<") {
+			const match = /^<<(-)?[ \t]*(?:'([^'\n]+)'|"([^"$`\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))(?=[ \t\n;&|)]|$)/u.exec(
+				command.slice(i),
+			);
+			if (!match) return null;
+			pending.push({ delimiter: match[2] ?? match[3] ?? match[4]!, stripTabs: !!match[1], owner: pieces.length });
+			i += match[0].length - 1;
+			continue;
+		}
+		// Process substitution and arithmetic/group syntax outside the supported subshell grammar.
+		if ((ch === "<" || ch === ">") && command[i + 1] === "(") return null;
+		if (ch === "{" || ch === "}" || ch === "\r") return null;
+		const redirect =
+			(ch === "&" && (command[i - 1] === ">" || command[i - 1] === "<" || command[i + 1] === ">")) ||
+			(ch === "|" && command[i - 1] === ">");
+		if (!redirect && /[\n;&|()]/u.test(ch)) {
+			push(i);
+			let operator = ch;
+			if ((ch === "&" || ch === "|") && (command[i + 1] === ch || (ch === "|" && command[i + 1] === "&"))) {
+				operator += command[++i];
+			}
+			pieces.push(operator);
+			start = i + 1;
+			if (ch === "\n" && pending.length > 0) {
+				for (const doc of pending) {
+					const bodyStart = start;
+					let found = false;
+					while (start < command.length) {
+						const newline = command.indexOf("\n", start);
+						const end = newline < 0 ? command.length : newline;
+						const line = command.slice(start, end);
+						start = newline < 0 ? command.length : newline + 1;
+						if ((doc.stripTabs ? line.replace(/^\t+/u, "") : line) === doc.delimiter) {
+							found = true;
+							break;
+						}
+					}
+					if (!found || !pieces[doc.owner]) return null;
+					pieces[doc.owner] += `\n${command.slice(bodyStart, start).trimEnd()}`;
+					heredocs.add(doc.owner);
+				}
+				pending.length = 0;
+				i = start - 1;
+			}
+		}
+	}
+	if (quote || pending.length > 0) return null;
+	push(command.length);
+
+	const segments: ApprovalShellSegment[] = [];
+	const stack: { kind: "for" | "while" | "until" | "("; body: boolean }[] = [];
+	let expectCommand = true;
+	let needsCommand = false;
+	let structured = false;
+	for (let index = 0; index < pieces.length; index++) {
+		const piece = pieces[index]!;
+		if (piece === "\n" && expectCommand) continue;
+		if (/^(?:;|&|&&|\|\|?|\|&|\n)$/u.test(piece)) {
+			if (expectCommand) return null;
+			expectCommand = true;
+			needsCommand = piece !== ";" && piece !== "&" && piece !== "\n";
+			continue;
+		}
+		if (piece === "(") {
+			if (!expectCommand || pieces[index + 1] === "(") return null;
+			stack.push({ kind: "(", body: false });
+			structured = true;
+			continue;
+		}
+		if (piece === ")") {
+			if (expectCommand && (needsCommand || pieces[index - 1] === "(")) return null;
+			if (stack.pop()?.kind !== "(") return null;
+			expectCommand = false;
+			continue;
+		}
+		if (!expectCommand) return null;
+		let text = piece;
+		const top = stack[stack.length - 1];
+		if (text === "done") {
+			if (!top || top.kind === "(" || !top.body || needsCommand) return null;
+			stack.pop();
+			expectCommand = false;
+			continue;
+		}
+		if (/^do(?:[ \t]|$)/u.test(text)) {
+			if (!top || top.kind === "(" || top.body || needsCommand) return null;
+			top.body = true;
+			text = text.slice(2).trimStart();
+			if (!text) continue;
+		}
+		const forLoop = /^for[ \t]+([a-z][a-z0-9_]*)[ \t]+in[ \t]+(.+)$/u.exec(text);
+		if (forLoop) {
+			const variable = forLoop[1]!;
+			// Shell-special variables can retarget executable lookup or alter later parsing.
+			if (["path", "fpath", "commands", "functions", "builtins"].includes(variable)) return null;
+			const values = parseLiteralShellCommandSegment(`echo ${forLoop[2]}`);
+			if (!values || heredocs.has(index)) return null;
+			stack.push({ kind: "for", body: false });
+			structured = true;
+			expectCommand = false;
+			continue;
+		}
+		const conditionLoop = /^(while|until)[ \t]+(.+)$/u.exec(text);
+		if (conditionLoop) {
+			stack.push({ kind: conditionLoop[1] as "while" | "until", body: false });
+			structured = true;
+			text = conditionLoop[2]!;
+		}
+		const literal = heredocs.has(index) ? null : parseApprovalShellSegment(text);
+		segments.push({ text, literal });
+		expectCommand = false;
+		needsCommand = false;
+	}
+	if (stack.length > 0 || needsCommand || segments.length === 0) return null;
+	return structured || segments.length > 1 || heredocs.size > 0 ? segments : null;
+}
+
 /**
  * Splits a single-line command on top-level unquoted `&&` (two or more clauses)
  * and annotates each clause with {@link LiteralShellCommandSegment} when that

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { extractLeadingCdTarget, lexShellCommand, readShellWord } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
+import {
+	extractApprovalShellSegments,
+	extractLeadingCdTarget,
+	lexShellCommand,
+	readShellWord,
+} from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
 
 describe("lexShellCommand", () => {
 	it("splits words from separators, keeping verbatim spelling beside the quote-removed value", () => {
@@ -170,5 +175,42 @@ describe("readShellWord", () => {
 	it("returns undefined for empty or all-whitespace input", () => {
 		expect(readShellWord("")).toBeUndefined();
 		expect(readShellWord("   ")).toBeUndefined();
+	});
+});
+
+describe("segment-aware shell approval extraction", () => {
+	it("keeps heredoc source attached to its interpreter and never parses its body as commands", () => {
+		const body = "python3 <<'PY'\nslack_write('hello; world')\nPY";
+		const segments = extractApprovalShellSegments(`echo before; ${body}\necho after`);
+		expect(segments?.map(segment => segment.text)).toEqual(["echo before", body, "echo after"]);
+		expect(segments?.[1]?.literal).toBeNull();
+	});
+
+	it("attaches multiple and tab-stripped heredocs to the correct pipeline commands", () => {
+		const segments = extractApprovalShellSegments("cat <<A <<-B | tail -3\none; two\nA\n\tthree | four\n\tB\necho done");
+		expect(segments?.map(segment => segment.text)).toEqual([
+			"cat <<A <<-B\none; two\nA\n\tthree | four\n\tB",
+			"tail -3",
+			"echo done",
+		]);
+		expect(segments?.[0]?.literal).toBeNull();
+	});
+
+	it("does not split quoted operators or mistake quoted descriptor text for a redirect", () => {
+		const segments = extractApprovalShellSegments('echo "a; b | c 2>&1" | tail -3');
+		expect(segments?.map(segment => segment.text)).toEqual(['echo "a; b | c 2>&1"', "tail -3"]);
+		expect(segments?.[0]?.literal?.argv).toEqual(["echo", "a; b | c 2>&1"]);
+	});
+
+	it("declines command substitution, process substitution, incomplete heredocs and malformed control flow", () => {
+		for (const command of [
+			"echo $(id); echo done",
+			"echo `id`; echo done",
+			"cat <(echo data); echo done",
+			"python3 <<PY\nprint('unterminated')",
+			"for b in one two; do echo done",
+			"echo before &&",
+			"(echo before",
+		]) expect(extractApprovalShellSegments(command)).toBeNull();
 	});
 });

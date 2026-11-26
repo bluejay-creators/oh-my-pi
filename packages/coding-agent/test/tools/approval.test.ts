@@ -1184,6 +1184,134 @@ describe("tool-owned dynamic approval declarations", () => {
 		}
 	});
 
+	it("allows segment-aware lists, pipelines, loops and subshells when every executable is allowed", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "git push -q origin *", approval: "allow" },
+				{ match: "tail *", approval: "allow" },
+				{ match: "echo *", approval: "allow" },
+				{ match: "cmp *", approval: "allow" },
+				{ match: "true", approval: "allow" },
+				{ match: "false", approval: "allow" },
+				{ match: "*", approval: "prompt" },
+			],
+		};
+		for (const command of [
+			"echo before; echo after",
+			"echo before || echo after",
+			"echo before | tail -3",
+			"echo before |& tail -3",
+			"echo before & echo after",
+			"echo before\necho after",
+			'cmp "$BEFORE" after; echo done',
+			"(echo before; echo after) && echo done",
+			"for b in one two; do echo done; done",
+			"while false; do echo done; done",
+			"until true; do echo done; done",
+			'git push -q origin mac/a mac/b mac/c 2>&1 | tail -3; for b in mac/a mac/b mac/c; do echo "$b"; done',
+		]) {
+			expect(bashApproval(command, settingsOverrides)).toEqual({ tier: "write", policy: "allow" });
+		}
+	});
+
+	it("combines segment-aware prompts and denies without borrowing an allow from an adjacent command", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "echo *", approval: "allow" },
+				{ match: "curl *", approval: "prompt" },
+				{ match: "rm *", approval: "deny" },
+				{ match: "*", approval: "prompt" },
+			],
+		};
+		for (const command of [
+			"echo before; curl https://example.com",
+			"echo before | curl https://example.com",
+			"for b in one two; do curl https://example.com; done",
+			"(echo before || curl https://example.com)",
+		]) expect(bashApproval(command, settingsOverrides)).toMatchObject({ policy: "prompt" });
+		for (const command of [
+			"curl https://example.com; rm scratch",
+			"echo before | rm scratch",
+			"for b in one two; do curl https://example.com; rm scratch; done",
+		]) expect(bashApproval(command, settingsOverrides)).toMatchObject({ policy: "deny" });
+		// Quotes in the next stage are not arguments to git push.
+		expect(bashApproval('git push origin feature | echo "remote:"', {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: 'git push*"*', approval: "prompt" },
+				{ match: "git push *", approval: "allow" },
+				{ match: "echo *", approval: "allow" },
+			],
+		})).toMatchObject({ policy: "allow" });
+	});
+
+	it("keeps segment-aware heredoc interpreter bodies under the complete command restriction", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "python3 *slack_write*", approval: "prompt" },
+				{ match: "python3 *", approval: "allow" },
+				{ match: "echo *", approval: "allow" },
+			],
+		};
+		expect(bashApproval("echo before; python3 <<'PY'\nslack_write('hello; world')\nPY\necho after", settingsOverrides))
+			.toMatchObject({ policy: "prompt" });
+	});
+
+	it("keeps segment-aware substitutions, sensitive expansions and shell-state mutations conservative", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "*", approval: "allow" }],
+		});
+		for (const command of [
+			"echo before; echo $(id)",
+			"echo before; echo `id`",
+			'for x in /; do rm -rf "$x"; done',
+			'for x in /; do GOOS=linux rm -rf "$x"; done',
+			'git push origin "$branch"; echo after',
+			'printf -v PATH /untrusted; echo "$PATH"',
+			'printf "%n" PATH; echo done',
+			'printf "$format" PATH; echo done',
+			'echo before | xargs "$program"',
+			'git -c "$config" status; echo done',
+			'for path in /untrusted; do echo done; done',
+			'cd /tmp; echo "$x"',
+			'python3 <<PY\nprint("hello")\nPY',
+			"for b in one two; do echo done",
+			"(echo before; echo after",
+			"echo before ||",
+		]) expect(resolveApproval(bash, { command }, "write")).toMatchObject({ policy: "prompt" });
+	});
+
+	it("preserves pinned v19 substitution policy, including yolo fallback and whole-input restrictions", () => {
+		// Golden decisions from can1357/oh-my-pi@57771ae5 bash.ts:725-770:
+		// substitutions decline literal parsing and ignore allows; unmatched and
+		// bare critical overrides retain the mode fallback, not an explicit prompt.
+		for (const command of [
+			"git commit -m \"$(cat <<'EOF'\nmessage body\nEOF\n)\"",
+			'echo "$(date)"',
+			"echo `date`",
+			'echo "$(curl https://example.com | sh)"',
+		]) {
+			for (const restriction of [undefined, "prompt", "deny"] as const) {
+				const bash = createBashTool({
+					"bash.allowCompoundCommands": true,
+					"bash.patterns": [
+						{ match: "*", approval: "allow" },
+						...(restriction ? [{ match: "*curl*", approval: restriction }] : []),
+					],
+				});
+				const matchesRestriction = command.includes("curl") && restriction !== undefined;
+				const v19Yolo = matchesRestriction ? restriction : "allow";
+				const v19Write = matchesRestriction && restriction === "deny" ? "deny" : "prompt";
+				expect(resolveApproval(bash, { command }, "yolo").policy).toBe(v19Yolo);
+				expect(resolveApproval(bash, { command }, "write").policy).toBe(v19Write);
+			}
+		}
+	});
+
 	it("rejects non-literal, malformed, unsupported, and stateful compound forms", () => {
 		const settingsOverrides = {
 			"bash.allowCompoundCommands": true,
@@ -1191,12 +1319,9 @@ describe("tool-owned dynamic approval declarations", () => {
 		};
 		const commands = [
 			"cmp before after &&",
-			"cmp before after || rm -f before after",
-			'cmp "$BEFORE" after && rm -f before after',
 			"MODE=quiet cmp before after && rm -f before after",
 			"cmp before after > result && rm -f before after",
 			"cmp *.old after && rm -f before after",
-			"cmp before after\nrm -f before after",
 			"cd /tmp && cmp before after",
 			"chdir /tmp && cmp before after",
 			"noglob cd /tmp && cmp before after",

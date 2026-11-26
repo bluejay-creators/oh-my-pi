@@ -76,11 +76,11 @@ import { outputMeta, resolveInlineByteCapBudget } from "./output-meta";
 import { resolveShellDirectory, resolveToCwd } from "./path-utils";
 import {
 	BASH_APPROVAL_SHELL_CONTROL_CHARS,
+	type ApprovalShellSegment,
+	extractApprovalShellSegments,
 	extractAndChainSegments,
 	extractLeadingCdTarget,
-	extractLiteralAndChainSegments,
 	isShellEnvironmentAssignment,
-	type LiteralShellCommandSegment,
 	lexShellCommand,
 	tokenizeShellSegments,
 	withoutLeadingEnvironmentAssignments,
@@ -348,9 +348,10 @@ function bashApprovalRuleMatches(
 	command: string,
 	rule: BashApprovalPatternRule,
 	allowedEnvVars: readonly string[],
+	parsedSegment = false,
 ): boolean {
 	if (rule.approval === "allow") {
-		if (hasBashApprovalShellControl(command)) return false;
+		if (!parsedSegment && hasBashApprovalShellControl(command)) return false;
 		const trimmedCommand = command.trimStart();
 		const hasLeadingEnv =
 			withoutLeadingEnvironmentAssignments(trimmedCommand) !== null || isShellEnvironmentAssignment(trimmedCommand);
@@ -419,7 +420,7 @@ interface BashPatternPolicy {
 
 function resolveBashPatternDecision(
 	command: string,
-	compoundSegments: readonly LiteralShellCommandSegment[] | null,
+	compoundSegments: readonly ApprovalShellSegment[] | null,
 	patternRules: readonly BashApprovalPatternRule[],
 	allowedEnvVars: readonly string[],
 ): BashPatternDecision {
@@ -428,8 +429,11 @@ function resolveBashPatternDecision(
 		for (const rule of patternRules) {
 			if (
 				rule.approval !== "allow" &&
+				(rule.approval === "deny" ||
+					compoundSegments.some(segment => segment.literal === null) ||
+					/[;&|]/u.test(rule.match)) &&
 				commandMatchesBashApprovalPattern(command, rule.match) &&
-				!compoundSegments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match))
+				!compoundSegments.some(segment => commandMatchesBashApprovalPattern(segment.text, rule.match))
 			) {
 				if (rule.approval === "deny") return { kind: "deny", rule };
 				promptRule ??= rule;
@@ -437,10 +441,20 @@ function resolveBashPatternDecision(
 		}
 		let hasUnmatchedSegment = false;
 		for (const segment of compoundSegments) {
-			const segmentRule = findBashApprovalPatternRule(segment.text, patternRules, allowedEnvVars);
+			// Ordered first-match semantics belong to each executable segment, not to
+			// the complete chain. Never split an opaque segment's heredoc body again.
+			const withoutEnv = withoutLeadingEnvironmentAssignments(segment.text);
+			const segmentRule = patternRules.find(rule =>
+				rule.approval === "allow"
+					? segment.literal !== null && bashApprovalRuleMatches(segment.text, rule, allowedEnvVars, true)
+					: commandMatchesBashApprovalPattern(segment.text, rule.match) ||
+						(withoutEnv !== null && commandMatchesBashApprovalPattern(withoutEnv, rule.match)) ||
+						(segment.literal !== null &&
+							commandSegmentMatchesBashApprovalPattern(segment.literal.argv.join(" "), rule.match)),
+			);
 			if (segmentRule?.approval === "deny") return { kind: "deny", rule: segmentRule };
 			if (segmentRule?.approval === "prompt") promptRule ??= segmentRule;
-			if (!segmentRule) hasUnmatchedSegment = true;
+			if (!segmentRule || segment.literal === null) hasUnmatchedSegment = true;
 		}
 		if (promptRule) return { kind: "prompt", rule: promptRule };
 		return hasUnmatchedSegment ? { kind: "unmatched" } : { kind: "allow" };
@@ -861,7 +875,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const shell = cfgBashAllowCompoundCommands.get(this.session.settings)
 			? this.session.settings.getShellConfig().shell
 			: undefined;
-		const compoundSegments = shell && isPosixShell(shell) ? extractLiteralAndChainSegments(command) : null;
+		const compoundSegments = shell && isPosixShell(shell) ? extractApprovalShellSegments(command) : null;
 		const decision = resolveBashPatternDecision(command, compoundSegments, policy.rules, policy.allowedEnvVars);
 		// Project layers may tighten the operator's `bash.patterns`, never loosen
 		// them: an operator deny or prompt still applies under a project allow.
@@ -895,7 +909,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		if (compoundSegments) {
 			for (const segment of compoundSegments) {
-				const literalCommand = segment.argv.join(" ");
+				const literalCommand = segment.literal?.argv.join(" ") ?? segment.text;
 				if (criticalCommand || CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(literalCommand))) {
 					return { tier: "exec", override: true, reason: "Critical pattern detected" };
 				}
