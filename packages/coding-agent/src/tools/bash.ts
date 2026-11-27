@@ -254,6 +254,36 @@ export const CRITICAL_BASH_PATTERNS = [
 	/\bnc\b[^|;]*\s-[a-zA-Z]*[ec][a-zA-Z]*\s/i, // `nc -e` / `nc -c`.
 ] as const;
 
+/** Absolute recursive removals remain critical, except literal temporary scratch. */
+function isCriticalBashCommand(command: string): boolean {
+	if (CRITICAL_BASH_PATTERNS.some((pattern, index) => index > 0 && pattern.test(command))) return true;
+	for (const argv of tokenizeShellSegments(command)) {
+		const executable = argv.findIndex(word => !isShellEnvironmentAssignment(word));
+		const program = path.basename(argv[executable] ?? "");
+		if (/^(?:awk|gawk|mawk|nawk)$/u.test(program) &&
+			argv.slice(executable + 1).some(arg => /\bsystem\s*\(/u.test(arg))) return true;
+		if (program !== "rm") continue;
+		let recursive = false;
+		let forced = false;
+		for (let index = executable + 1; index < argv.length && argv[index] !== "--"; index++) {
+			recursive ||= /^(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)$/u.test(argv[index]!);
+			forced ||= /^(?:-[a-zA-Z]*[fF][a-zA-Z]*|--force)$/u.test(argv[index]!);
+		}
+		let options = true;
+		for (const arg of argv.slice(executable + 1)) {
+			if (options && arg === "--") options = false;
+			else if (options && arg.startsWith("-")) continue;
+			else if (arg.startsWith("/") && (recursive || (forced && arg === "/"))) {
+				const target = arg.replace(/\/+$/u, "") || "/";
+				const scratch = /^(?:(?:\/private)?\/tmp\/|(?:\/private)?\/var\/folders\/)[^/]+\/?/u.test(target) &&
+					target.split("/").slice(1).every(part => part !== "." && part !== ".." && part !== "" && !/[*?[\]$`]/u.test(part));
+				if (!scratch) return true;
+			}
+		}
+	}
+	return false;
+}
+
 function normalizeBashApprovalPattern(value: string): string {
 	return value.trim().replace(/\s+/gu, " ");
 }
@@ -272,7 +302,7 @@ function normalizeBashPatternApproval(value: unknown): BashPatternApproval | und
 	return BASH_PATTERN_APPROVAL_VALUES.has(normalized) ? (normalized as BashPatternApproval) : undefined;
 }
 
-function normalizeBashAllowedEnvList(value: unknown): string[] {
+export function normalizeBashAllowedEnvList(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return value
 		.filter((entry): entry is string => typeof entry === "string")
@@ -280,7 +310,7 @@ function normalizeBashAllowedEnvList(value: unknown): string[] {
 		.filter(entry => entry.length > 0);
 }
 
-function getBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[] {
+export function getBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[] {
 	if (!Array.isArray(value)) return [];
 	return value
 		.map(item => {
@@ -395,21 +425,19 @@ function findNonCompoundBashRestrictionRule(
 	return promptRule;
 }
 
-function findBashApprovalPatternRule(
+export function findBashApprovalPatternRule(
 	command: string,
 	rules: readonly BashApprovalPatternRule[],
-	allowedEnvVars: readonly string[],
+	allowedEnvVars: readonly string[] = [],
 ): BashApprovalPatternRule | undefined {
-	if (hasBashApprovalShellControl(command)) {
-		return findNonCompoundBashRestrictionRule(command, rules);
-	}
-	return rules.find(rule => bashApprovalRuleMatches(command, rule, allowedEnvVars));
+	const decision = resolveBashPatternDecision(command, extractApprovalShellSegments(command), rules, allowedEnvVars);
+	return decision.kind === "unmatched" ? undefined : decision.rule;
 }
 
 type BashPatternDecision =
 	| { kind: "deny"; rule: BashApprovalPatternRule }
 	| { kind: "prompt"; rule: BashApprovalPatternRule }
-	| { kind: "allow" }
+	| { kind: "allow"; rule?: BashApprovalPatternRule }
 	| { kind: "unmatched" };
 
 /** One `bash.patterns` view: its rules plus the env names its `allow` rules may strip. */
@@ -418,52 +446,358 @@ interface BashPatternPolicy {
 	allowedEnvVars: string[];
 }
 
+interface GitApprovalCommand {
+	argv: string[];
+	configArgv: string[];
+	directory: string | undefined;
+	configOverride: boolean;
+	repositoryOverride: boolean;
+	unknown: boolean;
+}
+
+/** Skip Git's global options, not arbitrary options or path arguments after its subcommand. */
+function normalizeGitApprovalArgv(
+	argv: readonly string[],
+	unknown: readonly number[],
+	cwd: string | undefined,
+): GitApprovalCommand | undefined {
+	let start = 0;
+	while (isShellEnvironmentAssignment(argv[start] ?? "")) start++;
+	if (path.basename(argv[start] ?? "") !== "git") return undefined;
+	let directory = cwd;
+	let configOverride = false;
+	let repositoryOverride = false;
+	const configArgv: string[] = [];
+	let i = start + 1;
+	for (; i < argv.length; i++) {
+		const arg = argv[i]!;
+		if (/^(?:-[hv]|--help|--version|--exec-path|--html-path|--man-path|--info-path)$/u.test(arg) ||
+			arg.startsWith("--list-cmds=")) {
+			// Query/dispatch flags stop Git's global parsing. Do not reinterpret
+			// an ignored suffix as another command or grant it an operation exception.
+			if (i + 1 < argv.length) return undefined;
+			return { argv: ["git", ...argv.slice(i)], configArgv: ["git", ...configArgv, ...argv.slice(i)],
+				directory, configOverride, repositoryOverride, unknown: unknown.length > 0 };
+		}
+		if (arg === "-C") {
+			const value = argv[++i];
+			if (value === undefined) return undefined;
+			directory = !unknown.includes(i) && (directory || path.isAbsolute(value))
+				? path.resolve(directory ?? "/", value) : undefined;
+		} else if (arg === "-c" || arg === "--config-env" || arg.startsWith("--config-env=")) {
+			configOverride = true;
+			if (arg === "-c" || arg === "--config-env") {
+				const value = argv[++i];
+				if (value === undefined) return undefined;
+				configArgv.push(arg, value);
+			} else configArgv.push("--config-env", arg.slice(13));
+		} else if (/^--(?:git-dir|work-tree|namespace|super-prefix|attr-source|shallow-file)$/u.test(arg)) {
+			if (argv[++i] === undefined) return undefined;
+			repositoryOverride = true;
+		} else if (/^--(?:git-dir|work-tree|namespace|super-prefix|attr-source)=/u.test(arg)) {
+			repositoryOverride = true;
+		} else if (arg.startsWith("--exec-path=")) {
+			configOverride = true;
+			repositoryOverride = true;
+			configArgv.push(arg);
+		} else if (arg === "--bare") {
+			repositoryOverride = true;
+		} else if (/^(?:-[pP]|--no-pager|--paginate|--no-optional-locks|--no-advice|--no-lazy-fetch|--literal-pathspecs|--no-literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-replace-objects)$/u.test(arg)) {
+			continue;
+		} else if (arg.startsWith("-")) return undefined;
+		else break;
+	}
+	if (unknown.includes(i)) return undefined;
+	return { argv: ["git", ...argv.slice(i)], configArgv: ["git", ...configArgv, ...argv.slice(i)], directory, configOverride, repositoryOverride, unknown: unknown.length > 0 };
+}
+
+// Approval is synchronous. Port the bounded, read-only Git query used by the
+// feature-push policy; never execute any text from the command being assessed.
+function approvalGitOutput(directory: string, args: string[]): string | undefined {
+	const result = Bun.spawnSync({
+		cmd: ["git", "-C", directory, ...args],
+		stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 1000,
+		env: { ...Bun.env, GIT_OPTIONAL_LOCKS: "0" },
+	});
+	return result.exitCode === 0 ? result.stdout.toString().trim() : undefined;
+}
+
+function isProtectedPushRef(ref: string): boolean {
+	const branch = ref.replace(/^refs\/heads\//u, "");
+	return /^(?:main|master|trunk|staging|kstage|prod|production)$/u.test(branch) || branch.startsWith("release/");
+}
+
+function isFeaturePushRef(ref: string): boolean {
+	return ref.length > 0 && !isProtectedPushRef(ref) &&
+		!ref.startsWith("refs/tags/") && !ref.startsWith("refs/remotes/") &&
+		(!ref.startsWith("refs/") || ref.startsWith("refs/heads/")) &&
+		!/[\s$`*?[\]~^\\]|@\{|\.{2}/u.test(ref) && !ref.startsWith("+") && !ref.startsWith("-");
+}
+
+function isSafeFeaturePush(git: GitApprovalCommand): boolean {
+	if (git.configOverride || git.repositoryOverride || git.unknown) return false;
+	const positional: string[] = [];
+	for (const arg of git.argv.slice(2)) {
+		if (arg.startsWith("-")) {
+			if (/^--force-with-lease(?:=|$)/u.test(arg)) {
+				const lease = arg.split("=", 2)[1]?.split(":", 1)[0];
+				if (lease && !isFeaturePushRef(lease)) return false;
+			} else if (!/^(?:-[uqv]+|--set-upstream|--quiet|--verbose|--porcelain|--dry-run|--atomic|--delete|-d)$/u.test(arg)) return false;
+		} else positional.push(arg);
+	}
+	const remote = positional.shift();
+	if (remote !== undefined && remote !== "origin") return false;
+	if (positional.length === 0 || (positional.length === 1 && positional[0] === "HEAD")) {
+		if (!git.directory) return false;
+		const config = approvalGitOutput(git.directory, ["config", "--get-regexp", "^(push\\.default|remote\\..*\\.push)$"]);
+		if (config?.split("\n").some(line => line.startsWith("remote.") || /^push\.default (?:matching|nothing)$/u.test(line))) return false;
+		const branch = positional[0] === "HEAD"
+			? approvalGitOutput(git.directory, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+			: approvalGitOutput(git.directory, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"]);
+		if (!branch) return false;
+		if (positional[0] === "HEAD") return isFeaturePushRef(branch);
+		return branch.startsWith("origin/") && isFeaturePushRef(branch.slice(7));
+	}
+	return positional.every(refspec => {
+		if (refspec.startsWith(":") || refspec.startsWith("+")) return false;
+		const parts = refspec.split(":");
+		return parts.length <= 2 && parts.every(part => part === "HEAD" || isFeaturePushRef(part)) &&
+			isFeaturePushRef(parts[parts.length - 1]!);
+	});
+}
+
+function isGitConfigRead(args: readonly string[]): boolean {
+	let read = false;
+	let show = false;
+	const operands: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		if (/^(?:--get(?:-all|-regexp|-urlmatch)?|--list|-l)$/u.test(arg)) read = true;
+		else if (/^--show-(?:origin|scope|names)$/u.test(arg)) show = true;
+		else if (/^(?:--global|--local|--system|--worktree|--includes|--no-includes|--null|-z|--name-only)$/u.test(arg)) continue;
+		else if (arg === "--file" || arg === "-f" || arg === "--blob" || arg === "--type") i++;
+		else if (/^--(?:file|blob|type)=/u.test(arg)) continue;
+		else if (arg.startsWith("-")) return false;
+		else operands.push(arg);
+	}
+	if (operands[0] === "get" || operands[0] === "list") return true;
+	return read ? operands.length <= 2 : operands.length === 1 || (show && operands.length === 0);
+}
+
+function isSafeWorktreeRemoval(git: GitApprovalCommand): boolean {
+	if (git.configOverride || git.repositoryOverride || git.unknown || !git.directory || git.argv[2] !== "remove") return false;
+	const targets = git.argv.slice(3).filter(arg => arg !== "--force" && arg !== "-f" && arg !== "--");
+	if (targets.length !== 1 || targets[0]!.startsWith("-")) return false;
+	let target: string;
+	try {
+		target = fs.realpathSync(path.resolve(git.directory, targets[0]!));
+	} catch {
+		return false;
+	}
+	if (!/^(?:\/private)?\/tmp\/[^/]+/u.test(target) && !target.includes("/.worktrees/")) return false;
+	// Compare filesystem identity, not the /tmp alias or a caller's symlink spelling.
+	const list = approvalGitOutput(git.directory, ["worktree", "list", "--porcelain"]);
+	const entry = list?.split("\n\n").find(block => {
+		const registered = /^worktree (.+)$/mu.exec(block)?.[1];
+		if (!registered) return false;
+		try {
+			return fs.realpathSync(registered) === target;
+		} catch {
+			return false;
+		}
+	});
+	const head = entry && /^HEAD ([0-9a-f]+)$/mu.exec(entry)?.[1];
+	const branch = entry && /^branch (.+)$/mu.exec(entry)?.[1];
+	if (!head) return false;
+	const args = ["rev-list", "--max-count=1", head, "--not", "--single-worktree"];
+	if (branch) args.push(`--exclude=${branch}`);
+	args.push("--all");
+	return approvalGitOutput(git.directory, args) === "";
+}
+
+/** Recognize selectors with the consuming CLI's option arity; ambiguous targeting never grants a write. */
+function isKstageMarutWrite(argv: readonly string[], firstCommand: number): boolean {
+	if (path.basename(argv[firstCommand] ?? "") !== "marut") return false;
+	let profile: string | undefined;
+	let profiles = 0;
+	let explicitProfile = false;
+	let allowWrite = false;
+	for (const assignment of argv.slice(0, firstCommand)) {
+		if (assignment.startsWith("MARUT_PROFILE=")) {
+			profile = assignment.slice(14);
+			profiles++;
+		} else if (/^(?:MARUT_KERNEL_ID|MARUTAI_CLI_CONTROL_FILE)=/u.test(assignment)) return false;
+	}
+	for (let index = firstCommand + 1; index < argv.length; index++) {
+		const arg = argv[index]!;
+		if (arg === "--") break;
+		if (arg === "--profile" || arg === "-p") {
+			const value = argv[++index];
+			if (!value || value.startsWith("-")) return false;
+			profile = value;
+			profiles++;
+			explicitProfile = true;
+		} else if (/^--(?:kernel|control-file|config|profile-file|base|f2-backend)(?:=|$)/u.test(arg)) return false;
+		else if (/^--(?:lane|filter|reason|note|repo|issue|model|auth|service-id|client-id|issuer-key-id|timeout-ms|tail|trace|change|run|output|description|label|name|environment|image|user|since|sql|connector|project-folder|workspace|org|ws|execution|body|body-file|param|query|header|title|type|source|answers-to|answers|decisions|directives|connectors|capacity|profile-line|effect|basis|method|file|scope-type|scope-id|tier|source-environment|revision|values-file)$/u.test(arg)) {
+			if (argv[++index] === undefined) return false;
+		} else if (arg === "--allow-write") allowWrite = true;
+		else if (/^(?:--json|--all|--yes|-y|--force|--idle|--include-unrecorded|--no-assess|--allow-unexplained|--reinterpret|--steer|--with-changes|--ungroup|--withdraw|--close-issue-on-merge|--wait|--proxy|--create|--push|--allow-destructive|--migrations-at-head|--redeploy|--detach)$/u.test(arg)) continue;
+		else if (arg.startsWith("-")) return false;
+	}
+	return profiles === 1 && profile === "kstage" && allowWrite &&
+		(explicitProfile || (!Bun.env.MARUT_KERNEL_ID && !Bun.env.MARUTAI_CLI_CONTROL_FILE));
+}
+
 function resolveBashPatternDecision(
 	command: string,
 	compoundSegments: readonly ApprovalShellSegment[] | null,
 	patternRules: readonly BashApprovalPatternRule[],
 	allowedEnvVars: readonly string[],
+	cwd?: string,
 ): BashPatternDecision {
-	if (compoundSegments) {
-		let promptRule: BashApprovalPatternRule | undefined;
-		for (const rule of patternRules) {
-			if (
-				rule.approval !== "allow" &&
-				(rule.approval === "deny" ||
-					compoundSegments.some(segment => segment.literal === null) ||
-					/[;&|]/u.test(rule.match)) &&
-				commandMatchesBashApprovalPattern(command, rule.match) &&
-				!compoundSegments.some(segment => commandMatchesBashApprovalPattern(segment.text, rule.match))
-			) {
-				if (rule.approval === "deny") return { kind: "deny", rule };
-				promptRule ??= rule;
+	const segments = compoundSegments ?? extractApprovalShellSegments(command);
+	if (!segments) {
+		const rule = findNonCompoundBashRestrictionRule(command, patternRules);
+		if (rule) return { kind: rule.approval === "deny" ? "deny" : "prompt", rule };
+		if (tokenizeShellSegments(command).some(argv => {
+			const executable = argv.find(word => !isShellEnvironmentAssignment(word));
+			return path.basename(executable ?? "") === "git";
+		})) return { kind: "prompt", rule: { match: "git (unparsed shell syntax)", approval: "prompt" } };
+		return { kind: "unmatched" };
+	}
+	let promptRule: BashApprovalPatternRule | undefined;
+	let unmatched = false;
+	let allowRule: BashApprovalPatternRule | undefined;
+	const directories = new Map<number, { directory: string | undefined; allowContext: boolean }>();
+	directories.set(0, { directory: cwd, allowContext: true });
+	for (const rule of segments.length > 1 ? patternRules : []) {
+		if (rule.approval !== "allow" && /&&|\|\||;|\|/u.test(rule.match) &&
+			!/^\*(?:&&|;|\|) /u.test(rule.match) &&
+			commandMatchesBashApprovalPattern(command, rule.match)) {
+			if (rule.approval === "deny") return { kind: "deny", rule };
+			promptRule ??= rule;
+		}
+	}
+	for (const segment of segments) {
+		const scope = segment.cwdScope ?? 0;
+		if (!directories.has(scope)) {
+			const inherited = directories.get(segment.cwdParentScope ?? 0) ?? directories.get(0)!;
+			directories.set(scope, { ...inherited });
+		}
+		const context = directories.get(scope)!;
+		if (segment.cwdUnknown) context.directory = undefined;
+		const directory = context.directory;
+		const allowContext = context.allowContext;
+		const argv = segment.argv ?? segment.literal?.argv ?? tokenizeShellSegments(segment.text)[0] ?? [];
+		if (argv.length > 0 && argv.every(isShellEnvironmentAssignment)) {
+			unmatched = true;
+			continue;
+		}
+		const git = normalizeGitApprovalArgv(argv, segment.unknownArgv ?? [], directory);
+		let firstCommand = 0;
+		while (isShellEnvironmentAssignment(argv[firstCommand] ?? "")) firstCommand++;
+		const safeMarut = !segment.shellStateUnknown && !segment.unknownArgv?.length &&
+			isKstageMarutWrite(argv, firstCommand);
+		const spelling = git ? [...argv.slice(0, firstCommand), ...git.argv].join(" ") : argv.join(" ");
+		const stripped = withoutLeadingEnvironmentAssignments(spelling);
+		const candidates = stripped === null ? [spelling] : [spelling, stripped];
+		if (firstCommand > 0) candidates.push(argv.slice(firstCommand).join(" "));
+		if (git?.configOverride) candidates.push(git.configArgv.join(" "));
+		if (git?.argv[1] === "worktree" && git.argv[2] === "remove" && git.directory && !git.unknown && !git.repositoryOverride) {
+			const targets = git.argv.slice(3).filter(arg => arg !== "--force" && arg !== "-f" && arg !== "--");
+			if (targets.length === 1 && !targets[0]!.startsWith("-")) {
+				try {
+					const canonical = fs.realpathSync(path.resolve(git.directory, targets[0]!));
+					candidates.push(git.argv.map((arg, index) => index >= 3 && arg === targets[0] ? canonical : arg).join(" "));
+				} catch {
+					// Missing or unreadable targets cannot acquire a semantic exception.
+				}
 			}
 		}
-		let hasUnmatchedSegment = false;
-		for (const segment of compoundSegments) {
-			// Ordered first-match semantics belong to each executable segment, not to
-			// the complete chain. Never split an opaque segment's heredoc body again.
-			const withoutEnv = withoutLeadingEnvironmentAssignments(segment.text);
-			const segmentRule = patternRules.find(rule =>
-				rule.approval === "allow"
-					? segment.literal !== null && bashApprovalRuleMatches(segment.text, rule, allowedEnvVars, true)
-					: commandMatchesBashApprovalPattern(segment.text, rule.match) ||
-						(withoutEnv !== null && commandMatchesBashApprovalPattern(withoutEnv, rule.match)) ||
-						(segment.literal !== null &&
-							commandSegmentMatchesBashApprovalPattern(segment.literal.argv.join(" "), rule.match)),
-			);
-			if (segmentRule?.approval === "deny") return { kind: "deny", rule: segmentRule };
-			if (segmentRule?.approval === "prompt") promptRule ??= segmentRule;
-			if (!segmentRule || segment.literal === null) hasUnmatchedSegment = true;
+		const matches = (rule: BashApprovalPatternRule) => {
+			const match = rule.match.replace(/^\*(?:&&|;|\|) /u, "");
+			if (/&&|\|\||;|\|/u.test(match)) return false;
+			return candidates.some(text => commandMatchesBashApprovalPattern(text, match)) ||
+				(git?.directory !== undefined && /^git -C (?!\* )/u.test(match) &&
+					commandMatchesBashApprovalPattern(`git -C ${git.directory} ${git.argv.slice(1).join(" ")}`, match)) ||
+				(rule.approval !== "allow" && (rule.approval === "deny" || /[<>]/u.test(match) || segment.text.includes("\n")) &&
+					commandMatchesBashApprovalPattern(segment.text, match));
+		};
+		if (path.basename(argv[firstCommand] ?? "") === "git" && !git) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= { match: "git (unresolved global options)", approval: "prompt" };
+			continue;
 		}
-		if (promptRule) return { kind: "prompt", rule: promptRule };
-		return hasUnmatchedSegment ? { kind: "unmatched" } : { kind: "allow" };
+		if (git && ((git.unknown && /^(?:config|push|worktree)$/u.test(git.argv[1] ?? "")) ||
+			(git.argv[1] === "push" && (git.repositoryOverride || git.configOverride)))) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= { match: "git (uncertain arguments or repository selection)", approval: "prompt" };
+			continue;
+		}
+		let safeGit = false;
+		if (git?.argv[1] === "config" && !git.configOverride && !git.unknown) safeGit = isGitConfigRead(git.argv.slice(2));
+		if (git?.argv[1] === "push") safeGit = isSafeFeaturePush(git);
+		if (git?.argv[1] === "worktree" && git.argv[2] === "remove") safeGit = isSafeWorktreeRemoval(git);
+		if (segment.shellStateUnknown) safeGit = false;
+		const writtenRule = patternRules.find(rule =>
+			commandMatchesBashApprovalPattern(segment.text, rule.match) ||
+			(withoutLeadingEnvironmentAssignments(segment.text) !== null &&
+				commandMatchesBashApprovalPattern(withoutLeadingEnvironmentAssignments(segment.text)!, rule.match)));
+		const scopedAllow = git && !git.unknown && !git.repositoryOverride && !git.configOverride &&
+			writtenRule?.approval === "allow" && /^git -C (?!\* )/u.test(writtenRule.match) &&
+			segment.literal !== null && !segment.allowUnsafe && allowContext ? writtenRule : undefined;
+		const rule = scopedAllow ?? patternRules.find(rule => {
+			if (!matches(rule)) return false;
+			if (safeMarut && rule.approval === "prompt" && rule.match === "marut *--allow-write*") return false;
+			if (rule.approval === "allow") {
+				if (!allowContext || !(compoundSegments !== null || segments.length === 1) || segment.literal === null || segment.allowUnsafe) return false;
+				if (git?.argv[1] === "push" && git.unknown) return false;
+				const env = rule.env ? [...allowedEnvVars, ...rule.env] : allowedEnvVars;
+				if (firstCommand > 0 && !isShellEnvironmentAssignment(rule.match) &&
+					!argv.slice(0, firstCommand).every(value => env.includes(value.slice(0, value.indexOf("="))))) return false;
+				return git ? matches(rule) : bashApprovalRuleMatches(segment.text, rule, allowedEnvVars, true);
+			}
+			// Only the operation's broad guard gets a semantic read/safe-target
+			// exception. Independent restrictions (eg egress approval) still win.
+			if (safeGit && rule.approval === "prompt" &&
+				(/^(?:git config(?: \*)?|git push(?: \*)?|git worktree remove(?: .*)?)$/u.test(rule.match) ||
+					/^git push --force-with-lease(?:=\*:\*)? origin \*$/u.test(rule.match))) return false;
+			return true;
+		});
+		if (git?.argv[1] === "push" &&
+			!(rule?.approval === "allow" && !rule.match.includes("*")) &&
+			git.argv.slice(2).some(arg => !arg.startsWith("-") && (segments.length > 1 || arg.startsWith("HEAD:")) &&
+				isProtectedPushRef(arg.split(":").pop()!))) {
+			const guard = patternRules.find(rule => rule.approval === "prompt" && rule.match === "git push *");
+			if (guard) promptRule ??= guard;
+		}
+		if (git?.argv[1] === "push" && !safeGit &&
+			!(rule?.approval === "allow" && !rule.match.includes("*"))) {
+			const positional = git.argv.slice(2).filter(arg => !arg.startsWith("-"));
+			if (positional.length === 0 || (positional[0] === "origin" &&
+				(positional.length === 1 || (positional.length === 2 && positional[1] === "HEAD")))) {
+				promptRule ??= { match: "git push (unresolved destination)", approval: "prompt" };
+			}
+		}
+		if (rule?.approval === "deny") return { kind: "deny", rule };
+		if (rule?.approval === "prompt") promptRule ??= rule;
+		if (rule?.approval === "allow") allowRule ??= rule;
+		if (!rule && !safeGit && !safeMarut) unmatched = true;
+		if (argv[0] === "cd") {
+			context.allowContext = false;
+			context.directory = argv.length === 2 && !segment.unknownArgv?.length && (directory || path.isAbsolute(argv[1]!))
+				? path.resolve(directory ?? "/", argv[1]!) : undefined;
+		}
+		if (segment.cwdUnknownAfter) {
+			context.directory = undefined;
+			const parent = directories.get(segment.cwdParentScope ?? scope);
+			if (parent) parent.directory = undefined;
+		}
 	}
-	const patternRule = findBashApprovalPatternRule(command, patternRules, allowedEnvVars);
-	if (patternRule?.approval === "deny") return { kind: "deny", rule: patternRule };
-	if (patternRule?.approval === "prompt") return { kind: "prompt", rule: patternRule };
-	if (patternRule?.approval === "allow") return { kind: "allow" };
-	return { kind: "unmatched" };
+	if (promptRule) return { kind: "prompt", rule: promptRule };
+	return unmatched ? { kind: "unmatched" } : { kind: "allow", rule: allowRule };
 }
 
 async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
@@ -876,13 +1210,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			? this.session.settings.getShellConfig().shell
 			: undefined;
 		const compoundSegments = shell && isPosixShell(shell) ? extractApprovalShellSegments(command) : null;
-		const decision = resolveBashPatternDecision(command, compoundSegments, policy.rules, policy.allowedEnvVars);
+		const base = input.cwd ? resolveToCwd(input.cwd, this.session.cwd) : this.session.cwd;
+		const decision = resolveBashPatternDecision(command, compoundSegments, policy.rules, policy.allowedEnvVars, base);
 		// Project layers may tighten the operator's `bash.patterns`, never loosen
 		// them: an operator deny or prompt still applies under a project allow.
 		const authorityDecision =
 			authority === policy
 				? decision
-				: resolveBashPatternDecision(command, compoundSegments, authority.rules, authority.allowedEnvVars);
+				: resolveBashPatternDecision(command, compoundSegments, authority.rules, authority.allowedEnvVars, base);
 		const denied =
 			authorityDecision.kind === "deny" ? authorityDecision : decision.kind === "deny" ? decision : undefined;
 		if (denied) {
@@ -903,15 +1238,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				reason: `Prompt required by bash pattern: ${prompted.rule.match}`,
 			};
 		}
-		const criticalCommand = command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command));
+		const criticalCommand = command !== "" && isCriticalBashCommand(command);
 		if (!compoundSegments && criticalCommand) {
-			return { tier: "exec", override: true, reason: "Critical pattern detected" };
+			return { tier: "exec", override: true, policy: "prompt", reason: "Critical pattern detected" };
 		}
 		if (compoundSegments) {
 			for (const segment of compoundSegments) {
 				const literalCommand = segment.literal?.argv.join(" ") ?? segment.text;
-				if (criticalCommand || CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(literalCommand))) {
-					return { tier: "exec", override: true, reason: "Critical pattern detected" };
+				if (criticalCommand || isCriticalBashCommand(literalCommand)) {
+					return { tier: "exec", override: true, policy: "prompt", reason: "Critical pattern detected" };
 				}
 			}
 		}
