@@ -13,7 +13,7 @@ import {
 	resolveApprovalFromContext,
 	truncateForPrompt,
 } from "@oh-my-pi/pi-coding-agent/tools/approval";
-import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { BashTool, getBashApprovalOverrideClasses } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { MCPTool } from "../../src/mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolDefinition } from "../../src/mcp/types";
@@ -771,6 +771,123 @@ describe("argv-aware bash approval regressions", () => {
 		expect(policy('printf \'%s\\n\' \'awk {system("sudo true")}\'')).toBe("allow");
 	});
 
+	it("retains the literal sudo restriction for xargs awk independently of the direct awk guard", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "*sudo *", approval: "prompt" },
+				{ match: "echo *", approval: "allow" },
+				{ match: "xargs *", approval: "allow" },
+			],
+		});
+		const command = 'echo /dev/null | xargs awk \'BEGIN {system("sudo true")}\'';
+		const result = resolveApproval(bash, { command }, "yolo");
+		expect(result.policy).toBe("prompt");
+		expect(result.reason ?? "").not.toContain("P0 approval override: inert-data");
+		expect(getBashApprovalOverrideClasses(command, [{ match: "*sudo *", approval: "prompt" }])).not.toContain("inert-data");
+	});
+
+	const interpreterPayloads = [
+		["awk", 'awk \'BEGIN {system("sudo true")}\''],
+		["perl", 'perl -e \'system("sudo true")\''],
+		["python", 'python -c \'import os; os.system("sudo true")\''],
+		["sh", "sh -c 'sudo true'"],
+	] as const;
+	for (const wrapper of ["xargs", "env", "nice", "timeout 5"] as const) {
+		for (const [interpreter, payload] of interpreterPayloads) {
+			it(`retains sudo prompt restrictions for ${interpreter} code behind ${wrapper}`, () => {
+				const bash = createBashTool({
+					"bash.allowCompoundCommands": true,
+					"bash.patterns": [
+						{ match: "sudo *", approval: "prompt" },
+						{ match: "*sudo *", approval: "prompt" },
+						{ match: "echo *", approval: "allow" },
+						{ match: `${wrapper.split(" ")[0]} *`, approval: "allow" },
+					],
+				});
+				const command = `${wrapper} ${payload}`;
+				const result = resolveApproval(bash, { command }, "yolo");
+				expect(result.policy, command).toBe("prompt");
+				expect(result.reason ?? "", command).not.toContain("P0 approval override: inert-data");
+				expect(getBashApprovalOverrideClasses(command, [
+					{ match: "sudo *", approval: "prompt" },
+					{ match: "*sudo *", approval: "prompt" },
+				]), command).not.toContain("inert-data");
+			});
+
+			it(`retains sudo deny precedence for ${interpreter} code behind ${wrapper}`, () => {
+				const bash = createBashTool({
+					"bash.allowCompoundCommands": true,
+					"bash.patterns": [
+						{ match: "*sudo *", approval: "deny" },
+						{ match: "sudo *", approval: "prompt" },
+						{ match: `${wrapper.split(" ")[0]} *`, approval: "allow" },
+					],
+				});
+				expect(resolveApproval(bash, { command: `${wrapper} ${payload}` }, "yolo").policy).toBe("deny");
+			});
+		}
+	}
+
+	it("retains legacy literal-argv restrictions behind an unrecognized execution carrier", () => {
+		for (const approval of ["prompt", "deny"] as const) {
+			const rules = [{ match: "sudo *", approval }];
+			const tool = createBashTool({ "bash.allowCompoundCommands": true, "bash.patterns": rules });
+			for (const command of [
+				'echo /dev/null | xargs unknown-runner \'(sudo true)\'',
+				'echo /dev/null | xargs awk \'BEGIN {system("sudo true")}\'',
+			]) {
+				expect(resolveApproval(tool, { command }, "yolo").policy, command).toBe(approval);
+				expect(getBashApprovalOverrideClasses(command, rules), command).toEqual([]);
+			}
+		}
+	});
+	it("never classifies argument-selected programs as inert quoted data", () => {
+		const rules = [
+			{ match: "sudo *", approval: "prompt" },
+			{ match: "find *-exec*", approval: "prompt" },
+		] as const;
+		const tool = createBashTool({ "bash.allowCompoundCommands": true, "bash.patterns": rules });
+		for (const command of [
+			'rg --pre \'(sudo true)\' pattern /tmp/input && echo done',
+			'rg --hostname-bin \'(sudo true)\' pattern /tmp/input && echo done',
+			'gh pr view 17 --template \'(sudo true)\' && echo done',
+			'find /tmp -exec printf \'(sudo true)\' \\; && echo done',
+		]) {
+			expect(resolveApproval(tool, { command }, "yolo").policy, command).toBe("prompt");
+			expect(getBashApprovalOverrideClasses(command, rules), command).toEqual([]);
+		}
+	});
+
+
+	it("labels genuine quoted-data overrides as inert-data rather than interpreter code", () => {
+		const dataRules = [
+			{ match: "git config *", approval: "prompt" },
+			{ match: "sudo *", approval: "prompt" },
+		] as const;
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": dataRules,
+		});
+		for (const command of [
+			'perms check "git config core.x"',
+			'echo "git config core.x"',
+		]) {
+			expect(resolveApproval(bash, { command }, "yolo").policy, command).toBe("allow");
+			// e540 already allows these: no restriction was overridden.
+			expect(getBashApprovalOverrideClasses(command, dataRules), command).toEqual([]);
+		}
+		for (const command of [
+			'perms check "(git config core.x)" && echo done',
+			'echo "(git config core.x)" && echo done',
+			'echo \'awk BEGIN {system("sudo true")}\' && echo done',
+		]) {
+			const result = resolveApproval(bash, { command }, "yolo");
+			expect(result.policy, command).toBe("allow");
+			expect(getBashApprovalOverrideClasses(command, dataRules), command).toContain("inert-data");
+		}
+	});
+
 	it("treats quoted arguments and non-shell heredoc bodies as data", () => {
 		const tool = createBashTool({
 			"bash.allowCompoundCommands": true,
@@ -1031,6 +1148,67 @@ describe("argv-aware bash approval regressions", () => {
 				`echo ready; git -C ${repo} push origin main`,
 				`git -C ${repo} push origin main && echo done`,
 			]) expect(resolveApproval(captainTool, { command, cwd: repo }, "yolo").policy).toBe("allow");
+			const scopedCommand = "git -C /Users/jubin/agent-work push origin main";
+			const scopedRules = [
+				{ match: scopedCommand, approval: "allow" },
+				{ match: `git -C ${repo} push origin main`, approval: "allow" },
+				...patterns,
+			];
+			const scopedEnvVars = [
+				"NO_COLOR", "GIT_DIR", "GIT_WORK_TREE",
+				"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+			];
+			const envScopedTool = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.allowedEnvVars": scopedEnvVars,
+				"bash.patterns": scopedRules,
+			});
+			// Approval inputs only: neither the scoped command nor any push is executed.
+			for (const assignment of [
+				`GIT_DIR=${repo}/.git`,
+				`GIT_WORK_TREE=${repo}`,
+				"GIT_CONFIG_COUNT=0",
+				"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main",
+				"GIT_CONFIG_KEY_0=remote.origin.push",
+				"GIT_CONFIG_VALUE_0=HEAD:main",
+			]) {
+				for (const command of [
+					`${assignment} ${scopedCommand}`,
+					`${assignment} git -C ${repo} push origin main`,
+				]) {
+					const result = resolveApproval(envScopedTool, { command, cwd: repo }, "yolo");
+					expect(result.policy, command).toBe("prompt");
+					expect(result.reason ?? "", command).not.toContain("captain-scoped-exception");
+					expect(getBashApprovalOverrideClasses(command, scopedRules, scopedEnvVars, repo), command)
+						.not.toContain("captain-scoped-exception");
+				}
+			}
+			for (const command of [
+				scopedCommand,
+				`NO_COLOR=1 ${scopedCommand}`,
+				`git -C ${repo} push origin main`,
+				`NO_COLOR=1 git -C ${repo} push origin main`,
+			]) {
+				const result = resolveApproval(envScopedTool, { command, cwd: repo }, "yolo");
+				expect(result.policy, command).toBe("allow");
+				// An unchanged e540 captain allowance needs no override attribution.
+				expect(getBashApprovalOverrideClasses(command, scopedRules, scopedEnvVars, repo), command).toEqual([]);
+			}
+			const normalizedScopedRules = [
+				...scopedRules.slice(0, 2),
+				{ match: "git -* push *", approval: "prompt" },
+				...patterns,
+			];
+			const normalizedScopedTool = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.allowedEnvVars": scopedEnvVars,
+				"bash.patterns": normalizedScopedRules,
+			});
+			const normalizedScopedCommand = `git --no-pager -C ${repo} push origin main`;
+			expect(resolveApproval(normalizedScopedTool, { command: normalizedScopedCommand, cwd: repo }, "yolo").policy)
+				.toBe("allow");
+			expect(getBashApprovalOverrideClasses(normalizedScopedCommand, normalizedScopedRules, scopedEnvVars, repo))
+				.toContain("captain-scoped-exception");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
