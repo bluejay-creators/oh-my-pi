@@ -453,7 +453,43 @@ interface GitApprovalCommand {
 	directory: string | undefined;
 	configOverride: boolean;
 	repositoryOverride: boolean;
+	pathUncertain: boolean;
 	unknown: boolean;
+}
+
+interface ApprovalDirectory {
+	directory: string | undefined;
+	sawSymlink: boolean;
+	uncertain: boolean;
+}
+
+/**
+ * Inspect raw prefixes before normalization can erase a symlink followed by `..`.
+ * Keep uncertainty sticky across cd/-C: Bash logical cd and Git physical -C need
+ * not agree, so neither a later parent nor an absolute target can repair proof.
+ */
+function advanceApprovalDirectory(state: ApprovalDirectory, target: string): ApprovalDirectory {
+	let sawSymlink = state.sawSymlink;
+	let uncertain = state.uncertain;
+	if (!state.directory && !path.isAbsolute(target)) return { ...state, directory: undefined };
+	const raw = path.isAbsolute(target) ? target : `${state.directory}/${target}`;
+	const components = raw.split(path.sep);
+	let prefix = "";
+	try {
+		for (const component of components) {
+			if (!component) continue;
+			prefix += `${path.sep}${component}`;
+			if (fs.lstatSync(prefix).isSymbolicLink()) sawSymlink = true;
+		}
+		if (!fs.statSync(raw).isDirectory()) uncertain = true;
+	} catch (error) {
+		// A missing directory cannot execute Git, but must not manufacture a
+		// stricter literal-policy verdict. Parent traversal without proof is
+		// different: an unreadable prefix might conceal a symlink.
+		if (components.includes("..") || (error as NodeJS.ErrnoException).code !== "ENOENT") uncertain = true;
+	}
+	if (sawSymlink && components.includes("..")) uncertain = true;
+	return { directory: path.resolve(raw), sawSymlink, uncertain };
 }
 
 // These executables can select, rewrite, or interpret another command. Until
@@ -531,15 +567,31 @@ function approvalWrapperSourceNeedsPrompt(source: string): boolean {
 function normalizeGitApprovalArgv(
 	argv: readonly string[],
 	unknown: readonly number[],
-	cwd: string | undefined,
+	cwd: ApprovalDirectory,
 ): GitApprovalCommand | undefined {
 	let start = 0;
 	while (isShellEnvironmentAssignment(argv[start] ?? "")) start++;
 	if (path.basename(argv[start] ?? "") !== "git") return undefined;
-	let directory = cwd;
+	let location = cwd;
 	let configOverride = false;
 	let repositoryOverride = false;
 	const configArgv: string[] = [];
+	const result = (args: string[]): GitApprovalCommand => {
+		location = advanceApprovalDirectory(location, ".");
+		let directory: string | undefined;
+		if (!location.uncertain && location.directory) {
+			try {
+				directory = fs.realpathSync(location.directory);
+			} catch {
+				// No repository identity is available for an upstream lookup.
+				// Preserve plain rules unless traversal itself was uncertain.
+				directory = undefined;
+			}
+		}
+		return { argv: ["git", ...args], configArgv: ["git", ...configArgv, ...args],
+			directory, configOverride, repositoryOverride, pathUncertain: location.uncertain,
+			unknown: unknown.length > 0 };
+	};
 	let i = start + 1;
 	for (; i < argv.length; i++) {
 		const arg = argv[i]!;
@@ -548,14 +600,14 @@ function normalizeGitApprovalArgv(
 			// Query/dispatch flags stop Git's global parsing. Do not reinterpret
 			// an ignored suffix as another command or grant it an operation exception.
 			if (i + 1 < argv.length) return undefined;
-			return { argv: ["git", ...argv.slice(i)], configArgv: ["git", ...configArgv, ...argv.slice(i)],
-				directory, configOverride, repositoryOverride, unknown: unknown.length > 0 };
+			return result(argv.slice(i));
 		}
 		if (arg === "-C") {
 			const value = argv[++i];
 			if (value === undefined) return undefined;
-			directory = !unknown.includes(i) && (directory || path.isAbsolute(value))
-				? path.resolve(directory ?? "/", value) : undefined;
+			location = unknown.includes(i)
+				? { ...location, directory: undefined, uncertain: true }
+				: advanceApprovalDirectory(location, value);
 		} else if (arg === "-c" || arg === "--config-env" || arg.startsWith("--config-env=")) {
 			configOverride = true;
 			if (arg === "-c" || arg === "--config-env") {
@@ -580,7 +632,7 @@ function normalizeGitApprovalArgv(
 		else break;
 	}
 	if (unknown.includes(i)) return undefined;
-	return { argv: ["git", ...argv.slice(i)], configArgv: ["git", ...configArgv, ...argv.slice(i)], directory, configOverride, repositoryOverride, unknown: unknown.length > 0 };
+	return result(argv.slice(i));
 }
 
 // Approval is synchronous. Port the bounded, read-only Git query used by the
@@ -687,39 +739,6 @@ function isSafeWorktreeRemoval(git: GitApprovalCommand): boolean {
 	return approvalGitOutput(git.directory, args) === "";
 }
 
-/** Recognize selectors with the consuming CLI's option arity; ambiguous targeting never grants a write. */
-function isKstageMarutWrite(argv: readonly string[], firstCommand: number): boolean {
-	if (path.basename(argv[firstCommand] ?? "") !== "marut") return false;
-	let profile: string | undefined;
-	let profiles = 0;
-	let explicitProfile = false;
-	let allowWrite = false;
-	for (const assignment of argv.slice(0, firstCommand)) {
-		if (assignment.startsWith("MARUT_PROFILE=")) {
-			profile = assignment.slice(14);
-			profiles++;
-		} else if (/^(?:MARUT_KERNEL_ID|MARUTAI_CLI_CONTROL_FILE)=/u.test(assignment)) return false;
-	}
-	for (let index = firstCommand + 1; index < argv.length; index++) {
-		const arg = argv[index]!;
-		if (arg === "--") break;
-		if (arg === "--profile" || arg === "-p") {
-			const value = argv[++index];
-			if (!value || value.startsWith("-")) return false;
-			profile = value;
-			profiles++;
-			explicitProfile = true;
-		} else if (/^--(?:kernel|control-file|config|profile-file|base|f2-backend)(?:=|$)/u.test(arg)) return false;
-		else if (/^--(?:lane|filter|reason|note|repo|issue|model|auth|service-id|client-id|issuer-key-id|timeout-ms|tail|trace|change|run|output|description|label|name|environment|image|user|since|sql|connector|project-folder|workspace|org|ws|execution|body|body-file|param|query|header|title|type|source|answers-to|answers|decisions|directives|connectors|capacity|profile-line|effect|basis|method|file|scope-type|scope-id|tier|source-environment|revision|values-file)$/u.test(arg)) {
-			if (argv[++index] === undefined) return false;
-		} else if (arg === "--allow-write") allowWrite = true;
-		else if (/^(?:--json|--all|--yes|-y|--force|--idle|--include-unrecorded|--no-assess|--allow-unexplained|--reinterpret|--steer|--with-changes|--ungroup|--withdraw|--close-issue-on-merge|--wait|--proxy|--create|--push|--allow-destructive|--migrations-at-head|--redeploy|--detach)$/u.test(arg)) continue;
-		else if (arg.startsWith("-")) return false;
-	}
-	return profiles === 1 && profile === "kstage" && allowWrite &&
-		(explicitProfile || (!Bun.env.MARUT_KERNEL_ID && !Bun.env.MARUTAI_CLI_CONTROL_FILE));
-}
-
 function resolveBashPatternDecision(
 	command: string,
 	compoundSegments: readonly ApprovalShellSegment[] | null,
@@ -745,8 +764,9 @@ function resolveBashPatternDecision(
 	let promptRule: BashApprovalPatternRule | undefined;
 	let unmatched = false;
 	let allowRule: BashApprovalPatternRule | undefined;
-	const directories = new Map<number, { directory: string | undefined; allowContext: boolean }>();
-	directories.set(0, { directory: cwd, allowContext: true });
+	const initialDirectory: ApprovalDirectory = { directory: cwd, sawSymlink: false, uncertain: false };
+	const directories = new Map<number, ApprovalDirectory & { allowContext: boolean }>();
+	directories.set(0, { ...initialDirectory, allowContext: true });
 	for (const rule of segments.length > 1 ? patternRules : []) {
 		if (rule.approval !== "allow" && /&&|\|\||;|\|/u.test(rule.match) &&
 			!/^\*(?:&&|;|\|) /u.test(rule.match) &&
@@ -756,7 +776,7 @@ function resolveBashPatternDecision(
 		}
 	}
 	let segmentIndex = 0;
-	let simpleDirectory = cwd;
+	let simpleDirectory = initialDirectory;
 	for (const segment of segments) {
 		const simpleCandidate = simpleSegments?.[segmentIndex++];
 		const scope = segment.cwdScope ?? 0;
@@ -778,17 +798,15 @@ function resolveBashPatternDecision(
 		const simple = !!simpleCandidate && scope === 0 && !segment.unknownArgv?.length &&
 			simpleCandidate.text === segment.text && simpleCandidate.argv.length === argv.length &&
 			simpleCandidate.argv.every((arg, index) => arg === argv[index]);
-		if (simple && argv[0] === "cd") simpleDirectory = simpleDirectory || path.isAbsolute(argv[1]!)
-			? path.resolve(simpleDirectory ?? "/", argv[1]!) : undefined;
-		const git = normalizeGitApprovalArgv(argv, segment.unknownArgv ?? [], simple ? simpleDirectory : directory);
-		const checkedMarut = simple && isKstageMarutWrite(argv, firstCommand);
+		if (simple && argv[0] === "cd") simpleDirectory = advanceApprovalDirectory(simpleDirectory, argv[1]!);
+		const git = normalizeGitApprovalArgv(argv, segment.unknownArgv ?? [], simple ? simpleDirectory : context);
+		// Profile names and registry boot seeds do not prove a Marut kernel's
+		// current backend. Marut writes therefore keep their configured guard.
 		const semanticEnvironment = argv.slice(0, firstCommand).every(assignment => {
 			const name = assignment.slice(0, assignment.indexOf("="));
-			if (name === "MARUT_PROFILE") return checkedMarut;
 			return allowedEnvVars.includes(name) && !name.startsWith("GIT_") && !name.startsWith("MARUT_");
 		});
 		const semanticEligible = simple && semanticEnvironment;
-		const safeMarut = semanticEligible && checkedMarut;
 		const spelling = git ? [...argv.slice(0, firstCommand), ...git.argv].join(" ") : argv.join(" ");
 		const stripped = withoutLeadingEnvironmentAssignments(spelling);
 		const candidates = stripped === null ? [spelling] : [spelling, stripped];
@@ -836,6 +854,7 @@ function resolveBashPatternDecision(
 			continue;
 		}
 		if (git && ((git.unknown && /^(?:config|push|worktree)$/u.test(git.argv[1] ?? "")) ||
+			(git.pathUncertain && /^(?:config|push|worktree)$/u.test(git.argv[1] ?? "")) ||
 			(git.argv[1] === "push" && (git.repositoryOverride || git.configOverride)))) {
 			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
 			if (denied) return { kind: "deny", rule: denied };
@@ -850,10 +869,10 @@ function resolveBashPatternDecision(
 		}
 		// Like the live opaque-shell fallback, derived argv cannot acquire a
 		// literal allow. Otherwise a saved feature glob can hide loop state.
-		const literalOperation = !(git && (git.argv[1] === "push" || git.argv[1] === "config" ||
-			(git.argv[1] === "worktree" && git.argv[2] === "remove")) ||
-			(argv[firstCommand] === "marut" && argv.includes("--allow-write"))) ||
-			simple || extractSimpleApprovalShellSegments(segment.text) !== null;
+		const guardedOperation = (git && (git.argv[1] === "push" || git.argv[1] === "config" ||
+			(git.argv[1] === "worktree" && git.argv[2] === "remove"))) ||
+			(argv[firstCommand] === "marut" && argv.includes("--allow-write"));
+		const literalOperation = !guardedOperation || simple || extractSimpleApprovalShellSegments(segment.text) !== null;
 		const writtenRule = patternRules.find(rule =>
 			commandMatchesBashApprovalPattern(segment.text, rule.match) ||
 			(withoutLeadingEnvironmentAssignments(segment.text) !== null &&
@@ -863,7 +882,6 @@ function resolveBashPatternDecision(
 			segment.literal !== null && !segment.allowUnsafe && allowContext ? writtenRule : undefined;
 		const rule = scopedAllow ?? patternRules.find(rule => {
 			if (!matches(rule)) return false;
-			if (safeMarut && rule.approval === "prompt" && rule.match === "marut *--allow-write*") return false;
 			if (rule.approval === "allow") {
 				if (!literalOperation) return false;
 				if (!allowContext || !(compoundSegments !== null || segments.length === 1) || segment.literal === null || segment.allowUnsafe) return false;
@@ -898,11 +916,15 @@ function resolveBashPatternDecision(
 		if (rule?.approval === "deny") return { kind: "deny", rule };
 		if (rule?.approval === "prompt") promptRule ??= rule;
 		if (rule?.approval === "allow") allowRule ??= rule;
-		if (!rule && !safeGit && !safeMarut) unmatched = true;
+		if (!rule && !safeGit) unmatched = true;
 		if (argv[0] === "cd") {
 			context.allowContext = false;
-			context.directory = argv.length === 2 && !segment.unknownArgv?.length && (directory || path.isAbsolute(argv[1]!))
-				? path.resolve(directory ?? "/", argv[1]!) : undefined;
+			if (argv.length === 2 && !segment.unknownArgv?.length) {
+				Object.assign(context, advanceApprovalDirectory(context, argv[1]!));
+			} else {
+				context.directory = undefined;
+				context.uncertain = true;
+			}
 		}
 		if (segment.cwdUnknownAfter) {
 			context.directory = undefined;

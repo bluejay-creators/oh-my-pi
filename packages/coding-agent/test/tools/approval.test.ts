@@ -690,7 +690,7 @@ describe("argv-aware bash approval regressions", () => {
 			"marut --profile kstage api POST /fixture --allow-write >$OUTPUT",
 		]) expect(resolveApproval(bash, { command }, "yolo").policy, command).toBe("prompt");
 		expect(resolveApproval(bash, { command: "REVIEW=1 git config user.name" }, "yolo").policy).toBe("allow");
-		expect(resolveApproval(bash, { command: "MARUT_PROFILE=kstage marut api POST /fixture --allow-write" }, "yolo").policy).toBe("allow");
+		expect(resolveApproval(bash, { command: "MARUT_PROFILE=kstage marut api POST /fixture --allow-write" }, "yolo").policy).toBe("prompt");
 	});
 
 	it("preserves original wrapper denies and prompts ahead of conservative wrapper approval", () => {
@@ -756,6 +756,13 @@ describe("argv-aware bash approval regressions", () => {
 			"MARUT_PROFILE=kstage; marut api POST /fixture --allow-write",
 			"source /tmp/profile; marut --profile kstage api POST /fixture --allow-write",
 			"MARUT_PROFILE=kstage marut --config /tmp/profile api POST /fixture --allow-write",
+			"marut --profile kstage --kernel other api POST /fixture --allow-write",
+			"marut --profile kstage --control-file /tmp/control api POST /fixture --allow-write",
+			"marut --profile kstage --profile-file /tmp/profile api POST /fixture --allow-write",
+			"marut --profile kstage --base https://other.invalid api POST /fixture --allow-write",
+			"marut --profile kstage --f2-backend prod api POST /fixture --allow-write",
+			"MARUTAI_CLI_CONTROL_FILE=/tmp/control marut --profile kstage api POST /fixture --allow-write",
+			"MARUT_KERNEL_ID=other marut --profile kstage api POST /fixture --allow-write",
 		]) expect(resolveApproval(tool, { command }, "yolo").policy, command).toBe("prompt");
 	});
 
@@ -782,7 +789,7 @@ describe("argv-aware bash approval regressions", () => {
 		}, "yolo").policy).toBe("prompt");
 	});
 
-	it("allows literal kstage Marut writes without changing other target prompts", () => {
+	it("keeps Marut write prompts regardless of a profile's spelling or selector", () => {
 		const tool = createBashTool({
 			"bash.allowCompoundCommands": true,
 			"bash.allowedEnvVars": ["MARUT_PROFILE"],
@@ -792,8 +799,8 @@ describe("argv-aware bash approval regressions", () => {
 			"marut --profile kstage api POST /fixture --allow-write",
 			"marut -p kstage api POST /fixture --allow-write",
 			"MARUT_PROFILE=kstage marut api POST /fixture --allow-write",
-		]) expect(resolveApproval(tool, { command }, "yolo").policy).toBe("allow");
-		for (const command of [
+			"marut --profile review-kstage api POST /fixture --allow-write",
+			"marut --profile review-target api POST /fixture --allow-write",
 			"marut --profile prod api POST /fixture --allow-write",
 			"marut --profile pilot api POST /fixture --allow-write",
 			"marut --profile stage-neon api POST /fixture --allow-write",
@@ -801,6 +808,80 @@ describe("argv-aware bash approval regressions", () => {
 			"marut --profile $profile api POST /fixture --allow-write",
 			"MARUT_PROFILE=kstage marut --profile prod api POST /fixture --allow-write",
 		]) expect(resolveApproval(tool, { command }, "yolo").policy).toBe("prompt");
+	});
+
+	it("never treats registry backend metadata as proof or caches it across retargeting", () => {
+		const root = fs.mkdtempSync("/tmp/omp-marut-approval-");
+		const previous = Bun.env.MARUT_PROFILES_DIR;
+		const registry = path.join(root, "profiles.json");
+		const tool = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "marut *--allow-write*", approval: "prompt" }],
+		});
+		const commands = ["kstage", "review-kstage", "review-target", "unknown"].map(
+			name => `marut --profile ${name} api POST /fixture --allow-write`,
+		);
+		const assertPrompts = () => {
+			for (const command of commands) {
+				expect(resolveApproval(tool, { command }, "yolo").policy, command).toBe("prompt");
+			}
+		};
+		const profile = (name: string, f2Backend: string) => ({
+			f2Backend,
+			userDataDir: path.join(root, name, "state"),
+			flowConfigDir: path.join(root, name, "config"),
+		});
+		try {
+			Bun.env.MARUT_PROFILES_DIR = root;
+			// Registry v1 f2Backend is a boot seed, not attestation of a live kernel.
+			fs.writeFileSync(registry, JSON.stringify({
+				version: 1,
+				profiles: {
+					kstage: profile("kstage", "prod"),
+					"review-kstage": profile("review-kstage", "prod"),
+					"review-target": profile("review-target", "kstage"),
+				},
+			}));
+			assertPrompts();
+			// Reassess the same tool/commands after metadata changes; no prior
+			// resolution may turn an unproven backend into an automatic allow.
+			fs.writeFileSync(registry, JSON.stringify({
+				version: 1,
+				profiles: { kstage: profile("kstage", "kstage"), "review-target": profile("review-target", "prod") },
+			}));
+			assertPrompts();
+			fs.writeFileSync(registry, JSON.stringify({
+				version: 1,
+				profiles: {
+					kstage: profile("shared", "kstage"),
+					"review-target": profile("shared", "prod"),
+				},
+			}));
+			assertPrompts();
+			fs.writeFileSync(registry, '{"version":1,"profiles":{"kstage":');
+			assertPrompts();
+			fs.rmSync(registry);
+			fs.mkdirSync(registry);
+			assertPrompts();
+		} finally {
+			if (previous === undefined) delete Bun.env.MARUT_PROFILES_DIR;
+			else Bun.env.MARUT_PROFILES_DIR = previous;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves explicit Marut denies and independent restrictions after retiring backend inference", () => {
+		const command = "marut --profile kstage api POST /fixture --allow-write";
+		for (const approval of ["deny", "prompt"] as const) {
+			const tool = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [
+					{ match: "marut *", approval },
+					{ match: "marut *--allow-write*", approval: "prompt" },
+				],
+			});
+			expect(resolveApproval(tool, { command }, "yolo").policy).toBe(approval);
+		}
 	});
 
 	it("requires non-scratch or uniquely committed worktree removal approval", () => {
@@ -872,6 +953,55 @@ describe("argv-aware bash approval regressions", () => {
 				expect(policy(`cd ${feature} && ${push}`, bin)).toBe("allow");
 				expect(policy(`cd ${feature}\n${push}`, bin)).toBe("prompt");
 			}
+			const protectedBin = path.join(feature, "protected-bin");
+			const featureBin = path.join(feature, "bin");
+			fs.mkdirSync(featureBin);
+			fs.symlinkSync(bin, protectedBin);
+			const protectedAlias = path.join(feature, "protected-repo");
+			fs.symlinkSync(repo, protectedAlias);
+			const deniedPushTool = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [
+					{ match: "git push", approval: "deny" },
+					{ match: "git push *", approval: "deny" },
+					...patterns,
+				],
+			});
+			for (const push of ["push", "push --force-with-lease"]) {
+				for (const command of [
+					`git -C ${protectedBin} -C .. ${push}`,
+					`cd ${protectedBin} && git -C .. ${push}`,
+					`git -C ${protectedBin}/.. ${push}`,
+					`cd ${protectedBin}/.. && git ${push}`,
+					`cd ${feature} && cd protected-bin && git -C .. ${push}`,
+					`cd ${protectedBin} && cd .. && git ${push}`,
+					`git -C ${protectedBin} -C .. -C ${feature} ${push}`,
+					`cd ${protectedBin} && cd .. && cd ${feature} && git ${push}`,
+				]) expect(policy(command, feature), command).toBe("prompt");
+				for (const command of [
+					`git -C ${featureBin} -C .. ${push}`,
+					`git -C ${featureBin}/.. ${push}`,
+					`cd ${featureBin} && git -C .. ${push}`,
+					`cd ${featureBin} && cd .. && git ${push}`,
+				]) expect(policy(command, repo), command).toBe("allow");
+				for (const command of [
+					`git -C ${protectedAlias} ${push}`,
+					`cd ${protectedAlias} && git ${push}`,
+					`git -C ${protectedBin} ${push}`,
+				]) expect(policy(command, feature), command).toBe("prompt");
+				const command = `git -C ${protectedBin} -C .. ${push}`;
+				expect(resolveApproval(deniedPushTool, { command, cwd: feature }, "yolo").policy,
+					`${command}: deny still wins`).toBe("deny");
+			}
+			const missing = path.join(root, "missing-repo");
+			expect(policy(`git -C ${missing} config --get remote.origin.url`, repo)).toBe("allow");
+			expect(policy(`git -C ${missing} push`, repo)).toBe("prompt");
+			const literalCommand = `git -C ${missing} push --force origin feature/recovery`;
+			const literalPolicy = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [{ match: literalCommand, approval: "allow" }, ...patterns],
+			});
+			expect(resolveApproval(literalPolicy, { command: literalCommand }, "yolo").policy).toBe("allow");
 			git(["config", "branch.feature-review.merge", "refs/heads/main"], repo);
 			git(["config", "push.default", "upstream"], repo);
 			for (const command of ["git push --force-with-lease", "git push"]) {
