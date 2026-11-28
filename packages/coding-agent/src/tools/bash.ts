@@ -451,8 +451,7 @@ export function findBashApprovalPatternRule(
 }
 
 export type BashApprovalOverrideClass =
-	| "inert-data" | "feature-push" | "config-read" | "scratch-worktree-remove" | "captain-scoped-exception"
-	| "ordinary-env-wrapper";
+	"inert-data" | "feature-push" | "config-read" | "scratch-worktree-remove" | "captain-scoped-exception";
 
 const NO_BASH_APPROVAL_OVERRIDES: readonly BashApprovalOverrideClass[] = [];
 
@@ -888,6 +887,8 @@ interface LegacyBashRestriction {
 	/** Absent only for a restriction that matched across the whole source. */
 	segment?: ApprovalShellSegment;
 	criticalPattern?: RegExp;
+	/** The predecessor assessment of an ordinary env payload, not its wrapper spelling. */
+	innerEnvironment?: boolean;
 }
 
 interface LegacyBashAssessment {
@@ -1055,7 +1056,24 @@ function projectInertHeredocData(
 	return projected;
 }
 
-type ApprovalEnvSegment = ApprovalShellSegment & { envSourceArgv?: readonly string[] };
+type ApprovalEnvSegment = ApprovalShellSegment & { envSourceArgv?: readonly string[]; envInnerText?: string };
+
+/** Remove only validated literal prefix words; preserve the payload's exact quoting and expansions. */
+function ordinaryEnvInnerText(text: string, prefix: readonly string[]): string | undefined {
+	let words = 0;
+	let offset = 0;
+	for (const token of lexShellCommand(text)) {
+		if (token.kind === "word") {
+			if (token.value !== prefix[words]) return undefined;
+			words++;
+		} else if (!/^\s*$/u.test(token.raw)) {
+			return undefined;
+		}
+		offset += token.raw.length;
+		if (words === prefix.length) return text.slice(offset).trimStart();
+	}
+	return undefined;
+}
 
 /** Ordinary env values cannot select code/config/targets; unknown names stay wrapped. */
 function ordinaryEnvApprovalSegments(
@@ -1077,9 +1095,11 @@ function ordinaryEnvApprovalSegments(
 			unknown = ordinary.unknown;
 		}
 		if (argv === originalArgv) continue;
+		const envInnerText = ordinaryEnvInnerText(segment.text, originalArgv.slice(0, originalArgv.length - argv.length));
+		if (!envInnerText) continue;
 		const inner = [...argv];
 		const unwrapped: ApprovalEnvSegment = { ...segment, argv: inner, unknownArgv: [...unknown],
-			envSourceArgv: originalArgv, literal: segment.literal ? { ...segment.literal, argv: inner } : null };
+			envSourceArgv: originalArgv, envInnerText, literal: segment.literal ? { ...segment.literal, argv: inner } : null };
 		(prepared ??= [...segments])[index] = unwrapped;
 	}
 	return prepared ?? segments;
@@ -1099,13 +1119,27 @@ function resolveBashPatternDecision(
 	const projected = projectInertHeredocData(command, segments, searchPath);
 	const legacy = projected === command ? original :
 		legacyBashAssessment(projected, patternRules, allowedEnvVars, compoundEnabled);
-	const authorizations = original.restrictions.length || !original.matchedAllow
+	// Env contributes no authorization. Its payload inherits the complete
+	// predecessor floor of the exact unwrapped source, independently per unit.
+	let innerFloors: Map<ApprovalShellSegment, LegacyBashAssessment> | undefined;
+	let restrictions = legacy.restrictions;
+	for (const segment of segments ?? []) {
+		const innerText = (segment as ApprovalEnvSegment).envInnerText;
+		if (!innerText) continue;
+		const inner = legacyBashAssessment(innerText, patternRules, allowedEnvVars, compoundEnabled);
+		(innerFloors ??= new Map()).set(segment, inner);
+		for (const restriction of inner.restrictions) {
+			if (restrictions === legacy.restrictions) restrictions = [...restrictions];
+			restrictions.push({ ...restriction, segment, innerEnvironment: true });
+		}
+	}
+	const authorizations = original.restrictions.length || !original.matchedAllow || innerFloors
 		? new Map<ApprovalShellSegment, BashApprovalOverrideClass>() : undefined;
 	const decision = resolveArgvBashPatternDecision(command, compoundSegments, patternRules, allowedEnvVars, cwd, authorizations, segments, searchPath);
 	if (decision.kind === "deny") return decision;
 	let inertDataSegments: Set<ApprovalShellSegment> | undefined;
 	if (decision.kind === "prompt") {
-		const denied = legacy.restrictions.find(restriction => restriction.rule.approval === "deny");
+		const denied = restrictions.find(restriction => restriction.rule.approval === "deny");
 		return denied ? { kind: "deny", rule: denied.rule } : decision;
 	}
 	const classes = new Set<BashApprovalOverrideClass>();
@@ -1116,8 +1150,10 @@ function resolveBashPatternDecision(
 	let promptRule: BashApprovalPatternRule | undefined;
 	let criticalFloor = false;
 	const authorize = (segment: ApprovalShellSegment, restriction: LegacyBashRestriction): boolean => {
-		const semantic = (segment as ApprovalEnvSegment).envSourceArgv ? undefined : authorizations?.get(segment);
-		const authorization = semantic && semantic !== "ordinary-env-wrapper" && (semantic !== "captain-scoped-exception" ||
+		if (restriction.rule.approval === "deny") return false;
+		const semantic = !(segment as ApprovalEnvSegment).envSourceArgv || restriction.innerEnvironment
+			? authorizations?.get(segment) : undefined;
+		const authorization = semantic && (semantic !== "captain-scoped-exception" ||
 			(!restriction.criticalPattern && restriction.rule.approval !== "deny"))
 			? semantic : isInertBashRestrictionData(segment, restriction, searchPath) ? "inert-data" : undefined;
 		if (authorization) {
@@ -1126,7 +1162,7 @@ function resolveBashPatternDecision(
 		}
 		return authorization !== undefined;
 	};
-	for (const restriction of legacy.restrictions) {
+	for (const restriction of restrictions) {
 		let justified = false;
 		if (restriction.criticalPattern) {
 			// Every actual matching unit must be safe; one quoted example cannot
@@ -1142,7 +1178,7 @@ function resolveBashPatternDecision(
 			const prefix = normalizeBashApprovalPattern(restriction.rule.match.split("*", 1)[0] ?? "");
 			for (const segment of segments ?? []) {
 				const authorization = authorizations?.get(segment);
-				if (authorization && authorization !== "ordinary-env-wrapper" && !(segment as ApprovalEnvSegment).envSourceArgv &&
+				if (authorization && !(segment as ApprovalEnvSegment).envSourceArgv &&
 					prefix && normalizeBashApprovalPattern(segment.text).startsWith(prefix)) {
 					classes.add(authorization);
 					justified = true;
@@ -1168,11 +1204,11 @@ function resolveBashPatternDecision(
 	if (promptRule) return { kind: "prompt", rule: promptRule };
 	if (criticalFloor) return { kind: "critical", rule: LEGACY_CRITICAL_RULE,
 		...(classes.size ? { overrideClasses: [...classes] } : {}) };
-	if (original.matchedAllow && decision.kind === "unmatched" && segments?.every(segment =>
+	if (!innerFloors && original.matchedAllow && decision.kind === "unmatched" && segments?.every(segment =>
 		!segment.unknownArgv?.length && !segment.resolvedExpansion)) {
 		return classes.size ? { kind: "allow", overrideClasses: [...classes] } : { kind: "allow" };
 	}
-	if (!original.matchedAllow) {
+	if (!original.matchedAllow || innerFloors) {
 		const simple = extractSimpleApprovalShellSegments(command);
 		const target = simple?.length === segments?.length ? segments?.at(-1) : undefined;
 		const targetAuthorization = target && (authorizations?.get(target) ??
@@ -1192,7 +1228,7 @@ function resolveBashPatternDecision(
 			const before = original.segments?.[legacyIndex];
 			const sameUnit = before?.text === segment.text;
 			if (sameUnit) legacyIndex++;
-			const oldAllow = sameUnit && before?.matchedAllow &&
+			const oldAllow = (innerFloors?.get(segment)?.matchedAllow ?? (sameUnit && before?.matchedAllow)) &&
 				!segment.unknownArgv?.length && !segment.resolvedExpansion && !segment.shellStateUnknown;
 			if (authorization) classes.add(authorization);
 			else if (!oldAllow) complete = false;
@@ -1407,10 +1443,6 @@ function resolveArgvBashPatternDecision(
 		});
 		if (reviewedWrittenAllow) {
 			authorizations?.set(segment, "captain-scoped-exception");
-		}
-		if (!authorization && rule?.approval === "allow" && trustedExecutable &&
-			(segment as ApprovalEnvSegment).envSourceArgv && !segment.unknownArgv?.length) {
-			authorizations?.set(segment, "ordinary-env-wrapper");
 		}
 		if (git?.argv[1] === "push" && !safeGit &&
 			!(rule?.approval === "allow" && !rule.match.includes("*"))) {

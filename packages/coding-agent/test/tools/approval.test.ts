@@ -545,6 +545,7 @@ describe("argv-aware bash approval regressions", () => {
 					expect(resolveApproval(bash, { command: `${prefix} git status`, cwd }, mode).policy, prefix).toBe("allow");
 					expect(resolveApproval(bash, { command: `${prefix} git push origin feature/topic`, cwd }, mode).policy, prefix).toBe("allow");
 					expect(resolveApproval(bash, { command: `${prefix} git push origin main`, cwd }, mode).policy, prefix).toBe("prompt");
+					expect(getBashApprovalOverrideClasses(`${prefix} git status`, rules, [], cwd)).toEqual([]);
 				}
 				for (const prefix of ["env HOME=/tmp/other", "env XDG_CONFIG_HOME=/tmp/other", "env PATH=/tmp",
 					"env GIT_TERMINAL_PROMPT=1", "env GIT_CONFIG_COUNT=1", "env MARUT_PROFILE=other",
@@ -558,6 +559,30 @@ describe("argv-aware bash approval regressions", () => {
 				}
 				expect(resolveApproval(bash, { command: 'env NO_COLOR=1 git checkout "$option" main', cwd }, mode).policy)
 					.toBe(mode === "write" ? "prompt" : "allow");
+				const outerAllowRules = [
+					{ match: "env *", approval: "allow" as const },
+					{ match: "git status", approval: "allow" as const },
+					{ match: "git config *", approval: "prompt" as const },
+				];
+				const outerAllow = createBashTool({ "bash.patterns": outerAllowRules });
+				for (const inner of ["git branch -D topic", "git commit -m x"]) {
+					const command = `env NO_COLOR=1 ${inner}`;
+					expect(resolveApproval(outerAllow, { command, cwd }, mode).policy, command)
+						.toBe(mode === "write" ? "prompt" : "allow");
+					expect(getBashApprovalOverrideClasses(command, outerAllowRules, [], cwd)).toEqual([]);
+				}
+				expect(resolveApproval(outerAllow, { command: "env git config core.x value", cwd }, mode).policy).toBe("prompt");
+				expect(resolveApproval(outerAllow, { command: "env git config core.x", cwd }, mode).policy).toBe("allow");
+				const innerDeny = createBashTool({ "bash.patterns": [
+					{ match: "env *", approval: "allow" }, { match: "git branch *", approval: "deny" },
+				] });
+				expect(resolveApproval(innerDeny, { command: "env git branch -D topic", cwd }, mode).policy).toBe("deny");
+				for (const inner of ["git config core.x", "git push origin feature/topic"]) {
+					const semanticDeny = createBashTool({ "bash.patterns": [
+						{ match: "env *", approval: "allow" }, { match: "git *", approval: "deny" },
+					] });
+					expect(resolveApproval(semanticDeny, { command: `env ${inner}`, cwd }, mode).policy).toBe("deny");
+				}
 			});
 		});
 
@@ -2688,7 +2713,7 @@ describe("tool-owned dynamic approval declarations", () => {
 			expect(bashApproval(command, settingsOverrides)).toBe("exec");
 		}
 		expect(bashApproval("cmp before after && env sh script", settingsOverrides))
-			.toMatchObject({ tier: "write", policy: "allow", reason: "P0 approval override: ordinary-env-wrapper" });
+			.toMatchObject({ tier: "write", policy: "allow" });
 	});
 
 	it("does not compose printf variable writes with a retargeted executable", () => {
