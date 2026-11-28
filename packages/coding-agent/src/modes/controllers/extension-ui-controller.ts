@@ -201,13 +201,12 @@ export class ExtensionUiController {
 	 * and does not answer it.
 	 */
 	#denyingSteering: readonly AgentMessage[] | undefined;
-	readonly #pendingApprovals = new Set<AbortController>();
+	readonly #pendingApprovals = new Map<AbortController, ExtensionApprovalPrompt>();
 	readonly #timeoutSteering = new WeakSet<AgentMessage>();
-	#approvalTimeoutSteering: Promise<boolean> | undefined;
 
 	/** Session switches and shutdown close both shown and queued approvals. */
 	cancelToolApprovals(): void {
-		for (const pending of this.#pendingApprovals) pending.abort();
+		for (const pending of this.#pendingApprovals.keys()) pending.abort();
 		this.#denyingSteering = undefined;
 	}
 
@@ -660,7 +659,7 @@ export class ExtensionUiController {
 		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) return this.#deniedApproval(prompt);
 		this.#denyingSteering = undefined;
 		const steered = new AbortController();
-		this.#pendingApprovals.add(steered);
+		this.#pendingApprovals.set(steered, prompt);
 		let steeringBaseline = session.getQueuedMessages().steering.length;
 		let knownSteering = new Set(pendingSteering);
 		const unsubscribe = session.subscribe(event => {
@@ -688,25 +687,29 @@ export class ExtensionUiController {
 		signal.addEventListener("abort", clearTimer, { once: true });
 		if (timeout > 0 && !signal.aborted) {
 			timer = setTimeout(() => {
-				if (this.#approvalTimeoutSteering) return;
-				// Submit the same steering input that a human sends while approvals wait.
-				// Its queue_update denies every pending approval through the existing watch.
-				this.#approvalTimeoutSteering = session.prompt(approvalTimeoutPrompt.trim(), {
-					streamingBehavior: "steer",
-					expandPromptTemplates: false,
-					runCommands: false,
-					onPromptQueued: queued => {
-						for (const message of queued) this.#timeoutSteering.add(message);
-					},
+				// Settle every approval through its existing abort/denial path first.
+				// An idle extension may ask without a tool turn, so queue_update alone
+				// cannot be relied on to close these prompts.
+				for (const [pending, approval] of this.#pendingApprovals) {
+					pending.abort(new ToolApprovalTimeoutError(approval.full));
+				}
+				const onPromptQueued = (queued: readonly AgentMessage[]): void => {
+					for (const message of queued) this.#timeoutSteering.add(message);
+					this.#denyingSteering = queued;
+					if (session.isStreaming) agent.prioritizeSteering(queued);
+				};
+				const text = approvalTimeoutPrompt.trim();
+				const delivery = session.isStreaming
+					? session.prompt(text, {
+							streamingBehavior: "steer",
+							expandPromptTemplates: false,
+							runCommands: false,
+							onPromptQueued,
+						})
+					: session.followUp(text, undefined, { expandPromptTemplates: false, onPromptQueued });
+				void delivery.catch(error => {
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
 				});
-				void this.#approvalTimeoutSteering
-					.catch(error => {
-						for (const pending of this.#pendingApprovals) pending.abort(error);
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					})
-					.finally(() => {
-						this.#approvalTimeoutSteering = undefined;
-					});
 			}, timeout * 1_000);
 		}
 		try {
