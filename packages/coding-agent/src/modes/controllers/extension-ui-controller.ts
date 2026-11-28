@@ -5,6 +5,7 @@ import { decodeInput } from "@oh-my-pi/pi-tui/driver/input/decoder";
 import { widgetContext, widgetFor } from "@oh-my-pi/pi-tui/term/widgets";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { CollabHost } from "../../collab/host";
 import type {
 	CompactOptions,
@@ -95,6 +96,7 @@ const ASK_CHAT_OPTION = "Chat about this";
 const ASK_NEXT_OPTION = "Next →";
 /** What an inline ask warns while sending the composer's draft would skip it. */
 const ASK_SKIP_NOTICE = "Sending your message skips these questions";
+const APPROVAL_TIMEOUT_IDLE_NOTICE = "Approval timed out again; idle until a human responds.";
 
 /** The local ask shown above the composer (`#mountAsk`). */
 interface MountedAsk {
@@ -203,6 +205,33 @@ export class ExtensionUiController {
 	#denyingSteering: readonly AgentMessage[] | undefined;
 	readonly #pendingApprovals = new Map<AbortController, ExtensionApprovalPrompt>();
 	readonly #timeoutSteering = new WeakSet<AgentMessage>();
+	readonly #approvalRecoverySessions = new Set<string>();
+	readonly #approvalRecoveryStops = new Set<string>();
+	readonly #seenApprovalHumanInput = new WeakSet<AgentMessage>();
+	readonly #unsubscribeApprovalRecovery: () => void;
+
+	#noteApprovalHumanInput(messages: readonly AgentMessage[]): void {
+		for (const message of messages) {
+			if (message.role !== "user" || message.attribution === "agent" || this.#seenApprovalHumanInput.has(message)) {
+				continue;
+			}
+			this.#seenApprovalHumanInput.add(message);
+			this.#resetApprovalRecovery();
+		}
+	}
+
+	#resetApprovalRecovery(): void {
+		const id = this.ctx.sessionManager.getSessionId();
+		this.#approvalRecoverySessions.delete(id);
+		this.#approvalRecoveryStops.delete(id);
+	}
+
+	/** The mode owns this observer; switches retain each conversation's recovery budget. */
+	disposeApprovalRecovery(): void {
+		this.#unsubscribeApprovalRecovery();
+		this.#approvalRecoverySessions.clear();
+		this.#approvalRecoveryStops.clear();
+	}
 
 	/** Session switches and shutdown close both shown and queued approvals. */
 	cancelToolApprovals(): void {
@@ -222,7 +251,30 @@ export class ExtensionUiController {
 	 * call with the same picker/dialog primitives a live tool call would get.
 	 */
 	#toolUIContext: ExtensionUIContext | undefined;
-	constructor(private ctx: InteractiveModeContext) {}
+	constructor(private ctx: InteractiveModeContext) {
+		const session = ctx.session;
+		this.#noteApprovalHumanInput(session.agent.peekSteeringQueue?.() ?? []);
+		this.#noteApprovalHumanInput(session.agent.peekFollowUpQueue?.() ?? []);
+		this.#unsubscribeApprovalRecovery = session.subscribe(event => {
+			if (event.type === "message_start") this.#noteApprovalHumanInput([event.message]);
+			if (event.type === "queue_update") {
+				this.#noteApprovalHumanInput(session.agent.peekSteeringQueue?.() ?? []);
+				this.#noteApprovalHumanInput(session.agent.peekFollowUpQueue?.() ?? []);
+			}
+			if (event.type === "turn_end") {
+				const id = this.ctx.sessionManager.getSessionId();
+				if (this.#approvalRecoveryStops.delete(id)) {
+					// Let native timeout errors finish the tool batch, then stop before
+					// another model request can retry the same approval indefinitely.
+					void session.abort({ reason: APPROVAL_TIMEOUT_IDLE_NOTICE }).catch(error => {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					});
+				}
+			} else if (event.type === "agent_end") {
+				this.#approvalRecoveryStops.delete(this.ctx.sessionManager.getSessionId());
+			}
+		});
+	}
 
 	/** Ctrl+G in a dialog editor: the editor gets the terminal, the TUI stops rendering and reading keys until it exits. */
 	#editDialogExternally = async (text: string): Promise<string | null> => {
@@ -687,11 +739,20 @@ export class ExtensionUiController {
 		signal.addEventListener("abort", clearTimer, { once: true });
 		if (timeout > 0 && !signal.aborted) {
 			timer = setTimeout(() => {
+				const sessionId = this.ctx.sessionManager.getSessionId();
+				const recovering = this.#approvalRecoverySessions.has(sessionId);
+				this.#approvalRecoverySessions.add(sessionId);
 				// Settle every approval through its existing abort/denial path first.
 				// An idle extension may ask without a tool turn, so queue_update alone
 				// cannot be relied on to close these prompts.
 				for (const [pending, approval] of this.#pendingApprovals) {
 					pending.abort(new ToolApprovalTimeoutError(approval.full));
+				}
+				if (recovering) {
+					if (session.isStreaming) this.#approvalRecoveryStops.add(sessionId);
+					this.ctx.showStatus(APPROVAL_TIMEOUT_IDLE_NOTICE);
+					logger.warn(APPROVAL_TIMEOUT_IDLE_NOTICE, { sessionId });
+					return;
 				}
 				const onPromptQueued = (queued: readonly AgentMessage[]): void => {
 					for (const message of queued) this.#timeoutSteering.add(message);
@@ -703,10 +764,16 @@ export class ExtensionUiController {
 					? session.prompt(text, {
 							streamingBehavior: "steer",
 							expandPromptTemplates: false,
+							attribution: "agent",
+							userInitiated: false,
 							runCommands: false,
 							onPromptQueued,
 						})
-					: session.followUp(text, undefined, { expandPromptTemplates: false, onPromptQueued });
+					: session.followUp(text, undefined, {
+							expandPromptTemplates: false,
+							attribution: "agent",
+							onPromptQueued,
+						});
 				void delivery.catch(error => {
 					this.ctx.showError(error instanceof Error ? error.message : String(error));
 				});
@@ -789,6 +856,7 @@ export class ExtensionUiController {
 				}
 				return this.#deniedApproval(prompt);
 			}
+			if (choice !== undefined) this.#resetApprovalRecovery();
 			return approvalAnswerForChoice(prompt, choice);
 		} finally {
 			clearTimer();
