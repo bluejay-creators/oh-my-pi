@@ -962,6 +962,24 @@ describe("ExtensionUiController tool approval", () => {
 		harness.controller.disposeApprovalRecovery();
 	});
 
+	it("does not replenish recovery when a dialog's own countdown denies without a human", async () => {
+		const harness = makeHarness(120);
+		vi.useFakeTimers();
+		const first = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(120_000);
+		await first;
+		harness.deliverSteering();
+		const countdown = harness.controller.showCollabAwareApproval(prompt, { timeout: 10 });
+		vi.advanceTimersByTime(10);
+		expect(await countdown).toBe("deny");
+		const repeated = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(120_000);
+		expect((await repeated).message).toContain("Tool approval timed out");
+		expect(harness.ctx.session.prompt).toHaveBeenCalledTimes(1);
+		expect(harness.ctx.showStatus).toHaveBeenCalledWith("Approval timed out again; idle until a human responds.");
+		harness.controller.disposeApprovalRecovery();
+	});
+
 	it.each(["idle", "active"])("bounds the %s timeout recovery chain to one automatic message", async origin => {
 		const auth = createInMemoryAuthStorage();
 		auth.keys.setRuntime("anthropic", "test-key");

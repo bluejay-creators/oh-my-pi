@@ -732,6 +732,7 @@ export class ExtensionUiController {
 		const signal = dialogOptions?.signal ? AbortSignal.any([dialogOptions.signal, steered.signal]) : steered.signal;
 		const timeout = cfgToolsApprovalTimeout.get(this.ctx.settings);
 		let timer: Timer | undefined;
+		let countdownTimedOut = false;
 		const clearTimer = (): void => {
 			clearTimeout(timer);
 			timer = undefined;
@@ -815,7 +816,10 @@ export class ExtensionUiController {
 									options: {
 										fullPrompt: prompt.full,
 										timeout: dialogOptions?.timeout,
-										onTimeout: dialogOptions?.onTimeout,
+										onTimeout: () => {
+											countdownTimedOut = true;
+											dialogOptions?.onTimeout?.();
+										},
 										onTimeoutStart: dialogOptions?.onTimeoutStart,
 										onTimeoutReset: dialogOptions?.onTimeoutReset,
 										...(sessionLabel ? { session: { label: sessionLabel } } : {}),
@@ -856,7 +860,7 @@ export class ExtensionUiController {
 				}
 				return this.#deniedApproval(prompt);
 			}
-			if (choice !== undefined) this.#resetApprovalRecovery();
+			if (choice !== undefined && !countdownTimedOut) this.#resetApprovalRecovery();
 			return approvalAnswerForChoice(prompt, choice);
 		} finally {
 			clearTimer();
