@@ -442,13 +442,14 @@ describe("argv-aware bash approval regressions", () => {
 		}), { command, cwd }, "yolo").policy;
 	}
 
-	it("allows config reads in command lists without allowing writes or unset", () => {
-		expect(policy("cd /tmp && ls; git status --short | head -5; git config core.sparseCheckout")).toBe("allow");
+	it("uses plain prompt rules for config reads outside the simple target boundary", () => {
+		expect(policy("cd /tmp && ls; git status --short | head -5; git config core.sparseCheckout")).toBe("prompt");
 		for (const command of [
 			"git config --get core.sparseCheckout",
 			"git config --list",
 			"git config --show-origin core.sparseCheckout",
 		]) expect(policy(command)).toBe("allow");
+		expect(policy("cd /tmp && git config user.name")).toBe("allow");
 		for (const command of [
 			"git config core.sparseCheckout true",
 			"git config --unset core.sparseCheckout",
@@ -456,8 +457,8 @@ describe("argv-aware bash approval regressions", () => {
 		]) expect(policy(command)).toBe("prompt");
 	});
 
-	it("expands literal loop refs while protecting any protected branch iteration", () => {
-		expect(policy("for b in agents/a agents/b; do d=/tmp/repo; git -C $d push --force-with-lease origin HEAD:$b; done")).toBe("allow");
+	it("uses plain prompt rules for loop refs while protecting protected destinations", () => {
+		expect(policy("for b in agents/a agents/b; do d=/tmp/repo; git -C $d push --force-with-lease origin HEAD:$b; done")).toBe("prompt");
 		expect(policy("for b in agents/a main; do git -C $d push --force-with-lease origin HEAD:$b; done")).toBe("prompt");
 		expect(policy("git -C $d push --force origin HEAD:agents/a")).toBe("prompt");
 		expect(policy("git push origin $branch")).toBe("prompt");
@@ -475,6 +476,20 @@ describe("argv-aware bash approval regressions", () => {
 			command: "git push -u origin HEAD:1353/grant-requests && gh pr create --repo example/project --body \"$(printf '%s' 'git config key value')\"",
 		}, "yolo").policy).toBe("allow");
 		expect(resolveApproval(tool, { command: "perms check 'git config core.sparseCheckout'" }, "yolo").policy).toBe("allow");
+	});
+
+	it("does not interpret quoted grep alternations as git push or config commands", () => {
+		const tool = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "git push", approval: "prompt" },
+				{ match: "git push *", approval: "prompt" },
+				{ match: "git config", approval: "prompt" },
+				{ match: "git config *", approval: "prompt" },
+			],
+		});
+		const command = 'grep -nE "match: git (push|config)" file | grep -vE "git push -u origin [a-z]|git push origin [a-z]" | head';
+		expect(resolveApproval(tool, { command }, "yolo").policy).toBe("allow");
 	});
 
 	it("finds the git subcommand before a log path named config", () => {
@@ -506,6 +521,136 @@ describe("argv-aware bash approval regressions", () => {
 		expect(policy("git -C")).toBe("prompt");
 		expect(policy("git -c")).toBe("prompt");
 		expect(policy("git -P status")).toBe("allow");
+	});
+
+	const wrappers: Array<[string, (payload: string) => string]> = [
+		["command", payload => `command ${payload}`],
+		["command --", payload => `command -- ${payload}`],
+		["env", payload => `env ${payload}`],
+		["env assignment", payload => `env REVIEW=1 ${payload}`],
+		["exec", payload => `exec ${payload}`],
+		["xargs", payload => `xargs ${payload}`],
+		["nice", payload => `nice ${payload}`],
+		["nohup", payload => `nohup ${payload}`],
+		["time", payload => `time ${payload}`],
+		["sudo", payload => `sudo ${payload}`],
+		["sh -c", payload => `sh -c '${payload}'`],
+		["bash -c", payload => `bash -c '${payload}'`],
+		["zsh -c", payload => `zsh -c '${payload}'`],
+		["eval", payload => `eval '${payload}'`],
+	];
+	for (const [name, wrap] of wrappers) {
+		it(`prompts for protected, feature, and unknown payloads through ${name}`, () => {
+			for (const payload of [
+				"git push origin main",
+				"git push origin feature/topic",
+				"git --no-pager -C /tmp/repo push origin main",
+				"git --no-pager -C /tmp/repo push origin feature/topic",
+				"marut --profile kstage api POST /fixture --allow-write",
+				"marut --profile prod api POST /fixture --allow-write",
+				"$payload",
+			]) {
+				const command = wrap(payload);
+				const bash = createBashTool({
+					"bash.allowCompoundCommands": true,
+					"bash.patterns": [
+						{ match: "*", approval: "allow" },
+						...patterns,
+					],
+				});
+				expect(resolveApproval(bash, { command }, "yolo", { bash: "allow" }).policy, command).toBe("prompt");
+				expect(policy(`echo before; ${command}`), command).toBe("prompt");
+			}
+		});
+	}
+
+	it("does not add wrapper prompts to known non-Git and non-Marut payloads", () => {
+		for (const [, wrap] of wrappers) {
+			const command = wrap("echo harmless");
+			expect(policy(command), command).toBe("allow");
+			expect(policy(`echo before; ${command}`), command).toBe("allow");
+		}
+		expect(policy("bash tests/fixtures/ghx-reject-leading-gh.sh")).toBe("allow");
+	});
+
+	it("requires approval for all five structural semantic-exception regressions", () => {
+		for (const command of [
+			"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main git push origin feature/topic",
+			"GIT_DIR=/tmp/other/.git git push origin feature/topic",
+			"export GIT_DIR=/tmp/other/.git; git push origin feature/topic",
+			'b=feature/topic; for item in one two; do git push origin "$b"; b=main; done',
+			"false && cd /tmp/feature; git push origin feature/topic",
+			'for item in one; do "cd" /tmp/feature; done; git push origin feature/topic',
+			"git config user.name >$OUTPUT",
+		]) expect(policy(command), command).toBe("prompt");
+	});
+
+	it("does not promote saved literal feature allows into opaque shell contexts", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "git push origin feature/*", approval: "allow" },
+				{ match: "git push -u origin HEAD:feature/*", approval: "allow" },
+				...patterns,
+			],
+		});
+		for (const command of [
+			'b=feature/topic; for item in one two; do git push origin "$b"; b=main; done',
+			'for item in feature/topic; do git push origin "$item"; done',
+		]) expect(resolveApproval(bash, { command }, "yolo").policy, command).toBe("prompt");
+		expect(resolveApproval(bash, { command: "git push origin feature/topic" }, "yolo").policy).toBe("allow");
+		expect(resolveApproval(bash, {
+			command: 'git push -u origin HEAD:feature/topic && gh pr create --body "$(printf safe)"',
+		}, "yolo").policy).toBe("allow");
+		expect(policy("git config user.name; git config user.name")).toBe("prompt");
+	});
+
+	it("requires explicit harmless env eligibility and never exempts Git or unchecked Marut selectors", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.allowedEnvVars": ["REVIEW", "GIT_DIR", "GIT_CONFIG_COUNT", "MARUT_ENDPOINT"],
+			"bash.patterns": [...patterns, { match: "marut *--allow-write*", approval: "prompt" }],
+		});
+		for (const command of [
+			"GIT_DIR=/tmp/other/.git git push origin feature/topic",
+			"GIT_CONFIG_COUNT=0 git push origin feature/topic",
+			"OTHER=1 git config user.name",
+			"MARUT_ENDPOINT=https://other.invalid marut --profile kstage api POST /fixture --allow-write",
+			"echo before; marut --profile kstage api POST /fixture --allow-write",
+			"for target in kstage; do marut --profile kstage api POST /fixture --allow-write; done",
+			"marut --profile kstage api POST /fixture --allow-write >$OUTPUT",
+		]) expect(resolveApproval(bash, { command }, "yolo").policy, command).toBe("prompt");
+		expect(resolveApproval(bash, { command: "REVIEW=1 git config user.name" }, "yolo").policy).toBe("allow");
+		expect(resolveApproval(bash, { command: "MARUT_PROFILE=kstage marut api POST /fixture --allow-write" }, "yolo").policy).toBe("allow");
+	});
+
+	it("preserves original wrapper denies and prompts ahead of conservative wrapper approval", () => {
+		for (const [name, wrap] of wrappers) {
+			const command = wrap("git push origin feature/topic");
+			const match = `${name.split(" ")[0]} *`;
+			for (const restriction of ["prompt", "deny"] as const) {
+				const bash = createBashTool({
+					"bash.allowCompoundCommands": true,
+					"bash.patterns": [
+						{ match: "*", approval: "allow" },
+						{ match, approval: restriction },
+					],
+				});
+				expect(resolveApproval(bash, { command }, "yolo", { bash: "allow" })).toMatchObject({
+					policy: restriction,
+					reason: `${restriction === "deny" ? "Blocked" : "Prompt required"} by bash pattern: ${match}`,
+				});
+			}
+		}
+	});
+
+	it("does not promote quoted wrapper examples or non-shell heredoc data into commands", () => {
+		const examples = wrappers.map(([, wrap]) => wrap("git push origin main"));
+		for (const example of examples) {
+			const quoted = example.replaceAll("'", "'\\''");
+			expect(policy(`printf '%s\\n' '${quoted}'`), example).toBe("allow");
+		}
+		expect(policy(`cat <<'EOF'\n${examples.join("\n")}\nEOF`)).toBe("allow");
 	});
 
 	it("never gives unknown config or global operands a semantic exception", () => {
@@ -571,6 +716,7 @@ describe("argv-aware bash approval regressions", () => {
 	it("allows literal kstage Marut writes without changing other target prompts", () => {
 		const tool = createBashTool({
 			"bash.allowCompoundCommands": true,
+			"bash.allowedEnvVars": ["MARUT_PROFILE"],
 			"bash.patterns": [{ match: "marut *--allow-write*", approval: "prompt" }],
 		});
 		for (const command of [
@@ -608,7 +754,7 @@ describe("argv-aware bash approval regressions", () => {
 			const tree = git(["rev-parse", "HEAD^{tree}"], repo);
 			const commit = git(["commit-tree", tree, "-p", "HEAD"], repo, "unique approval fixture\n");
 			git(["update-ref", "HEAD", commit], unique);
-			expect(policy(`set -u; R=${repo}; git -C $R worktree remove --force ${scratch}`)).toBe("allow");
+			expect(policy(`set -u; R=${repo}; git -C $R worktree remove --force ${scratch}`)).toBe("prompt");
 			expect(policy(`git -C ${repo} worktree remove --force ${scratch.replace(/^\/private\/tmp/u, "/tmp")}`)).toBe("allow");
 			const alias = path.join(root, "scratch-alias");
 			fs.symlinkSync(scratch, alias);
@@ -627,7 +773,9 @@ describe("argv-aware bash approval regressions", () => {
 			expect(policy(`git -C ${repo} worktree remove --force /Users/example/keep`)).toBe("prompt");
 			const feature = path.join(root, "feature");
 			git(["worktree", "add", "-b", "feature-review", feature, "HEAD"], repo);
-			expect(policy("git push", feature)).toBe("prompt");
+			for (const command of ["git push --force-with-lease", "git push"]) {
+				expect(policy(command, feature), `${command}: no upstream`).toBe("prompt");
+			}
 			fs.appendFileSync(path.join(repo, ".git", "config"), [
 				'\n[remote "origin"]', "\turl = https://example.invalid/review",
 				"\tfetch = +refs/heads/*:refs/remotes/origin/*",
@@ -637,10 +785,28 @@ describe("argv-aware bash approval regressions", () => {
 			].join("\n"));
 			git(["update-ref", "refs/remotes/origin/main", initial], repo);
 			git(["update-ref", "refs/remotes/origin/feature-review", initial], repo);
-			expect(policy("git push", feature)).toBe("allow");
+			for (const command of ["git push --force-with-lease", "git push"]) {
+				expect(policy(command, feature), `${command}: origin feature upstream`).toBe("allow");
+				expect(policy(command, repo), `${command}: origin protected upstream`).toBe("prompt");
+			}
+			expect(policy(`cd ${feature} && git push`, repo)).toBe("allow");
+			expect(policy(`cd ${feature}; git push`, repo)).toBe("allow");
+			expect(policy(`"cd" ${feature}; git push`, repo)).toBe("allow");
+			git(["config", "branch.feature-review.merge", "refs/heads/main"], repo);
+			git(["config", "push.default", "upstream"], repo);
+			for (const command of ["git push --force-with-lease", "git push"]) {
+				expect(policy(command, feature), `${command}: feature tracking protected upstream`).toBe("prompt");
+			}
+			git(["config", "branch.feature-review.merge", "refs/heads/feature-review"], repo);
+			git(["config", "push.default", "simple"], repo);
 			expect(policy(`(cd ${feature}); git push`, repo)).toBe("prompt");
 			expect(policy(`cd ${feature} | cat; git push`, repo)).toBe("prompt");
 			expect(policy(`cat | cd ${feature}; git push`, repo)).toBe("prompt");
+			for (const command of [
+				`false && cd ${feature}; git push`,
+				`true || cd ${feature}; git push`,
+				`cd ${feature} || true; git push`,
+			]) expect(policy(command, repo), command).toBe("prompt");
 			expect(policy(`git --git-dir=${repo}/.git -C ${feature} push`, repo)).toBe("prompt");
 			const captainTool = createBashTool({
 				"bash.allowCompoundCommands": true,
@@ -1013,7 +1179,6 @@ describe("tool-owned dynamic approval declarations", () => {
 			"GOWORK=off && go vet ./...",
 			"GOWORK=off : && go vet ./...",
 			"GOWORK=off cd /tmp && go vet ./...",
-			"GOWORK=off env go vet ./... && git status --short",
 			"'GOWORK'=off go vet ./... && git status --short",
 			"'BASH_CMDS[go]'=/tmp/evil go vet ./... && git status --short",
 			"git status --short && go vet GOWORK=off ./...",
@@ -1021,6 +1186,8 @@ describe("tool-owned dynamic approval declarations", () => {
 		]) {
 			expect(bashApproval(command, settingsOverrides)).toBe("exec");
 		}
+		expect(bashApproval("GOWORK=off env go vet ./... && git status --short", settingsOverrides))
+			.toBe("exec");
 	});
 
 	it("matches bash.allowedEnvVars entries as exact names, never as wildcards", () => {
@@ -1580,7 +1747,6 @@ describe("tool-owned dynamic approval declarations", () => {
 			"test -v 'BASH_VERSINFO[$(id >&2)0]' && echo approved",
 			"print -v PATH /untrusted && cmp before after",
 			"cmp before after && 'cd' /tmp",
-			"cmp before after && env sh script",
 			"cmp before after && echo $(id)",
 			"cmp before after && echo 'unterminated",
 			"cmp before after && echo 'literal\nnewline'",
@@ -1593,6 +1759,8 @@ describe("tool-owned dynamic approval declarations", () => {
 		for (const command of commands) {
 			expect(bashApproval(command, settingsOverrides)).toBe("exec");
 		}
+		expect(bashApproval("cmp before after && env sh script", settingsOverrides))
+			.toMatchObject({ policy: "prompt" });
 	});
 
 	it("does not compose printf variable writes with a retargeted executable", () => {

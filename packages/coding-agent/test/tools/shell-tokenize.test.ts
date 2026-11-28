@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	extractApprovalShellSegments,
 	extractLeadingCdTarget,
+	extractSimpleApprovalShellSegments,
 	lexShellCommand,
 	readShellWord,
 } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
@@ -21,6 +22,130 @@ describe("lexShellCommand", () => {
 			"a b",
 			"2>",
 			"1",
+		]);
+	});
+});
+
+describe("extractSimpleApprovalShellSegments", () => {
+	it("returns only the initial literal cd chain and first target, preserving their source", () => {
+		const command = "'cd' '/repo one' && cd /repo-two; git push origin feature; git push origin main";
+		expect(extractSimpleApprovalShellSegments(command)).toEqual([
+			{ text: "'cd' '/repo one'", argv: ["cd", "/repo one"] },
+			{ text: "cd /repo-two", argv: ["cd", "/repo-two"] },
+			{ text: "git push origin feature", argv: ["git", "push", "origin", "feature"] },
+		]);
+		expect(extractSimpleApprovalShellSegments("git status; cd /other; git push origin feature")).toEqual([
+			{ text: "git status", argv: ["git", "status"] },
+		]);
+		expect(extractSimpleApprovalShellSegments('cd /repo; git push origin "feature/topic"')).toEqual([
+			{ text: "cd /repo", argv: ["cd", "/repo"] },
+			{ text: 'git push origin "feature/topic"', argv: ["git", "push", "origin", "feature/topic"] },
+		]);
+	});
+
+	it("keeps literal environment overrides visible for Bash policy rather than approving their names", () => {
+		for (const prefix of [
+			"GIT_DIR=/other",
+			"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main",
+		]) {
+			const result = extractSimpleApprovalShellSegments(`${prefix} git push origin feature`);
+			expect(result?.[0]?.argv).toEqual([...prefix.split(" "), "git", "push", "origin", "feature"]);
+		}
+	});
+
+	it("rejects loops including quoted cd and loop-carried literal variable bindings", () => {
+		for (const command of [
+			"for x in one; do git push origin feature; done",
+			"for x in one; do 'cd' /other; git push origin feature; done",
+			'b=feature; for x in one two; do git push origin "$b"; b=main; done',
+			'for b in feature; do git push origin "$b"; done',
+			"while true; do git push origin feature; done",
+			"until false; do git push origin feature; done",
+			"repeat 2 git push origin feature",
+		]) {
+			expect(extractSimpleApprovalShellSegments(command)).toBeNull();
+		}
+	});
+
+	it("never infers a cwd through a conditional cd or a prior non-cd command", () => {
+		expect(extractSimpleApprovalShellSegments("false && cd /other; git push origin feature")).toEqual([
+			{ text: "false", argv: ["false"] },
+		]);
+		expect(extractSimpleApprovalShellSegments("cd /one || cd /two; git push origin feature")).toBeNull();
+		expect(extractSimpleApprovalShellSegments("if false; then cd /other; fi; git push origin feature")).toBeNull();
+	});
+
+	it("rejects standalone assignments, exports, expansions and nonliteral redirect targets", () => {
+		for (const command of [
+			"b=feature; git push origin feature",
+			"export b=feature; git push origin feature",
+			'b=feature; git push origin "$b"',
+			'git push origin "$b"',
+			"cd /repo extra && git push origin feature",
+			"cd - && git push origin feature",
+			"GIT_DIR=/other cd /repo && git push origin feature",
+			"git config user.name >$OUTPUT",
+			"git config user.name >/tmp/output",
+			"git config user.name 2>$(target)",
+			"git config user.name >>/dev/null",
+			"git config user.name </dev/null",
+			"git config user.name 3>/dev/null",
+			"git config user.name 2>&2",
+			"git config user.name >&1",
+			"git config user.name &>/dev/null",
+			"git config user.name >/dev/null$OUTPUT",
+			"git config user.name >/dev/null/other",
+		]) {
+			expect(extractSimpleApprovalShellSegments(command)).toBeNull();
+		}
+		for (const suffix of ["export b=feature; git push origin feature", "b=feature; git push origin feature", "echo ok | cat", 'echo "$UNKNOWN"']) {
+			expect(extractSimpleApprovalShellSegments(`git status; ${suffix}`)).toEqual([
+				{ text: "git status", argv: ["git", "status"] },
+			]);
+		}
+	});
+
+	it("allows only the three safe redirects without including them in argv", () => {
+		for (const redirect of ["2>&1", ">/dev/null", "2>/dev/null", '> "/dev/null"', "2> /dev/null"]) {
+			const command = `git config user.name ${redirect}`;
+			expect(extractSimpleApprovalShellSegments(command)).toEqual([
+				{ text: command, argv: ["git", "config", "user.name"] },
+			]);
+		}
+		expect(extractSimpleApprovalShellSegments("cd /repo && git push origin feature >/dev/null 2>&1")).toEqual([
+			{ text: "cd /repo", argv: ["cd", "/repo"] },
+			{ text: "git push origin feature >/dev/null 2>&1", argv: ["git", "push", "origin", "feature"] },
+		]);
+	});
+
+	it("rejects unsupported target structure and OR-lists anywhere", () => {
+		for (const command of [
+			"git status || true",
+			"git status; echo ok || true",
+			"git status | cat",
+			"cd /repo | git status",
+			"(git status)",
+			"{ git status; }",
+			"f() { git status; }; f",
+			"function f { git status; }; f",
+			"case x in x) git status;; esac",
+			"git status &",
+			"git status\n",
+			"git status;",
+			"git status &&",
+			"git status 'unterminated",
+			'git status "unterminated',
+		]) {
+			expect(extractSimpleApprovalShellSegments(command)).toBeNull();
+		}
+	});
+
+	it("keeps quoted and escaped operators as literal argument data", () => {
+		expect(extractSimpleApprovalShellSegments(String.raw`git log 'a || b; c && d | (e)' "x > y" \$branch`)).toEqual([
+			{
+				text: String.raw`git log 'a || b; c && d | (e)' "x > y" \$branch`,
+				argv: ["git", "log", "a || b; c && d | (e)", "x > y", "$branch"],
+			},
 		]);
 	});
 });
@@ -431,6 +556,18 @@ describe("segment-aware shell approval extraction", () => {
 		expect(segments?.find(segment => segment.argv?.[0] === "git")?.argv).toEqual(["git", "push", "origin", "main"]);
 	});
 
+	it("declines conditional and function bodies whose execution is not modeled", () => {
+		for (const command of [
+			"if false; then cd /feature; fi; git push",
+			"if true; then echo ok; else cd /feature; fi; git push",
+			"if cd /feature; then echo ok; fi; git push",
+			"case value in other) cd /feature;; esac; git push",
+			"f() { cd /feature; }; git push",
+			"function f { cd /feature; }; f; git push",
+			"f() (cd /feature); git push",
+		]) expect(extractApprovalShellSegments(command)).toBeNull();
+	});
+
 	it("lets cwd consumers isolate subshell pipeline substitution and heredoc changes", () => {
 		const pushDirectories = (command: string) => {
 			const directories = new Map<number, string | undefined>([[0, "/protected"]]);
@@ -447,12 +584,33 @@ describe("segment-aware shell approval extraction", () => {
 		};
 		expect(pushDirectories("(cd /feature); git push")).toEqual(["/protected"]);
 		expect(pushDirectories("cd /feature | cat; git push")).toEqual(["/protected"]);
-		expect(pushDirectories("(cd /feature; git push); git push")).toEqual(["/feature", "/protected"]);
-		expect(pushDirectories('echo "$(cd /feature; git push)"; git push')).toEqual(["/feature", "/protected"]);
-		expect(pushDirectories("bash <<'EOF'\ncd /feature\ngit push\nEOF\ngit push")).toEqual(["/feature", "/protected"]);
+		expect(pushDirectories("(cd /feature && git push); git push")).toEqual(["/feature", "/protected"]);
+		expect(pushDirectories('echo "$(cd /feature && git push)"; git push')).toEqual(["/feature", "/protected"]);
+		expect(pushDirectories("bash <<'EOF'\ncd /feature && git push\nEOF\ngit push")).toEqual(["/feature", "/protected"]);
 		expect(pushDirectories("echo ok | cd /feature; git push")).toEqual([undefined]);
 		expect(pushDirectories('for d in /feature /protected; do cd "$d"; git push; done; git push')).toEqual([
 			undefined, undefined, undefined,
 		]);
+		for (const prefix of [
+			"false && cd /feature",
+			"true || cd /feature",
+			"cd /feature || true",
+			"cd /feature && echo ok",
+			"cd /feature",
+			"false && cd /feature && echo ok",
+			"while false; do cd /feature; done",
+			"until true; do cd /feature; done",
+			"for d in /feature; do X=value cd /feature; done",
+		]) expect(pushDirectories(`${prefix}; git push`)).toEqual([undefined]);
+		expect(pushDirectories("(cd /feature; git push); git push")).toEqual([undefined, "/protected"]);
+		expect(pushDirectories('echo "$(cd /feature; git push)"; git push')).toEqual([undefined, "/protected"]);
+		expect(pushDirectories("while cd /feature; do git push; done; git push")).toEqual([undefined, undefined]);
+		expect(pushDirectories("cd /feature && git push")).toEqual(["/feature"]);
+		expect(pushDirectories("cd /feature && git push; git push")).toEqual(["/feature", undefined]);
+		expect(pushDirectories("false && cd /feature && git push")).toEqual([undefined]);
+		expect(pushDirectories("true || cd /feature && git push")).toEqual([undefined]);
+		expect(pushDirectories('false && cd /feature; echo "$(git push)"')).toEqual([undefined]);
+		expect(pushDirectories("false && cd /feature; (git push)")).toEqual([undefined]);
+		expect(pushDirectories("cd /feature; cd /other && git push")).toEqual(["/other"]);
 	});
 });

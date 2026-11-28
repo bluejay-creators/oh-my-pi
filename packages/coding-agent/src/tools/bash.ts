@@ -78,6 +78,7 @@ import {
 	BASH_APPROVAL_SHELL_CONTROL_CHARS,
 	type ApprovalShellSegment,
 	extractApprovalShellSegments,
+	extractSimpleApprovalShellSegments,
 	extractAndChainSegments,
 	extractLeadingCdTarget,
 	isShellEnvironmentAssignment,
@@ -455,6 +456,77 @@ interface GitApprovalCommand {
 	unknown: boolean;
 }
 
+// These executables can select, rewrite, or interpret another command. Until
+// their option grammars and execution contexts are modeled, neither literal
+// payloads nor unknown argv may inherit Git's semantic approval exceptions.
+const BASH_APPROVAL_COMMAND_WRAPPERS: Record<string, true> = {
+	command: true, env: true, exec: true, xargs: true, nice: true,
+	nohup: true, time: true, sudo: true, sh: true, bash: true,
+	zsh: true, ash: true, dash: true, ksh: true, eval: true,
+};
+
+/** Only wrappers that may execute Git/Marut (or an unresolved payload) need the extra guard. */
+function requiresApprovalWrapperPrompt(argv: readonly string[], unknown: readonly number[] = []): boolean {
+	let index = 0;
+	while (isShellEnvironmentAssignment(argv[index] ?? "")) index++;
+	if (unknown.includes(index)) return true;
+	const executable = path.basename(argv[index++] ?? "");
+	if (!Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, executable)) return false;
+	if (/^(?:sh|bash|zsh|ash|dash|ksh)$/u.test(executable)) {
+		for (; index < argv.length; index++) {
+			const arg = argv[index]!;
+			if (unknown.includes(index)) return true;
+			if (arg === "--command" || /^-[^-]*c/u.test(arg)) {
+				const payload = argv[index + 1];
+				if (payload === undefined || unknown.includes(index + 1)) return true;
+				return approvalWrapperSourceNeedsPrompt(payload);
+			}
+			if (arg === "--") return index + 1 >= argv.length || unknown.includes(index + 1);
+			if (!arg.startsWith("-") && !arg.startsWith("+")) return false;
+			// Unmodeled interpreter options can change which argument is executable source.
+			if (!/^(?:-[lrxv]+|--noprofile|--norc)$/u.test(arg)) return true;
+		}
+		return true; // stdin is executable source, not a known script operand.
+	}
+	if (executable === "eval") {
+		if (unknown.some(position => position >= index)) return true;
+		return approvalWrapperSourceNeedsPrompt(argv.slice(index).join(" "));
+	}
+	for (; index < argv.length; index++) {
+		const arg = argv[index]!;
+		if (unknown.includes(index)) return true;
+		if (arg === "--") { index++; break; }
+		if (executable === "env" && isShellEnvironmentAssignment(arg)) continue;
+		if (!arg.startsWith("-")) break;
+		if ((executable === "command" && arg === "-p") ||
+			(executable === "env" && (arg === "-i" || arg === "--ignore-environment"))) continue;
+		return true;
+	}
+	if (index >= argv.length || unknown.includes(index)) return true;
+	const payload = path.basename(argv[index]!);
+	return payload === "git" || payload === "marut" || /^(?:sh|bash|zsh|ash|dash|ksh)$/u.test(payload) ||
+		requiresApprovalWrapperPrompt(argv.slice(index), unknown.filter(position => position >= index).map(position => position - index));
+}
+
+function approvalWrapperSourceNeedsPrompt(source: string): boolean {
+	const segments = extractApprovalShellSegments(source);
+	const simple = extractSimpleApprovalShellSegments(source);
+	if (!simple || !segments || simple.length !== segments.length) return true;
+	if (!segments?.length) return true;
+	return segments.some(segment => {
+		const argv = segment.argv ?? segment.literal?.argv;
+		if (!argv) return true;
+		if (!simple.some(candidate => candidate.text === segment.text &&
+			candidate.argv.length === argv.length && candidate.argv.every((arg, index) => arg === argv[index]))) return true;
+		let index = 0;
+		while (isShellEnvironmentAssignment(argv[index] ?? "")) index++;
+		const executable = path.basename(argv[index] ?? "");
+		return segment.shellStateUnknown || segment.unknownArgv?.includes(index) ||
+			executable === "git" || executable === "marut" ||
+			requiresApprovalWrapperPrompt(argv, segment.unknownArgv);
+	});
+}
+
 /** Skip Git's global options, not arbitrary options or path arguments after its subcommand. */
 function normalizeGitApprovalArgv(
 	argv: readonly string[],
@@ -656,13 +728,18 @@ function resolveBashPatternDecision(
 	cwd?: string,
 ): BashPatternDecision {
 	const segments = compoundSegments ?? extractApprovalShellSegments(command);
+	// Structural eligibility is independent of the flattened parser's inferred bindings.
+	// Match both original bytes and argv so loop expansion can never borrow this exception.
+	const simpleSegments = extractSimpleApprovalShellSegments(command);
 	if (!segments) {
 		const rule = findNonCompoundBashRestrictionRule(command, patternRules);
 		if (rule) return { kind: rule.approval === "deny" ? "deny" : "prompt", rule };
 		if (tokenizeShellSegments(command).some(argv => {
 			const executable = argv.find(word => !isShellEnvironmentAssignment(word));
-			return path.basename(executable ?? "") === "git";
-		})) return { kind: "prompt", rule: { match: "git (unparsed shell syntax)", approval: "prompt" } };
+			const program = path.basename(executable ?? "");
+			return program === "git" || (Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, program) &&
+				requiresApprovalWrapperPrompt(argv));
+		})) return { kind: "prompt", rule: { match: "git or command wrapper (unparsed shell syntax)", approval: "prompt" } };
 		return { kind: "unmatched" };
 	}
 	let promptRule: BashApprovalPatternRule | undefined;
@@ -678,7 +755,10 @@ function resolveBashPatternDecision(
 			promptRule ??= rule;
 		}
 	}
+	let segmentIndex = 0;
+	let simpleDirectory = cwd;
 	for (const segment of segments) {
+		const simpleCandidate = simpleSegments?.[segmentIndex++];
 		const scope = segment.cwdScope ?? 0;
 		if (!directories.has(scope)) {
 			const inherited = directories.get(segment.cwdParentScope ?? 0) ?? directories.get(0)!;
@@ -693,11 +773,22 @@ function resolveBashPatternDecision(
 			unmatched = true;
 			continue;
 		}
-		const git = normalizeGitApprovalArgv(argv, segment.unknownArgv ?? [], directory);
 		let firstCommand = 0;
 		while (isShellEnvironmentAssignment(argv[firstCommand] ?? "")) firstCommand++;
-		const safeMarut = !segment.shellStateUnknown && !segment.unknownArgv?.length &&
-			isKstageMarutWrite(argv, firstCommand);
+		const simple = !!simpleCandidate && scope === 0 && !segment.unknownArgv?.length &&
+			simpleCandidate.text === segment.text && simpleCandidate.argv.length === argv.length &&
+			simpleCandidate.argv.every((arg, index) => arg === argv[index]);
+		if (simple && argv[0] === "cd") simpleDirectory = simpleDirectory || path.isAbsolute(argv[1]!)
+			? path.resolve(simpleDirectory ?? "/", argv[1]!) : undefined;
+		const git = normalizeGitApprovalArgv(argv, segment.unknownArgv ?? [], simple ? simpleDirectory : directory);
+		const checkedMarut = simple && isKstageMarutWrite(argv, firstCommand);
+		const semanticEnvironment = argv.slice(0, firstCommand).every(assignment => {
+			const name = assignment.slice(0, assignment.indexOf("="));
+			if (name === "MARUT_PROFILE") return checkedMarut;
+			return allowedEnvVars.includes(name) && !name.startsWith("GIT_") && !name.startsWith("MARUT_");
+		});
+		const semanticEligible = simple && semanticEnvironment;
+		const safeMarut = semanticEligible && checkedMarut;
 		const spelling = git ? [...argv.slice(0, firstCommand), ...git.argv].join(" ") : argv.join(" ");
 		const stripped = withoutLeadingEnvironmentAssignments(spelling);
 		const candidates = stripped === null ? [spelling] : [spelling, stripped];
@@ -723,6 +814,14 @@ function resolveBashPatternDecision(
 				(rule.approval !== "allow" && (rule.approval === "deny" || /[<>]/u.test(match) || segment.text.includes("\n")) &&
 					commandMatchesBashApprovalPattern(segment.text, match));
 		};
+		if (Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, path.basename(argv[firstCommand] ?? "")) &&
+			requiresApprovalWrapperPrompt(argv, segment.unknownArgv)) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= patternRules.find(rule => rule.approval === "prompt" && matches(rule)) ??
+				{ match: "command wrapper (unresolved execution context)", approval: "prompt" };
+			continue;
+		}
 		if (path.basename(argv[firstCommand] ?? "") === "git" && !git) {
 			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
 			if (denied) return { kind: "deny", rule: denied };
@@ -737,21 +836,29 @@ function resolveBashPatternDecision(
 			continue;
 		}
 		let safeGit = false;
-		if (git?.argv[1] === "config" && !git.configOverride && !git.unknown) safeGit = isGitConfigRead(git.argv.slice(2));
-		if (git?.argv[1] === "push") safeGit = isSafeFeaturePush(git);
-		if (git?.argv[1] === "worktree" && git.argv[2] === "remove") safeGit = isSafeWorktreeRemoval(git);
-		if (segment.shellStateUnknown) safeGit = false;
+		if (semanticEligible) {
+			if (git?.argv[1] === "config" && !git.configOverride && !git.unknown) safeGit = isGitConfigRead(git.argv.slice(2));
+			if (git?.argv[1] === "push") safeGit = isSafeFeaturePush(git);
+			if (git?.argv[1] === "worktree" && git.argv[2] === "remove") safeGit = isSafeWorktreeRemoval(git);
+		}
+		// Like the live opaque-shell fallback, derived argv cannot acquire a
+		// literal allow. Otherwise a saved feature glob can hide loop state.
+		const literalOperation = !(git && (git.argv[1] === "push" || git.argv[1] === "config" ||
+			(git.argv[1] === "worktree" && git.argv[2] === "remove")) ||
+			(argv[firstCommand] === "marut" && argv.includes("--allow-write"))) ||
+			simple || extractSimpleApprovalShellSegments(segment.text) !== null;
 		const writtenRule = patternRules.find(rule =>
 			commandMatchesBashApprovalPattern(segment.text, rule.match) ||
 			(withoutLeadingEnvironmentAssignments(segment.text) !== null &&
 				commandMatchesBashApprovalPattern(withoutLeadingEnvironmentAssignments(segment.text)!, rule.match)));
-		const scopedAllow = git && !git.unknown && !git.repositoryOverride && !git.configOverride &&
+		const scopedAllow = literalOperation && git && !git.unknown && !git.repositoryOverride && !git.configOverride &&
 			writtenRule?.approval === "allow" && /^git -C (?!\* )/u.test(writtenRule.match) &&
 			segment.literal !== null && !segment.allowUnsafe && allowContext ? writtenRule : undefined;
 		const rule = scopedAllow ?? patternRules.find(rule => {
 			if (!matches(rule)) return false;
 			if (safeMarut && rule.approval === "prompt" && rule.match === "marut *--allow-write*") return false;
 			if (rule.approval === "allow") {
+				if (!literalOperation) return false;
 				if (!allowContext || !(compoundSegments !== null || segments.length === 1) || segment.literal === null || segment.allowUnsafe) return false;
 				if (git?.argv[1] === "push" && git.unknown) return false;
 				const env = rule.env ? [...allowedEnvVars, ...rule.env] : allowedEnvVars;
@@ -1231,6 +1338,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const prompted =
 			authorityDecision.kind === "prompt" ? authorityDecision : decision.kind === "prompt" ? decision : undefined;
 		if (prompted) {
+			if (isCriticalBashCommand(command) || compoundSegments?.some(segment =>
+				isCriticalBashCommand(segment.literal?.argv.join(" ") ?? segment.text))) {
+				return { tier: "exec", override: true, policy: "prompt", reason: "Critical pattern detected" };
+			}
 			return {
 				tier: "exec",
 				override: true,

@@ -346,6 +346,28 @@ export function withoutLeadingEnvironmentAssignments(
  * validate them against `bash.allowedEnvVars` and per-rule `env` allowlists.
  */
 export function extractLiteralAndChainSegments(command: string): LiteralShellCommandSegment[] | null {
+	return extractStrictLiteralShellSegments(command, false);
+}
+
+/**
+ * The semantic-exception boundary: only an initial literal `cd <path>` chain
+ * and its first non-cd command are eligible. Later commands cannot affect an
+ * earlier target; an OR-list anywhere still invalidates destination certainty.
+ * Environment assignments stay in argv for the caller's environment policy.
+ */
+export function extractSimpleApprovalShellSegments(command: string): LiteralShellCommandSegment[] | null {
+	if (lexShellCommand(command).some(token => token.kind === "separator" && token.raw.includes("||"))) return null;
+	const segments = extractStrictLiteralShellSegments(command, true);
+	if (!segments) return null;
+	const targetIndex = segments.findIndex(segment => segment.argv[0] !== "cd");
+	return targetIndex < 0 ? segments : segments.slice(0, targetIndex + 1);
+}
+
+/** Share quote removal and literal validation with the existing compound parser. */
+function extractStrictLiteralShellSegments(
+	command: string,
+	simpleApproval: boolean,
+): LiteralShellCommandSegment[] | null {
 	for (let i = 0; i < command.length; i++) {
 		const code = command.charCodeAt(i);
 		if ((code < 0x20 && code !== 0x09) || code === 0x7f) return null;
@@ -357,20 +379,27 @@ export function extractLiteralAndChainSegments(command: string): LiteralShellCom
 	let tokenStart = -1;
 	let quote: "'" | '"' | undefined;
 	let segmentStart = 0;
+	let redirectTarget = false;
+	let invalidRedirect = false;
 
 	const startToken = (index: number) => {
 		if (tokenStart < 0) tokenStart = index;
 	};
 	const pushToken = (end: number) => {
 		if (tokenStart < 0) return;
-		argv.push(token);
-		rawTokens.push(command.slice(tokenStart, end));
+		if (redirectTarget) {
+			if (token !== "/dev/null") invalidRedirect = true;
+			redirectTarget = false;
+		} else {
+			argv.push(token);
+			rawTokens.push(command.slice(tokenStart, end));
+		}
 		token = "";
 		tokenStart = -1;
 	};
 	const pushSegment = (end: number): boolean => {
 		pushToken(end);
-		if (argv.length === 0) return false;
+		if (argv.length === 0 || redirectTarget || invalidRedirect) return false;
 		let commandIndex = 0;
 		while (commandIndex < rawTokens.length && SHELL_ASSIGNMENT_NAME.test(rawTokens[commandIndex]!)) {
 			commandIndex++;
@@ -384,8 +413,15 @@ export function extractLiteralAndChainSegments(command: string): LiteralShellCom
 			argv.slice(commandIndex).some(argument => SHELL_ASSIGNMENT.test(argument)) ||
 			(commandArguments.some(argument => SHELL_REINTERPRET_OPTION.test(argument)) &&
 				commandArguments.some(hasBashApprovalShellControlChar)) ||
-			SHELL_STATEFUL_COMMANDS.has(commandName) ||
+			(SHELL_STATEFUL_COMMANDS.has(commandName) && !(simpleApproval && executable === "cd")) ||
 			Object.hasOwn(SHELL_INTERPRETER_COMMANDS, commandName)
+		) {
+			return false;
+		}
+		if (
+			simpleApproval &&
+			executable === "cd" &&
+			(commandIndex !== 0 || argv.length !== 2 || !argv[1] || argv[1].startsWith("-"))
 		) {
 			return false;
 		}
@@ -443,8 +479,46 @@ export function extractLiteralAndChainSegments(command: string): LiteralShellCom
 			pushToken(i);
 			continue;
 		}
+		if (simpleApproval && ch === ">") {
+			if (redirectTarget) return null;
+			const raw = tokenStart < 0 ? "" : command.slice(tokenStart, i);
+			const stderr = raw === "2";
+			if (stderr) {
+				token = "";
+				tokenStart = -1;
+			} else {
+				// An adjacent unquoted number is a file descriptor, not an argument.
+				if (/^[0-9]+$/u.test(raw)) return null;
+				pushToken(i);
+			}
+			if (command[i + 1] === "&") {
+				const after = command[i + 3];
+				if (
+					!stderr ||
+					command[i + 2] !== "1" ||
+					(after !== undefined && !/[ \t;&>]/u.test(after))
+				) {
+					return null;
+				}
+				i += 2;
+			} else {
+				redirectTarget = true;
+			}
+			continue;
+		}
+		if (simpleApproval && ch === ";") {
+			if (!pushSegment(i)) return null;
+			if (simpleApproval && segments.at(-1)?.argv[0] !== "cd") {
+				return command.slice(i + 1).trim() ? segments : null;
+			}
+			segmentStart = i + 1;
+			continue;
+		}
 		if (ch === "&" && command[i + 1] === "&") {
 			if (!pushSegment(i)) return null;
+			if (simpleApproval && segments.at(-1)?.argv[0] !== "cd") {
+				return command.slice(i + 2).trim() ? segments : null;
+			}
 			i++;
 			segmentStart = i + 1;
 			continue;
@@ -477,7 +551,7 @@ export function extractLiteralAndChainSegments(command: string): LiteralShellCom
 		token += ch;
 	}
 
-	if (quote || !pushSegment(command.length) || segments.length < 2) return null;
+	if (quote || !pushSegment(command.length) || (!simpleApproval && segments.length < 2)) return null;
 	return segments;
 }
 
@@ -833,6 +907,7 @@ function extractApprovalShellSegmentsInScope(
 	scopes: { next: number },
 	initialScope: number,
 	initialParentScope?: number,
+	initialCwdUnknown = false,
 ): ApprovalShellSegment[] | null {
 	const pieces: string[] = [];
 	const heredocs = new Set<number>();
@@ -965,13 +1040,29 @@ function extractApprovalShellSegmentsInScope(
 	let conditionalAssignment = false;
 	let cwdScope = initialScope;
 	let cwdParentScope = initialParentScope;
-	const loopMayChangeCwd = pieces.some(piece => /^(?:do[ \t]+)?(?:cd|pushd|popd)(?:[ \t]|$)/u.test(piece));
+	// A successful cd is known only along its success-only && continuation.
+	// List boundaries and skipped commands leave both old and new cwd possible.
+	const cwdStates = new Map<number, { unknown: boolean; successOnly: boolean; conditional: boolean }>();
+	cwdStates.set(initialScope, { unknown: initialCwdUnknown, successOnly: false, conditional: false });
+	const cwdState = () => cwdStates.get(cwdScope)!;
+	const loopMayChangeCwd = pieces.some(piece => {
+		const words = parseApprovalWords(piece.replace(/^(?:do|while|until)[ \t]+/u, ""), variables);
+		let commandIndex = 0;
+		while (words?.[commandIndex] && isShellEnvironmentAssignment(words[commandIndex]!.value)) commandIndex++;
+		return /^(?:cd|pushd|popd)$/u.test(words?.[commandIndex]?.value.split("/").pop() ?? "");
+	});
 	for (let index = 0; index < pieces.length; index++) {
 		const piece = pieces[index]!;
 		if (piece === "\n" && expectCommand) continue;
 		if (/^(?:;|&|&&|\|\|?|\|&|\n)$/u.test(piece)) {
 			if (expectCommand) return null;
 			conditionalAssignment ||= piece !== ";" && piece !== "\n";
+			const state = cwdState();
+			if (piece !== "&&" && state.successOnly) {
+				state.unknown = true;
+				state.successOnly = false;
+			}
+			state.conditional = piece === "&&" || piece === "||";
 			expectCommand = true;
 			needsCommand = piece !== ";" && piece !== "&" && piece !== "\n";
 			continue;
@@ -982,6 +1073,11 @@ function extractApprovalShellSegmentsInScope(
 			stack.push({ kind: "(", body: false, previousScope: cwdScope, previousParentScope: cwdParentScope });
 			cwdParentScope = cwdScope;
 			cwdScope = scopes.next++;
+			cwdStates.set(cwdScope, {
+				unknown: cwdStates.get(cwdParentScope)!.unknown,
+				successOnly: false,
+				conditional: false,
+			});
 			continue;
 		}
 		if (piece === ")") {
@@ -995,6 +1091,8 @@ function extractApprovalShellSegmentsInScope(
 		}
 		if (!expectCommand) return null;
 		let text = piece;
+		// Unsupported compound bodies must not become definite cwd mutations.
+		if (/^(?:if|then|elif|else|fi|case|esac|function)(?:[ \t]|$)/u.test(text)) return null;
 		const top = stack[stack.length - 1];
 		if (text === "done") {
 			if (!top || top.kind === "(" || !top.body || needsCommand) return null;
@@ -1020,14 +1118,15 @@ function extractApprovalShellSegmentsInScope(
 		const childProcess = pipelineBefore || pipelineAfter || pieces[index + 1] === "&";
 		const executionScope = childProcess ? scopes.next++ : cwdScope;
 		const executionParentScope = childProcess ? cwdScope : cwdParentScope;
-		const loopCwdUnknown = loopMayChangeCwd && stack.some(frame => frame.kind !== "(");
+		const loopCwdUnknown = loopMayChangeCwd &&
+			(stack.some(frame => frame.kind !== "(") || /^(?:while|until)[ \t]/u.test(text));
 		const provenance = {
 			cwdScope: executionScope,
-			...(loopCwdUnknown ? { cwdUnknown: true } : {}),
+			...(loopCwdUnknown || cwdState().unknown ? { cwdUnknown: true } : {}),
 			...(executionParentScope !== undefined ? { cwdParentScope: executionParentScope } : {}),
 		};
 		for (const body of substitutions.get(index) ?? []) {
-			const inner = extractApprovalShellSegmentsInScope(body, scopes, scopes.next++, executionScope);
+			const inner = extractApprovalShellSegmentsInScope(body, scopes, scopes.next++, executionScope, cwdState().unknown);
 			if (!inner) return null;
 			segments.push(...inner.map(segment => ({
 				...segment,
@@ -1129,7 +1228,7 @@ function extractApprovalShellSegmentsInScope(
 				if (parsed && heredocSources.has(index) && approvalShellReadsStdin(parsed.argv)) {
 					for (const body of heredocSources.get(index)!) {
 						if (!body.trim()) continue;
-						const inner = extractApprovalShellSegmentsInScope(body, scopes, scopes.next++, executionScope);
+						const inner = extractApprovalShellSegmentsInScope(body, scopes, scopes.next++, executionScope, cwdState().unknown);
 						if (!inner) return null;
 						segments.push(...inner.map(segment => ({
 							...segment,
@@ -1157,6 +1256,12 @@ function extractApprovalShellSegmentsInScope(
 					...(unsafe || parsed?.stateful || parsed?.changesCwd ? { allowUnsafe: true } : {}),
 					...(shellStateUnknown || parsed?.stateful ? { shellStateUnknown: true } : {}),
 				});
+				if (parsed?.changesCwd && !childProcess) {
+					const state = cwdState();
+					const successOnly = !state.conditional && !loopCwdUnknown && pieces[index + 1] === "&&";
+					state.unknown = !successOnly;
+					state.successOnly = successOnly;
+				}
 				if (parsed?.stateful) {
 					shellStateUnknown = true;
 					variables.clear();
