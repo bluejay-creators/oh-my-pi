@@ -36,7 +36,14 @@ import { cfgExtensionAssistantTextRenderers } from "../../extensibility/settings
 import type { ComposerOwner, InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { launchTerminal } from "../../subprocess/terminal-launch";
-import { approvalAnswerForChoice, approvalChoiceLabels, approvalOnceLabel } from "../../tools/approval";
+import {
+	approvalAnswerForChoice,
+	approvalChoiceLabels,
+	approvalOnceLabel,
+	ToolApprovalTimeoutError,
+} from "../../tools/approval";
+import { cfgToolsApprovalTimeout } from "../../tools/settings";
+import approvalTimeoutPrompt from "../../prompts/tools/approval-timeout.md" with { type: "text" };
 import {
 	choiceValue,
 	defaultFormData,
@@ -194,6 +201,22 @@ export class ExtensionUiController {
 	 * and does not answer it.
 	 */
 	#denyingSteering: readonly AgentMessage[] | undefined;
+	readonly #pendingApprovals = new Set<AbortController>();
+	readonly #timeoutSteering = new WeakSet<AgentMessage>();
+	#approvalTimeoutSteering: Promise<boolean> | undefined;
+
+	/** Session switches and shutdown close both shown and queued approvals. */
+	cancelToolApprovals(): void {
+		for (const pending of this.#pendingApprovals) pending.abort();
+		this.#denyingSteering = undefined;
+	}
+
+	#deniedApproval(prompt: ExtensionApprovalPrompt): "deny" {
+		if (this.#denyingSteering?.some(message => this.#timeoutSteering.has(message))) {
+			throw new ToolApprovalTimeoutError(prompt.full);
+		}
+		return "deny";
+	}
 	/**
 	 * Built once in `initHooksAndCustomTools()`. Reused directly by `/tree`
 	 * `ask` re-answer (issue #5642) to drive a standalone `AskTool.execute()`
@@ -634,9 +657,10 @@ export class ExtensionUiController {
 		const session = this.ctx.session;
 		const agent = session.agent;
 		const pendingSteering = agent.peekSteeringQueue();
-		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) return "deny";
+		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) return this.#deniedApproval(prompt);
 		this.#denyingSteering = undefined;
 		const steered = new AbortController();
+		this.#pendingApprovals.add(steered);
 		let steeringBaseline = session.getQueuedMessages().steering.length;
 		let knownSteering = new Set(pendingSteering);
 		const unsubscribe = session.subscribe(event => {
@@ -655,6 +679,36 @@ export class ExtensionUiController {
 			}
 		});
 		const signal = dialogOptions?.signal ? AbortSignal.any([dialogOptions.signal, steered.signal]) : steered.signal;
+		const timeout = cfgToolsApprovalTimeout.get(this.ctx.settings);
+		let timer: Timer | undefined;
+		const clearTimer = (): void => {
+			clearTimeout(timer);
+			timer = undefined;
+		};
+		signal.addEventListener("abort", clearTimer, { once: true });
+		if (timeout > 0 && !signal.aborted) {
+			timer = setTimeout(() => {
+				if (this.#approvalTimeoutSteering) return;
+				// Submit the same steering input that a human sends while approvals wait.
+				// Its queue_update denies every pending approval through the existing watch.
+				this.#approvalTimeoutSteering = session.prompt(approvalTimeoutPrompt.trim(), {
+					streamingBehavior: "steer",
+					expandPromptTemplates: false,
+					runCommands: false,
+					onPromptQueued: queued => {
+						for (const message of queued) this.#timeoutSteering.add(message);
+					},
+				});
+				void this.#approvalTimeoutSteering
+					.catch(error => {
+						for (const pending of this.#pendingApprovals) pending.abort(error);
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+					})
+					.finally(() => {
+						this.#approvalTimeoutSteering = undefined;
+					});
+			}, timeout * 1_000);
+		}
 		try {
 			const choice = await this.#raceCollabDialog(request, signal, localSignal =>
 				this.#presentDialog({ kind: "permission", msg: prompt.compact }, localSignal, settle => {
@@ -726,8 +780,17 @@ export class ExtensionUiController {
 					};
 				}),
 			);
+			if (steered.signal.aborted) {
+				if (steered.signal.reason instanceof Error && steered.signal.reason.name !== "AbortError") {
+					throw steered.signal.reason;
+				}
+				return this.#deniedApproval(prompt);
+			}
 			return approvalAnswerForChoice(prompt, choice);
 		} finally {
+			clearTimer();
+			signal.removeEventListener("abort", clearTimer);
+			this.#pendingApprovals.delete(steered);
 			unsubscribe();
 		}
 	}
