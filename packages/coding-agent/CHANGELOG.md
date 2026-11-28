@@ -21,7 +21,8 @@
 
 - Bash approvals keep flags and quoted data command-local, explicitly gate grouped/negated Git and Marut targets and wrappers, and limit safe-target exceptions to literal top-level commands with only success-only `cd … &&` prefixes and harmless output redirections.
 - Git approval target lookup now resolves physical repository identity and rejects parent traversal after symlinks. Marut profile names and registry boot seeds no longer bypass configured write prompts.
-- Bash approvals preserve the complete e540 decision floor, including critical prompts and unmatched exec tiers in write mode. Unknown or expanded argv never acquire a literal allow; feature exceptions require real unambiguous local branch sources and non-tag destinations.
+- Bash approvals preserve the complete e540 decision floor per command, including critical prompts and unmatched exec tiers in write mode. One semantic exception cannot authorize another unmatched command; captain additions require an explicit review identity bound to the exact written rule.
+- Feature-push exceptions require unambiguous local branch sources. Forced unqualified destinations additionally require an existing origin branch-tracking ref, preventing remote-only tags from borrowing a feature grant.
 - Heredoc authorization uses parser-owned quoted-body offsets in data-only command lines. Data from one source unit cannot excuse a different restricted command or a generated script's interpreter.
 - Resuming or rewinding a session with an aborted task result no longer throws while the transcript renders; the card shows the cancellation text ([#20533](https://github.com/can1357/oh-my-pi/pull/20533) by [@g0spel](https://github.com/g0spel))
 - Save in Plan Review now accepts a custom path and shows where the plan was saved without requiring you to dismiss the review ([#20539](https://github.com/can1357/oh-my-pi/issues/20539)).

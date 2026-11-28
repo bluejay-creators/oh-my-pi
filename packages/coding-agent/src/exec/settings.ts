@@ -21,6 +21,8 @@ export interface BashApprovalPatternRule {
 	approval: BashPatternApproval;
 	/** Leading env assignment names this `allow` rule strips before matching. */
 	env?: string[];
+	/** Identity of an explicitly reviewed exact-literal captain addition. */
+	captainException?: string;
 }
 
 const EMPTY_BASH_PATTERNS: BashApprovalPatternRule[] = [];

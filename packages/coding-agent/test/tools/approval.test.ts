@@ -56,7 +56,7 @@ function bashApproval(command: string, settingsOverrides: Record<string, unknown
 	return approval({ command });
 }
 
-function withPushFixture(run: (cwd: string) => void): void {
+function withPushFixture(run: (cwd: string, git: (args: string[], stdin?: string) => string) => void): void {
 	const cwd = fs.realpathSync(fs.mkdtempSync("/tmp/omp-push-approval-"));
 	const git = (args: string[], stdin?: string): string => {
 		const result = Bun.spawnSync(["git", ...args], {
@@ -78,10 +78,11 @@ function withPushFixture(run: (cwd: string) => void): void {
 		const commit = git(["commit-tree", tree], "approval fixture\n");
 		for (const ref of [
 			"refs/heads/main", "refs/heads/feature/topic", "refs/heads/collision",
+			"refs/remotes/origin/feature/topic",
 			"refs/tags/v1.2.3", "refs/tags/collision",
 		]) git(["update-ref", ref, commit]);
 		git(["remote", "add", "origin", "https://example.invalid/approval"]);
-		run(cwd);
+		run(cwd, git);
 	} finally {
 		fs.rmSync(cwd, { recursive: true, force: true });
 	}
@@ -525,6 +526,242 @@ describe("argv-aware bash approval regressions", () => {
 				});
 				const missing = `git --no-pager -C ${path.join(cwd, "missing-repository")} push origin feature/topic`;
 				expect(resolveApproval(declaredFeature, { command: missing, cwd }, mode).policy).toBe("prompt");
+			});
+		});
+
+		it(`requires branch-destination proof for force pushes even with a feature grant in ${mode}`, () => {
+			withPushFixture((cwd, git) => {
+				const origin = path.join(cwd, "origin.git");
+				git(["clone", "--bare", "--no-hardlinks", cwd, origin]);
+				git(["remote", "set-url", "origin", origin]);
+				const oid = git(["rev-parse", "refs/heads/feature/topic"]);
+				git(["--git-dir", origin, "update-ref", "refs/tags/deploy-candidate", oid]);
+				expect(git(["--git-dir", origin, "show-ref", "--verify", "refs/tags/deploy-candidate"]))
+					.toBe(`${oid} refs/tags/deploy-candidate`);
+				expect(git(["for-each-ref", "--format=%(refname)",
+					"refs/tags/deploy-candidate", "refs/remotes/origin/deploy-candidate"])).toBe("");
+				const bash = createBashTool({
+					"bash.patterns": [
+						{ match: "git push origin feature/*", approval: "allow" },
+						{ match: "git push *", approval: "prompt" },
+					],
+				});
+				const lease = `--force-with-lease=deploy-candidate:${oid}`;
+				const unqualified = `git --no-pager push ${lease} origin feature/topic:deploy-candidate`;
+				expect(resolveApproval(bash, { command: unqualified, cwd }, mode).policy).toBe("prompt");
+				const explicit = `git --no-pager push ${lease} origin feature/topic:refs/heads/deploy-candidate`;
+				expect(resolveApproval(bash, { command: explicit, cwd }, mode).policy).toBe("allow");
+				expect(resolveApproval(bash, {
+					command: "git --no-pager push origin feature/topic:deploy-candidate", cwd,
+				}, mode).policy).toBe("allow");
+				for (const flag of ["--force-with-lease", "--force-if-includes", "--force", "-f"]) {
+					const command = `git --no-pager push ${flag} origin feature/topic:deploy-candidate`;
+					expect(resolveApproval(bash, { command, cwd }, mode).policy, command).toBe("prompt");
+				}
+				// A broad historical allow is not a feature exception. Even that
+				// baseline cannot make an unknown forced destination a branch.
+				const baseline = createBashTool({ "bash.patterns": [{ match: "git push *", approval: "allow" }] });
+				const forcedArguments = [
+					"--force", "-f", "--force-if-includes", "--force-with-lease",
+				].map(flag => `${flag} origin feature/topic:deploy-candidate`);
+				forcedArguments.push("origin +feature/topic:deploy-candidate");
+				for (const args of forcedArguments) {
+					expect(resolveApproval(baseline, { command: `git push ${args}`, cwd }, mode).policy, args).toBe("prompt");
+				}
+				git(["update-ref", "refs/remotes/origin/deploy-candidate", oid]);
+				expect(resolveApproval(bash, { command: unqualified, cwd }, mode).policy).toBe("allow");
+				for (const args of forcedArguments) {
+					expect(resolveApproval(baseline, { command: `git push ${args}`, cwd }, mode).policy, args).toBe("allow");
+				}
+				for (const destination of ["deploy-candidate", "refs/heads/deploy-candidate"]) {
+					const command = `git --no-pager push --force-with-lease origin feature/topic:${destination}`;
+					expect(resolveApproval(bash, { command, cwd }, mode).policy, command).toBe("allow");
+					for (const force of ["--force", "-f", "--force-if-includes"]) {
+						const command = `git --no-pager push ${force} origin feature/topic:${destination}`;
+						expect(resolveApproval(bash, { command, cwd }, mode).policy, command).toBe("prompt");
+					}
+					const forcedRefspec = `git --no-pager push origin +feature/topic:${destination}`;
+					expect(resolveApproval(bash, { command: forcedRefspec, cwd }, mode).policy).toBe("prompt");
+				}
+				for (const destination of ["refs/tags/deploy-candidate", "unknown-destination"]) {
+					const command = `git --no-pager push ${lease} origin feature/topic:${destination}`;
+					expect(resolveApproval(bash, { command, cwd }, mode).policy, command).toBe("prompt");
+				}
+			});
+		});
+
+		it(`resolves implicit remote destinations independently of fetch aliases in ${mode}`, () => {
+			withPushFixture((cwd, git) => {
+				git(["symbolic-ref", "HEAD", "refs/heads/feature/topic"]);
+				git(["config", "push.default", "upstream"]);
+				git(["config", "branch.feature/topic.remote", "origin"]);
+				git(["config", "branch.feature/topic.merge", "refs/heads/main"]);
+				git(["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/feature/disguised"]);
+				const oid = git(["rev-parse", "HEAD"]);
+				git(["update-ref", "refs/remotes/origin/feature/disguised", oid]);
+				expect(git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"]))
+					.toBe("origin/feature/disguised");
+				const rules = [{ match: "git push *", approval: "prompt" }];
+				const bash = createBashTool({ "bash.patterns": rules });
+				for (const command of ["git push", "git push --force-with-lease"]) {
+					expect(resolveApproval(bash, { command, cwd }, mode).policy).toBe("prompt");
+					expect(getBashApprovalOverrideClasses(command, rules, [], cwd)).not.toContain("feature-push");
+				}
+				git(["config", "push.default", "current"]);
+				git(["config", "remote.origin.fetch", "+refs/heads/feature/topic:refs/remotes/origin/main"]);
+				git(["update-ref", "refs/remotes/origin/main", oid]);
+				expect(git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"])).toBe("origin/main");
+				for (const command of ["git push", "git push --force-with-lease"]) {
+					expect(resolveApproval(bash, { command, cwd }, mode).policy).toBe("allow");
+				}
+			});
+		});
+
+		it(`keeps each compound unit's native floor after config, feature, and scratch grants in ${mode}`, () => {
+			withPushFixture((cwd, git) => {
+				const scratch = path.join(cwd, "scratch");
+				git(["worktree", "add", "--detach", scratch, "HEAD"]);
+				const rules = [
+					{ match: "git config *", approval: "prompt" },
+					{ match: "git push *", approval: "prompt" },
+					{ match: "git worktree remove *", approval: "prompt" },
+					{ match: "echo legacy-allowed", approval: "allow" },
+					{ match: "git status *", approval: "allow" },
+				];
+				const bash = createBashTool({
+					"bash.allowCompoundCommands": true, "bash.patterns": rules,
+				});
+				const unmatched = "git --no-pager branch -D topic";
+				const native = resolveApproval(bash, { command: unmatched, cwd }, mode);
+				expect(native).toMatchObject({ policy: mode === "write" ? "prompt" : "allow", tier: "exec" });
+				for (const first of [
+					"git config --get user.name",
+					"git --no-pager push origin feature/topic",
+					`git --no-pager worktree remove --force ${scratch}`,
+				]) {
+					expect(resolveApproval(bash, { command: first, cwd }, mode).policy, first).toBe("allow");
+					const command = `${first} && ${unmatched}`;
+					expect(resolveApproval(bash, { command, cwd }, mode).policy, command).toBe(native.policy);
+					expect(resolveApproval(bash, {
+						command: `${first} && echo legacy-allowed`, cwd,
+					}, mode).policy, first).toBe("allow");
+				}
+				expect(resolveApproval(bash, {
+					command: `cd ${cwd} && git --no-pager push origin feature/topic`, cwd,
+				}, mode).policy).toBe("allow");
+				expect(resolveApproval(bash, { command: "git status --short", cwd }, mode).policy).toBe("allow");
+				const normalizedRead = "git --no-pager status --short";
+				expect(resolveApproval(bash, { command: normalizedRead, cwd }, mode))
+					.toMatchObject({ policy: native.policy, tier: "exec" });
+				expect(getBashApprovalOverrideClasses(normalizedRead, rules, [], cwd)).toEqual([]);
+			});
+		});
+
+		it(`does not expand untagged raw captain rules through normalized argv in ${mode}`, () => {
+			withPushFixture(cwd => {
+				const raw = `git -C ${cwd} branch -D topic`;
+				const rules = [{ match: raw, approval: "allow" }];
+				const bash = createBashTool({ "bash.patterns": rules });
+				expect(resolveApproval(bash, { command: raw, cwd }, mode).policy).toBe("allow");
+				expect(getBashApprovalOverrideClasses(raw, rules, [], cwd)).toEqual([]);
+				const normalized = `git --no-pager -C ${cwd} branch -D topic`;
+				expect(resolveApproval(bash, { command: normalized, cwd }, mode))
+					.toMatchObject({ policy: mode === "write" ? "prompt" : "allow", tier: "exec" });
+				expect(getBashApprovalOverrideClasses(normalized, rules, [], cwd))
+					.not.toContain("captain-scoped-exception");
+			});
+		});
+
+		it(`binds reviewed captain additions to their exact raw rule and each unit's floor in ${mode}`, () => {
+			withPushFixture((cwd, git) => {
+				const feature = path.join(cwd, "feature");
+				git(["worktree", "add", "-b", "feature/captain", feature, "HEAD"]);
+				const raw = `git -C ${feature} push origin prod`;
+				const exceptionId = (match: string) => `captain-addition:${new Bun.CryptoHasher("sha256")
+					.update(match.trim().replace(/\s+/gu, " ")).digest("hex")}`;
+				const command = `cd ${feature} && ${raw}`;
+				const allowedEnvVars = ["GIT_DIR", "GIT_CONFIG_COUNT"];
+				for (const rule of [
+					{ match: raw, approval: "allow" },
+					{ match: raw, approval: "allow", captainException: "captain-addition:wrong-id" },
+					{ match: raw, approval: "allow", captainException: exceptionId(`${raw}-other`) },
+					{ match: raw.replace("origin prod", "origin production"), approval: "allow",
+						captainException: exceptionId(raw) },
+					{ match: `git -C ${feature} push origin *`, approval: "allow",
+						captainException: exceptionId(`git -C ${feature} push origin *`) },
+				]) {
+					const rules = [rule];
+					const bash = createBashTool({
+						"bash.allowCompoundCommands": true,
+						"bash.allowedEnvVars": allowedEnvVars,
+						"bash.patterns": rules,
+					});
+					const testedCommand = rule.match.endsWith("production")
+						? command.replace("origin prod", "origin production") : command;
+					const baseline = createBashTool({
+						"bash.allowCompoundCommands": true,
+						"bash.patterns": [{ match: rule.match, approval: "allow" }],
+					});
+					expect(resolveApproval(bash, { command: testedCommand, cwd }, mode).policy, rule.match)
+						.toBe(resolveApproval(baseline, { command: testedCommand, cwd }, mode).policy);
+					if (!rule.match.includes("*")) {
+						expect(resolveApproval(bash, { command: testedCommand, cwd }, mode).policy, rule.match)
+							.toBe(mode === "write" ? "prompt" : "allow");
+					}
+					expect(getBashApprovalOverrideClasses(testedCommand, rules, allowedEnvVars, cwd), rule.match)
+						.not.toContain("captain-scoped-exception");
+				}
+				// Whitespace is normalized for the identifier, not expanded into new argv scope.
+				const reviewed = { match: `  ${raw.replace(" push ", "\tpush  ")}  `, approval: "allow",
+					captainException: exceptionId(raw) };
+				const rules = [reviewed];
+				const bash = createBashTool({
+					"bash.allowCompoundCommands": true,
+					"bash.allowedEnvVars": allowedEnvVars,
+					"bash.patterns": rules,
+				});
+				expect(resolveApproval(bash, { command: raw, cwd }, mode).policy).toBe("allow");
+				expect(getBashApprovalOverrideClasses(raw, rules, allowedEnvVars, cwd)).toEqual([]);
+				expect(resolveApproval(bash, { command, cwd }, mode).policy).toBe("allow");
+				expect(getBashApprovalOverrideClasses(command, rules, allowedEnvVars, cwd))
+					.toContain("captain-scoped-exception");
+				const normalizedAlias = command.replace("git -C", "git --no-pager -C");
+				expect(resolveApproval(bash, { command: normalizedAlias, cwd }, mode))
+					.toMatchObject({ tier: "exec", policy: mode === "write" ? "prompt" : "allow" });
+				expect(getBashApprovalOverrideClasses(normalizedAlias, rules, allowedEnvVars, cwd))
+					.not.toContain("captain-scoped-exception");
+				for (const guarded of [
+					`cd ${feature} && GIT_CONFIG_COUNT=0 ${raw}`,
+					`cd ${feature} && GIT_DIR=${cwd}/.git ${raw}`,
+					`{ ${command}; }`,
+					`cd ${feature} && command ${raw}`,
+				]) {
+					expect(resolveApproval(bash, { command: guarded, cwd }, mode).policy, guarded).toBe("prompt");
+					expect(getBashApprovalOverrideClasses(guarded, rules, allowedEnvVars, cwd), guarded)
+						.not.toContain("captain-scoped-exception");
+				}
+				const opaqueNeighbor = `${raw} && echo "$(printf -- --repo)"`;
+				const fallbackRules = [reviewed, { match: "git -C * push *--repo*", approval: "prompt" }];
+				const fallbackBash = createBashTool({
+					"bash.allowCompoundCommands": true, "bash.patterns": fallbackRules,
+				});
+				expect(resolveApproval(fallbackBash, { command: opaqueNeighbor, cwd }, mode).policy)
+					.toBe(mode === "write" ? "prompt" : "allow");
+				expect(getBashApprovalOverrideClasses(opaqueNeighbor, fallbackRules, [], cwd))
+					.toContain("captain-scoped-exception");
+				for (const rule of [
+					{ match: raw, approval: "allow" },
+					{ match: raw, approval: "allow", captainException: exceptionId(`${raw}-other`) },
+				]) {
+					const unreviewedRules = [rule, fallbackRules[1]];
+					const unreviewedBash = createBashTool({
+						"bash.allowCompoundCommands": true, "bash.patterns": unreviewedRules,
+					});
+					expect(resolveApproval(unreviewedBash, { command: opaqueNeighbor, cwd }, mode).policy)
+						.toBe("prompt");
+					expect(getBashApprovalOverrideClasses(opaqueNeighbor, unreviewedRules, [], cwd))
+						.not.toContain("captain-scoped-exception");
+				}
 			});
 		});
 
@@ -1245,12 +1482,17 @@ describe("argv-aware bash approval regressions", () => {
 			const missing = path.join(root, "missing-repo");
 			expect(policy(`git -C ${missing} config --get remote.origin.url`, repo)).toBe("allow");
 			expect(policy(`git -C ${missing} push`, repo)).toBe("prompt");
-			const literalCommand = `git -C ${missing} push --force origin feature/recovery`;
+			const literalCommand = `git -C ${missing} push --force origin feature/recovery:refs/heads/feature/recovery`;
 			const literalPolicy = createBashTool({
 				"bash.allowCompoundCommands": true,
 				"bash.patterns": [{ match: literalCommand, approval: "allow" }, ...patterns],
 			});
 			expect(resolveApproval(literalPolicy, { command: literalCommand }, "yolo").policy).toBe("allow");
+			const unqualified = `git -C ${missing} push --force origin feature/recovery`;
+			const unqualifiedPolicy = createBashTool({
+				"bash.patterns": [{ match: unqualified, approval: "allow" }, ...patterns],
+			});
+			expect(resolveApproval(unqualifiedPolicy, { command: unqualified }, "yolo").policy).toBe("prompt");
 			git(["config", "branch.feature-review.merge", "refs/heads/main"], repo);
 			git(["config", "push.default", "upstream"], repo);
 			for (const command of ["git push --force-with-lease", "git push"]) {
@@ -1338,9 +1580,9 @@ describe("argv-aware bash approval regressions", () => {
 			});
 			const normalizedScopedCommand = `git --no-pager -C ${repo} push origin main`;
 			expect(resolveApproval(normalizedScopedTool, { command: normalizedScopedCommand, cwd: repo }, "yolo").policy)
-				.toBe("allow");
+				.toBe("prompt");
 			expect(getBashApprovalOverrideClasses(normalizedScopedCommand, normalizedScopedRules, scopedEnvVars, repo))
-				.toContain("captain-scoped-exception");
+				.not.toContain("captain-scoped-exception");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -1787,7 +2029,12 @@ describe("tool-owned dynamic approval declarations", () => {
 			expect(typeof decision === "object" ? decision.policy : undefined).not.toBe("allow");
 		}
 		for (const command of ["/usr/bin/git status", '"git" status']) {
-			expect(bashApproval(command, settingsOverrides)).toMatchObject({ policy: "allow" });
+			expect(bashApproval(command, settingsOverrides)).toBe("exec");
+			const bash = createBashTool(settingsOverrides);
+			for (const mode of ["yolo", "write"] as const) {
+				expect(resolveApproval(bash, { command }, mode))
+					.toMatchObject({ tier: "exec", policy: mode === "write" ? "prompt" : "allow" });
+			}
 		}
 
 		for (const command of ["git status", "git status --short", "git  status", "git\tstatus"]) {
