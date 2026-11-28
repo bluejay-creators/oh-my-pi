@@ -1,3 +1,5 @@
+import { unwrapOrdinaryApprovalEnv } from "./bash-env-wrapper";
+
 /**
  * Conservative shell command tokenizer shared by the bash approval-pattern
  * matcher, the gh-cache invalidator, and the session anonymizer.
@@ -409,12 +411,13 @@ function extractStrictLiteralShellSegments(
 		if (executable.length === 0) return false;
 		const commandName = executable.slice(Math.max(executable.lastIndexOf("/"), executable.lastIndexOf("\\")) + 1);
 		const commandArguments = argv.slice(commandIndex + 1);
+		const ordinaryEnv = simpleApproval && commandIndex === 0 && !!unwrapOrdinaryApprovalEnv(argv);
 		if (
-			argv.slice(commandIndex).some(argument => SHELL_ASSIGNMENT.test(argument)) ||
+			(!ordinaryEnv && argv.slice(commandIndex).some(argument => SHELL_ASSIGNMENT.test(argument))) ||
 			(commandArguments.some(argument => SHELL_REINTERPRET_OPTION.test(argument)) &&
 				commandArguments.some(hasBashApprovalShellControlChar)) ||
-			(SHELL_STATEFUL_COMMANDS.has(commandName) && !(simpleApproval && executable === "cd")) ||
-			Object.hasOwn(SHELL_INTERPRETER_COMMANDS, commandName)
+			(SHELL_STATEFUL_COMMANDS.has(commandName) && !ordinaryEnv && !(simpleApproval && executable === "cd")) ||
+			(Object.hasOwn(SHELL_INTERPRETER_COMMANDS, commandName) && !ordinaryEnv)
 		) {
 			return false;
 		}
@@ -826,12 +829,13 @@ function parseApprovalShellSegment(
 		!unknownArgv.includes(commandIndex + 1);
 	const safeSet = executable === "set" && unknownArgv.length === 0 && commandIndex === 0 &&
 		/^(?:(?:-[eu]+)(?: |$)|-[eu]*o pipefail(?: |$))+$/u.test(argv.slice(1).join(" "));
+	const ordinaryEnv = commandIndex === 0 && !!unwrapOrdinaryApprovalEnv(argv, unknownArgv);
 	const scopedShellState = argv.slice(0, commandIndex).some(word =>
 		/^(?:PATH|FPATH|IFS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|CDPATH|GLOBIGNORE|path|fpath|commands|functions|builtins)=/u.test(word));
 	const changesCwd = executable === "cd";
 	const stateful = !executable || unknownArgv.includes(commandIndex) || scopedShellState ||
-		(SHELL_STATEFUL_COMMANDS.has(executable) && !safePrintf && !safeSet && !changesCwd) ||
-		Object.hasOwn(SHELL_INTERPRETER_COMMANDS, executable);
+		(SHELL_STATEFUL_COMMANDS.has(executable) && !ordinaryEnv && !safePrintf && !safeSet && !changesCwd) ||
+		(Object.hasOwn(SHELL_INTERPRETER_COMMANDS, executable) && !ordinaryEnv);
 	// Preserve assignment syntax for the strict parser, but quote every literal argument.
 	const quoted = argv.map((word, index) => {
 		if (index < commandIndex) {
@@ -841,7 +845,7 @@ function parseApprovalShellSegment(
 		return `'${((safePrintf || safeSet) && index === commandIndex ? "echo" : word).replaceAll("'", "'\\''")}'`;
 	}).join(" ");
 	const literal = stateful || expansionSensitive || unknownArgv.length > 0 || expanded
-		? null : parseLiteralShellCommandSegment(quoted);
+		? null : ordinaryEnv ? extractSimpleApprovalShellSegments(quoted)?.[0] ?? null : parseLiteralShellCommandSegment(quoted);
 	if (literal) {
 		literal.text = text;
 		literal.argv = argv;

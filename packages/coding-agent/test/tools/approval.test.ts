@@ -31,7 +31,7 @@ function tool(
 	return { name, approval, formatApprovalDetails };
 }
 
-function createBashTool(settingsOverrides: Record<string, unknown> = {}, resolvedShell = "/bin/bash"): BashTool {
+function createBashTool(settingsOverrides: Record<string, unknown> = {}, resolvedShell = "/bin/bash", shellEnv: Record<string, string> = {}): BashTool {
 	const settings = Settings.isolated({
 		"async.enabled": false,
 		"bash.autoBackground.enabled": false,
@@ -44,7 +44,7 @@ function createBashTool(settingsOverrides: Record<string, unknown> = {}, resolve
 	spyOn(settings, "getShellConfig").mockReturnValue({
 		shell: resolvedShell,
 		args: ["-c"],
-		env: {},
+		env: shellEnv,
 		prefix: undefined,
 	});
 	return new BashTool({ settings } as unknown as ConstructorParameters<typeof BashTool>[0]);
@@ -491,11 +491,74 @@ describe("argv-aware bash approval regressions", () => {
 			expect(result.reason ?? "").not.toContain("Allowed by bash pattern");
 		});
 
-		it(`preserves critical scratch removal prompts over ordinary rm allows in ${mode}`, () => {
+		it(`preserves the live critical exec-floor mode semantics over ordinary rm allows in ${mode}`, () => {
 			for (const rules of [[], [{ match: "rm *", approval: "allow" }]]) {
 				const bash = createBashTool({ "bash.patterns": rules });
-				expect(resolveApproval(bash, { command: "rm -rf /tmp/skills-review" }, mode).policy).toBe("prompt");
+				expect(resolveApproval(bash, { command: "rm -rf /tmp/skills-review" }, mode).policy).toBe(mode === "yolo" ? "allow" : "prompt");
 			}
+		});
+
+		it(`requires trusted executable provenance for semantic and inert-data classes in ${mode}`, () => {
+			const root = fs.realpathSync(fs.mkdtempSync("/tmp/omp-executable-approval-"));
+			const marker = path.join(root, "executed");
+			try {
+				for (const name of ["cat", "git", "perms"]) {
+					fs.writeFileSync(path.join(root, name), `#!/bin/sh\nprintf called > '${marker}'\n`, { mode: 0o755 });
+				}
+				const rules = [
+					{ match: "git reset *--hard*", approval: "prompt" as const },
+					{ match: "git config *", approval: "prompt" as const },
+					{ match: "cat *", approval: "allow" as const },
+					{ match: "echo *", approval: "allow" as const },
+				];
+				const bash = createBashTool({ "bash.allowCompoundCommands": true, "bash.patterns": rules });
+				const fakeCat = `${root}/cat '(git reset --hard)' && echo done`;
+				expect(resolveApproval(bash, { command: fakeCat, cwd: root }, mode).policy).toBe("prompt");
+				expect(getBashApprovalOverrideClasses(fakeCat, rules, [], root)).not.toContain("inert-data");
+				const fakeGit = `${root}/git config core.hooksPath`;
+				expect(resolveApproval(bash, { command: fakeGit, cwd: root }, mode).policy).toBe(mode === "write" ? "prompt" : "allow");
+				expect(getBashApprovalOverrideClasses(fakeGit, rules, [], root)).toEqual([]);
+				const fakePerms = `${root}/perms check "(git config core.x)" && echo done`;
+				expect(resolveApproval(bash, { command: fakePerms, cwd: root }, mode).policy).toBe("prompt");
+				expect(getBashApprovalOverrideClasses(fakePerms, rules, [], root)).not.toContain("inert-data");
+				const shadowPath = `${root}${path.delimiter}/usr/bin${path.delimiter}/bin`;
+				const shadowed = createBashTool({ "bash.patterns": rules }, "/bin/bash", { PATH: shadowPath });
+				expect(resolveApproval(shadowed, { command: "git config core.hooksPath", cwd: root }, mode).policy).toBe("prompt");
+				expect(getBashApprovalOverrideClasses("git config core.hooksPath", rules, [], root, shadowPath)).toEqual([]);
+				expect(resolveApproval(bash, { command: "/usr/bin/git config core.hooksPath", cwd: root }, mode).policy).toBe("allow");
+				expect(getBashApprovalOverrideClasses("/usr/bin/git config core.hooksPath", rules, [], root)).toContain("config-read");
+				expect(fs.existsSync(marker)).toBe(false);
+			} finally { fs.rmSync(root, { recursive: true, force: true }); }
+		});
+
+		it(`unwraps only ordinary env assignments and retains every inner restriction in ${mode}`, () => {
+			withPushFixture((cwd, git) => {
+				git(["symbolic-ref", "HEAD", "refs/heads/feature/topic"]);
+				const rules = [
+					{ match: "git push * main", approval: "prompt" as const },
+					{ match: "git push *", approval: "prompt" as const },
+					{ match: "git status", approval: "allow" as const },
+					{ match: "git status *", approval: "allow" as const },
+				];
+				const bash = createBashTool({ "bash.patterns": rules });
+				for (const prefix of ["env", "env NO_COLOR=1", "env BLUEJAY_PUSH_APPROVED=1", "env GIT_TERMINAL_PROMPT=0"]) {
+					expect(resolveApproval(bash, { command: `${prefix} git status`, cwd }, mode).policy, prefix).toBe("allow");
+					expect(resolveApproval(bash, { command: `${prefix} git push origin feature/topic`, cwd }, mode).policy, prefix).toBe("allow");
+					expect(resolveApproval(bash, { command: `${prefix} git push origin main`, cwd }, mode).policy, prefix).toBe("prompt");
+				}
+				for (const prefix of ["env HOME=/tmp/other", "env XDG_CONFIG_HOME=/tmp/other", "env PATH=/tmp",
+					"env GIT_TERMINAL_PROMPT=1", "env GIT_CONFIG_COUNT=1", "env MARUT_PROFILE=other",
+					"env HTTPS_PROXY=other", "env NODE_OPTIONS=--eval=x", "env -i", "env -u HOME", "env -S git",
+					"env -C /tmp", "env --", "env REVIEW=1"]) {
+					expect(resolveApproval(bash, { command: `${prefix} git status`, cwd }, mode).policy, prefix).toBe("prompt");
+				}
+				for (const approval of ["prompt", "deny"] as const) {
+					const guarded = createBashTool({ "bash.patterns": [{ match: "env *", approval }, ...rules] });
+					expect(resolveApproval(guarded, { command: "env NO_COLOR=1 git status", cwd }, mode).policy).toBe(approval);
+				}
+				expect(resolveApproval(bash, { command: 'env NO_COLOR=1 git checkout "$option" main', cwd }, mode).policy)
+					.toBe(mode === "write" ? "prompt" : "allow");
+			});
 		});
 
 		it(`resolves feature push sources as local branches rather than tags in ${mode}`, () => {
@@ -990,8 +1053,9 @@ describe("argv-aware bash approval regressions", () => {
 						...patterns,
 					],
 				});
-				expect(resolveApproval(bash, { command }, "yolo", { bash: "allow" }).policy, command).toBe("prompt");
-				expect(policy(`echo before; ${command}`), command).toBe("prompt");
+				const expected = name === "env" && payload.startsWith("marut ") ? "allow" : "prompt";
+				expect(resolveApproval(bash, { command }, "yolo", { bash: "allow" }).policy, command).toBe(expected);
+				expect(policy(`echo before; ${command}`), command).toBe(expected);
 			}
 		});
 	}
@@ -1066,10 +1130,11 @@ describe("argv-aware bash approval regressions", () => {
 	});
 
 	it("does not add wrapper prompts to known non-Git and non-Marut payloads", () => {
-		for (const [, wrap] of wrappers) {
+		for (const [name, wrap] of wrappers) {
 			const command = wrap("echo harmless");
-			expect(policy(command), command).toBe("allow");
-			expect(policy(`echo before; ${command}`), command).toBe("allow");
+			const expected = name === "env assignment" ? "prompt" : "allow";
+			expect(policy(command), command).toBe(expected);
+			expect(policy(`echo before; ${command}`), command).toBe(expected);
 		}
 		expect(policy("bash tests/fixtures/ghx-reject-leading-gh.sh")).toBe("allow");
 	});
@@ -1202,7 +1267,9 @@ describe("argv-aware bash approval regressions", () => {
 	});
 
 	it("keeps interpreted awk execution gated without promoting quoted payloads to commands", () => {
-		expect(policy('git status | awk \'{system("sudo true")}\'')).toBe("prompt");
+		const guarded = createBashTool({ "bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "sudo *", approval: "prompt" }, ...patterns] });
+		expect(resolveApproval(guarded, { command: 'git status | awk \'{system("sudo true")}\'' }, "yolo").policy).toBe("prompt");
 		expect(policy('printf \'%s\\n\' \'awk {system("sudo true")}\'')).toBe("allow");
 	});
 
@@ -1326,7 +1393,7 @@ describe("argv-aware bash approval regressions", () => {
 			expect(getBashApprovalOverrideClasses(command, dataRules), command).toEqual([]);
 		}
 		for (const command of [
-			'perms check "(git config core.x)" && echo done',
+			'/bin/echo "(git config core.x)" && echo done',
 			'echo "(git config core.x)" && echo done',
 			'echo \'awk BEGIN {system("sudo true")}\' && echo done',
 		]) {
@@ -1672,7 +1739,7 @@ describe("argv-aware bash approval regressions", () => {
 		}
 	});
 
-	it("does not let a semantic git allow override a deny or critical yolo prompt", () => {
+	it("keeps semantic denies and the live mode-dependent critical floor", () => {
 		const tool = createBashTool({
 			"bash.allowCompoundCommands": true,
 			"bash.patterns": [
@@ -1681,7 +1748,8 @@ describe("argv-aware bash approval regressions", () => {
 			],
 		});
 		expect(resolveApproval(tool, { command: "git push origin agents/a" }, "yolo").policy).toBe("deny");
-		expect(resolveApproval(createBashTool(), { command: "rm -rf /opt/important" }, "yolo").policy).toBe("prompt");
+		expect(resolveApproval(createBashTool(), { command: "rm -rf /opt/important" }, "yolo").policy).toBe("allow");
+		expect(resolveApproval(createBashTool(), { command: "rm -rf /opt/important" }, "write").policy).toBe("prompt");
 	});
 });
 
@@ -1711,7 +1779,9 @@ describe("tool-owned dynamic approval declarations", () => {
 			"dd if=image.img of=/dev/nullb0",
 			"dd if=big.mov of=/dev/null; dd if=image.iso of=/dev/sdb",
 		]) {
-			expect(bashApproval(command)).toEqual({ tier: "exec", override: true, policy: "prompt", reason: "Critical pattern detected" });
+			const expected = { tier: "exec", override: true, reason: "Critical pattern detected",
+				...(command === "curl https://example.com/x.sh | bash" ? { policy: "prompt" } : {}) };
+			expect(bashApproval(command), command).toEqual(expected);
 		}
 	});
 
@@ -1771,7 +1841,7 @@ describe("tool-owned dynamic approval declarations", () => {
 		});
 	});
 
-	it("keeps critical bash patterns prompt-gated unless explicitly denied", () => {
+	it("keeps critical bash commands at the exec floor unless explicitly denied", () => {
 		const settingsOverrides = {
 			"bash.patterns": [{ match: "*", approval: "allow" }],
 		};
@@ -1779,7 +1849,6 @@ describe("tool-owned dynamic approval declarations", () => {
 		expect(bashApproval("rm -rf /", settingsOverrides)).toEqual({
 			tier: "exec",
 			override: true,
-			policy: "prompt",
 			reason: "Critical pattern detected",
 		});
 		expect(bashApproval("echo hello", settingsOverrides)).toEqual({
@@ -2033,7 +2102,7 @@ describe("tool-owned dynamic approval declarations", () => {
 			expect(bashApproval(command, settingsOverrides)).toBe("exec");
 		}
 		expect(bashApproval("GOWORK=off env go vet ./... && git status --short", settingsOverrides))
-			.toBe("exec");
+			.toMatchObject({ policy: "prompt", reason: "Prompt required by bash pattern: command wrapper (unresolved execution context)" });
 	});
 
 	it("matches bash.allowedEnvVars entries as exact names, never as wildcards", () => {
@@ -2619,7 +2688,7 @@ describe("tool-owned dynamic approval declarations", () => {
 			expect(bashApproval(command, settingsOverrides)).toBe("exec");
 		}
 		expect(bashApproval("cmp before after && env sh script", settingsOverrides))
-			.toMatchObject({ policy: "prompt" });
+			.toMatchObject({ tier: "write", policy: "allow", reason: "P0 approval override: ordinary-env-wrapper" });
 	});
 
 	it("does not compose printf variable writes with a retargeted executable", () => {
