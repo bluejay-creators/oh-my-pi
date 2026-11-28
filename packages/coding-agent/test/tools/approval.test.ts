@@ -704,7 +704,7 @@ describe("argv-aware bash approval regressions", () => {
 				git(["update-ref", "refs/remotes/origin/feature/disguised", oid]);
 				expect(git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"]))
 					.toBe("origin/feature/disguised");
-				const rules = [{ match: "git push *", approval: "prompt" }];
+				const rules = [{ match: "git push *", approval: "prompt" }] as const;
 				const bash = createBashTool({ "bash.patterns": rules });
 				for (const command of ["git push", "git push --force-with-lease"]) {
 					expect(resolveApproval(bash, { command, cwd }, mode).policy).toBe("prompt");
@@ -774,8 +774,8 @@ describe("argv-aware bash approval regressions", () => {
 
 		it(`does not classify write or executable Git options as inert read data in ${mode}`, () => {
 			withPushFixture(cwd => {
-				const rules = [{ match: "git -C * config", approval: "prompt" },
-					...["diff", "log", "show", "format-patch"].map(command => ({ match: `git ${command} *`, approval: "allow" }))];
+				const rules = [{ match: "git -C * config", approval: "prompt" as const },
+					...["diff", "log", "show", "format-patch"].map(command => ({ match: `git ${command} *`, approval: "allow" as const }))];
 				const bash = createBashTool({ "bash.patterns": rules });
 				for (const args of [
 					"diff --output=/tmp/approval-output", "diff --output /tmp/approval-output",
@@ -806,7 +806,7 @@ describe("argv-aware bash approval regressions", () => {
 					{ match: "git worktree remove *", approval: "prompt" },
 					{ match: "echo legacy-allowed", approval: "allow" },
 					{ match: "git status *", approval: "allow" },
-				];
+				] as const;
 				const bash = createBashTool({
 					"bash.allowCompoundCommands": true, "bash.patterns": rules,
 				});
@@ -839,7 +839,7 @@ describe("argv-aware bash approval regressions", () => {
 		it(`does not expand untagged raw captain rules through normalized argv in ${mode}`, () => {
 			withPushFixture(cwd => {
 				const raw = `git -C ${cwd} branch -D topic`;
-				const rules = [{ match: raw, approval: "allow" }];
+				const rules = [{ match: raw, approval: "allow" }] as const;
 				const bash = createBashTool({ "bash.patterns": rules });
 				expect(resolveApproval(bash, { command: raw, cwd }, mode).policy).toBe("allow");
 				expect(getBashApprovalOverrideClasses(raw, rules, [], cwd)).toEqual([]);
@@ -868,7 +868,7 @@ describe("argv-aware bash approval regressions", () => {
 						captainException: exceptionId(raw) },
 					{ match: `git -C ${feature} push origin *`, approval: "allow",
 						captainException: exceptionId(`git -C ${feature} push origin *`) },
-				]) {
+				] as const) {
 					const rules = [rule];
 					const bash = createBashTool({
 						"bash.allowCompoundCommands": true,
@@ -892,7 +892,7 @@ describe("argv-aware bash approval regressions", () => {
 				}
 				// Whitespace is normalized for the identifier, not expanded into new argv scope.
 				const reviewed = { match: `  ${raw.replace(" push ", "\tpush  ")}  `, approval: "allow",
-					captainException: exceptionId(raw) };
+					captainException: exceptionId(raw) } as const;
 				const rules = [reviewed];
 				const bash = createBashTool({
 					"bash.allowCompoundCommands": true,
@@ -920,7 +920,7 @@ describe("argv-aware bash approval regressions", () => {
 						.not.toContain("captain-scoped-exception");
 				}
 				const opaqueNeighbor = `${raw} && echo "$(printf -- --repo)"`;
-				const fallbackRules = [reviewed, { match: "git -C * push *--repo*", approval: "prompt" }];
+				const fallbackRules = [reviewed, { match: "git -C * push *--repo*", approval: "prompt" }] as const;
 				const fallbackBash = createBashTool({
 					"bash.allowCompoundCommands": true, "bash.patterns": fallbackRules,
 				});
@@ -931,7 +931,7 @@ describe("argv-aware bash approval regressions", () => {
 				for (const rule of [
 					{ match: raw, approval: "allow" },
 					{ match: raw, approval: "allow", captainException: exceptionId(`${raw}-other`) },
-				]) {
+				] as const) {
 					const unreviewedRules = [rule, fallbackRules[1]];
 					const unreviewedBash = createBashTool({
 						"bash.allowCompoundCommands": true, "bash.patterns": unreviewedRules,
@@ -1712,8 +1712,8 @@ describe("argv-aware bash approval regressions", () => {
 			]) expect(resolveApproval(captainTool, { command, cwd: repo }, "yolo").policy).toBe("allow");
 			const scopedCommand = "git -C /Users/jubin/agent-work push origin main";
 			const scopedRules = [
-				{ match: scopedCommand, approval: "allow" },
-				{ match: `git -C ${repo} push origin main`, approval: "allow" },
+				{ match: scopedCommand, approval: "allow" as const },
+				{ match: `git -C ${repo} push origin main`, approval: "allow" as const },
 				...patterns,
 			];
 			const scopedEnvVars = [
@@ -1758,7 +1758,7 @@ describe("argv-aware bash approval regressions", () => {
 			}
 			const normalizedScopedRules = [
 				...scopedRules.slice(0, 2),
-				{ match: "git -* push *", approval: "prompt" },
+				{ match: "git -* push *", approval: "prompt" as const },
 				...patterns,
 			];
 			const normalizedScopedTool = createBashTool({
@@ -1816,8 +1816,8 @@ describe("tool-owned dynamic approval declarations", () => {
 			"dd if=image.img of=/dev/nullb0",
 			"dd if=big.mov of=/dev/null; dd if=image.iso of=/dev/sdb",
 		]) {
-			const expected = { tier: "exec", override: true, reason: "Critical pattern detected",
-				...(command === "curl https://example.com/x.sh | bash" ? { policy: "prompt" } : {}) };
+			const expected = { tier: "exec" as const, override: true, reason: "Critical pattern detected",
+				...(command === "curl https://example.com/x.sh | bash" ? { policy: "prompt" as const } : {}) };
 			expect(bashApproval(command), command).toEqual(expected);
 		}
 	});

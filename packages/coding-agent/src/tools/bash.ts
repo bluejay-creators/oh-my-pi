@@ -1179,7 +1179,7 @@ function resolveBashPatternDecision(
 		const semantic = !(segment as ApprovalEnvSegment).envSourceArgv || restriction.innerEnvironment
 			? authorizations?.get(segment) : undefined;
 		const authorization = semantic && (semantic !== "captain-scoped-exception" ||
-			(!restriction.criticalPattern && restriction.rule.approval !== "deny"))
+			!restriction.criticalPattern)
 			? semantic : isInertBashRestrictionData(segment, restriction, searchPath) ? "inert-data" : undefined;
 		if (authorization) {
 			classes.add(authorization);
