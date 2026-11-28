@@ -349,6 +349,29 @@ export const cfgToolsApprovalMode = register({
 	},
 });
 
+/** Seconds an interactive tool approval may wait; zero preserves an unlimited wait. */
+export const cfgToolsApprovalTimeout = register({
+	id: "tools.approvalTimeout",
+	type: "number",
+	default: 0,
+	ui: {
+		tab: "interaction",
+		group: "Approvals",
+		label: "Tool Approval Timeout",
+		description: "Seconds before unanswered tool approvals are denied and the turn is steered (0 = no deadline).",
+		options: [
+			{ value: "0", label: "No deadline" },
+			{ value: "120", label: "2 minutes" },
+			{ value: "300", label: "5 minutes" },
+		],
+	},
+	validate: raw => {
+		if (raw !== undefined && (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0 || raw > 2_147_483.647)) {
+			throw new Error("tools.approvalTimeout must be seconds between 0 and 2147483.647");
+		}
+	},
+});
+
 // Folders where every action asks, in every approval mode and whatever was remembered.
 export const cfgToolsRestrictedFolders = register({
 	id: "tools.restrictedFolders",

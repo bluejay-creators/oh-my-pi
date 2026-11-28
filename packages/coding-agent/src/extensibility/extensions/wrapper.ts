@@ -22,6 +22,7 @@ import {
 	resolveApproval,
 	resolveApprovalFromContext,
 	sessionApprovalScope,
+	ToolApprovalTimeoutError,
 	truncateForPrompt,
 } from "../../tools/approval";
 import { getApprovalGrants } from "../../tools/approval-cache";
@@ -512,9 +513,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, answer);
 				}
 			} catch (err) {
-				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
+				const error =
+					err instanceof ToolApprovalTimeoutError
+						? new ToolApprovalTimeoutError(
+								`${err.details}\nApproval required by: ${
+									approvalCheck.reason ?? `${resolved.source} policy (${approvalMode} mode)`
+								}${safetyAppendix.length ? `\n${safetyAppendix.join("\n")}` : ""}`,
+							)
+						: err;
+				await emitApprovalResolved(false, error instanceof Error ? error.message : "approval aborted");
 				cancelPreflight();
-				throw err;
+				throw error;
 			}
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
 			if (!approved) {

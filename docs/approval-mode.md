@@ -148,6 +148,21 @@ In the interactive UI the prompt docks above the composer until answered with a 
 
 An Ask and remember prompt with grants lists the **Remember across sessions** toggle and the grant choices above **Approve Once**, which is highlighted on mount. `Enter` on the toggle flips it, and the grant labels switch to their **Always …** forms. `Ctrl+Enter` still approves only this call.
 
+### Unanswered approvals
+
+`tools.approvalTimeout` sets an interactive approval deadline in seconds. It defaults to `0` (no deadline); leaving it unset also preserves the unlimited wait. For unattended fleet panes:
+
+```yaml
+tools:
+   approvalTimeout: 120
+```
+
+When an approval remains unanswered past its deadline, OMP submits this fixed steering message through the same path used when a user sends a message while approvals are pending:
+
+> Not approved in time. Do not work around it. Send Inbox a durable ask with the exact command and why, then continue other work.
+
+That message denies all pending approvals in the turn, including requests queued behind another dialog and later requests in the same tool batch. Each affected call reports an explicit approval timeout with its prompt and the policy or reason that required approval. Answering before the deadline behaves normally. Answering, aborting, switching sessions, and shutting down clear the timers. This setting applies to the interactive terminal/Tern approval controller (including collab answers); headless, RPC, ACP, and subagent approval behavior is unchanged.
+
 ## Defining approval on tools
 
 Built-in and custom tools share the same shape:
