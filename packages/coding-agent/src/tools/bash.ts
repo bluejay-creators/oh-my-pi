@@ -5,9 +5,14 @@ import {
 	formatExitCodeNotice,
 	WALL_TIME_NOTICE_MIN_MS,
 } from "./details/bash";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { GIT_PUSH_CONFIG_PATTERN, isGitPushBranchConfigSafe, parseGitPushConfig } from "./bash-git-push-config";
+import { isReadOnlyGitApprovalArgv } from "./bash-git-readonly";
+import { resolveTrustedApprovalExecutable } from "./bash-executable-trust";
+import { unwrapOrdinaryApprovalEnv } from "./bash-env-wrapper";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -77,7 +82,10 @@ import { resolveShellDirectory, resolveToCwd } from "./path-utils";
 import {
 	BASH_APPROVAL_SHELL_CONTROL_CHARS,
 	type ApprovalShellSegment,
+	type QuotedHeredocBody,
 	extractApprovalShellSegments,
+	extractLegacyApprovalShellSegments,
+	extractSimpleApprovalShellSegments,
 	extractAndChainSegments,
 	extractLeadingCdTarget,
 	isShellEnvironmentAssignment,
@@ -254,6 +262,36 @@ export const CRITICAL_BASH_PATTERNS = [
 	/\bnc\b[^|;]*\s-[a-zA-Z]*[ec][a-zA-Z]*\s/i, // `nc -e` / `nc -c`.
 ] as const;
 
+/** Absolute recursive removals remain critical, except literal temporary scratch. */
+function isCriticalBashCommand(command: string): boolean {
+	if (CRITICAL_BASH_PATTERNS.some((pattern, index) => index > 0 && pattern.test(command))) return true;
+	for (const argv of tokenizeShellSegments(command)) {
+		const executable = argv.findIndex(word => !isShellEnvironmentAssignment(word));
+		const program = path.basename(argv[executable] ?? "");
+		if (/^(?:awk|gawk|mawk|nawk)$/u.test(program) &&
+			argv.slice(executable + 1).some(arg => /\bsystem\s*\(/u.test(arg))) return true;
+		if (program !== "rm") continue;
+		let recursive = false;
+		let forced = false;
+		for (let index = executable + 1; index < argv.length && argv[index] !== "--"; index++) {
+			recursive ||= /^(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)$/u.test(argv[index]!);
+			forced ||= /^(?:-[a-zA-Z]*[fF][a-zA-Z]*|--force)$/u.test(argv[index]!);
+		}
+		let options = true;
+		for (const arg of argv.slice(executable + 1)) {
+			if (options && arg === "--") options = false;
+			else if (options && arg.startsWith("-")) continue;
+			else if (arg.startsWith("/") && (recursive || (forced && arg === "/"))) {
+				const target = arg.replace(/\/+$/u, "") || "/";
+				const scratch = /^(?:(?:\/private)?\/tmp\/|(?:\/private)?\/var\/folders\/)[^/]+\/?/u.test(target) &&
+					target.split("/").slice(1).every(part => part !== "." && part !== ".." && part !== "" && !/[*?[\]$`]/u.test(part));
+				if (!scratch) return true;
+			}
+		}
+	}
+	return false;
+}
+
 function normalizeBashApprovalPattern(value: string): string {
 	return value.trim().replace(/\s+/gu, " ");
 }
@@ -272,7 +310,7 @@ function normalizeBashPatternApproval(value: unknown): BashPatternApproval | und
 	return BASH_PATTERN_APPROVAL_VALUES.has(normalized) ? (normalized as BashPatternApproval) : undefined;
 }
 
-function normalizeBashAllowedEnvList(value: unknown): string[] {
+export function normalizeBashAllowedEnvList(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return value
 		.filter((entry): entry is string => typeof entry === "string")
@@ -280,7 +318,7 @@ function normalizeBashAllowedEnvList(value: unknown): string[] {
 		.filter(entry => entry.length > 0);
 }
 
-function getBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[] {
+export function getBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[] {
 	if (!Array.isArray(value)) return [];
 	return value
 		.map(item => {
@@ -291,9 +329,17 @@ function getBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[] 
 			const approval = normalizeBashPatternApproval(record.approval);
 			const env = normalizeBashAllowedEnvList(record.env);
 			if (match.length === 0 || !approval) return undefined;
-			return env.length > 0 ? { match, approval, env } : { match, approval };
+			const rule: BashApprovalPatternRule = env.length > 0 ? { match, approval, env } : { match, approval };
+			if (typeof record.captainException === "string") rule.captainException = record.captainException;
+			return rule;
 		})
 		.filter((rule): rule is BashApprovalPatternRule => !!rule);
+}
+
+/** The review manifest grants this exact spelling, never its normalized aliases. */
+function isCaptainBashException(rule: BashApprovalPatternRule): boolean {
+	return typeof rule.captainException === "string" && rule.approval === "allow" && !rule.match.includes("*") &&
+		rule.captainException === `captain-addition:${createHash("sha256").update(normalizeBashApprovalPattern(rule.match)).digest("hex")}`;
 }
 
 function commandMatchesBashApprovalPattern(command: string, pattern: string): boolean {
@@ -395,22 +441,39 @@ function findNonCompoundBashRestrictionRule(
 	return promptRule;
 }
 
-function findBashApprovalPatternRule(
+export function findBashApprovalPatternRule(
 	command: string,
 	rules: readonly BashApprovalPatternRule[],
-	allowedEnvVars: readonly string[],
+	allowedEnvVars: readonly string[] = [],
 ): BashApprovalPatternRule | undefined {
-	if (hasBashApprovalShellControl(command)) {
-		return findNonCompoundBashRestrictionRule(command, rules);
-	}
-	return rules.find(rule => bashApprovalRuleMatches(command, rule, allowedEnvVars));
+	const decision = resolveBashPatternDecision(command, extractApprovalShellSegments(command), rules, allowedEnvVars);
+	return decision.kind === "unmatched" ? undefined : decision.rule;
 }
 
-type BashPatternDecision =
+export type BashApprovalOverrideClass =
+	"inert-data" | "feature-push" | "config-read" | "scratch-worktree-remove" | "captain-scoped-exception";
+
+const NO_BASH_APPROVAL_OVERRIDES: readonly BashApprovalOverrideClass[] = [];
+
+type BashPatternDecision = (
 	| { kind: "deny"; rule: BashApprovalPatternRule }
 	| { kind: "prompt"; rule: BashApprovalPatternRule }
-	| { kind: "allow" }
-	| { kind: "unmatched" };
+	| { kind: "critical"; rule: BashApprovalPatternRule }
+	| { kind: "allow"; rule?: BashApprovalPatternRule }
+	| { kind: "unmatched" }
+) & { overrideClasses?: readonly BashApprovalOverrideClass[] };
+
+/** Actual authorization evidence, not a second heuristic inferred by replay tooling. */
+export function getBashApprovalOverrideClasses(
+	command: string,
+	rules: readonly BashApprovalPatternRule[],
+	allowedEnvVars: readonly string[] = [],
+	cwd?: string,
+	searchPath: string | undefined = process.env.PATH,
+): readonly BashApprovalOverrideClass[] {
+	return resolveBashPatternDecision(command, extractApprovalShellSegments(command), rules, allowedEnvVars, cwd, true, searchPath).overrideClasses ??
+		NO_BASH_APPROVAL_OVERRIDES;
+}
 
 /** One `bash.patterns` view: its rules plus the env names its `allow` rules may strip. */
 interface BashPatternPolicy {
@@ -418,52 +481,1025 @@ interface BashPatternPolicy {
 	allowedEnvVars: string[];
 }
 
+interface GitApprovalCommand {
+	argv: string[];
+	configArgv: string[];
+	executable: string;
+	searchPath: string | undefined;
+	directory: string | undefined;
+	configOverride: boolean;
+	repositoryOverride: boolean;
+	pathUncertain: boolean;
+	unknown: boolean;
+}
+
+interface ApprovalDirectory {
+	directory: string | undefined;
+	sawSymlink: boolean;
+	uncertain: boolean;
+}
+
+/**
+ * Inspect raw prefixes before normalization can erase a symlink followed by `..`.
+ * Keep uncertainty sticky across cd/-C: Bash logical cd and Git physical -C need
+ * not agree, so neither a later parent nor an absolute target can repair proof.
+ */
+function advanceApprovalDirectory(state: ApprovalDirectory, target: string): ApprovalDirectory {
+	let sawSymlink = state.sawSymlink;
+	let uncertain = state.uncertain;
+	if (!state.directory && !path.isAbsolute(target)) return { ...state, directory: undefined };
+	const raw = path.isAbsolute(target) ? target : `${state.directory}/${target}`;
+	const components = raw.split(path.sep);
+	let prefix = "";
+	try {
+		for (const component of components) {
+			if (!component) continue;
+			prefix += `${path.sep}${component}`;
+			if (fs.lstatSync(prefix).isSymbolicLink()) sawSymlink = true;
+		}
+		if (!fs.statSync(raw).isDirectory()) uncertain = true;
+	} catch (error) {
+		// A missing directory cannot execute Git, but must not manufacture a
+		// stricter literal-policy verdict. Parent traversal without proof is
+		// different: an unreadable prefix might conceal a symlink.
+		if (components.includes("..") || (error as NodeJS.ErrnoException).code !== "ENOENT") uncertain = true;
+	}
+	if (sawSymlink && components.includes("..")) uncertain = true;
+	return { directory: path.resolve(raw), sawSymlink, uncertain };
+}
+
+// These executables can select, rewrite, or interpret another command. Until
+// their option grammars and execution contexts are modeled, neither literal
+// payloads nor unknown argv may inherit Git's semantic approval exceptions.
+const BASH_APPROVAL_COMMAND_WRAPPERS: Record<string, true> = {
+	command: true, env: true, exec: true, xargs: true, nice: true,
+	timeout: true,
+	nohup: true, time: true, sudo: true, sh: true, bash: true,
+	zsh: true, ash: true, dash: true, ksh: true, eval: true,
+};
+
+const BASH_APPROVAL_CODE_INTERPRETERS = /^(?:awk|gawk|mawk|nawk|sed|gsed|perl|python(?:\d+(?:\.\d+)*)?|pypy(?:\d+)?|node|nodejs|bun|deno|ruby|lua|luajit|julia|osascript|find)$/u;
+
+/** Interpreter programs are executable payloads, never inert quoted arguments. */
+function requiresApprovalWrapperPrompt(argv: readonly string[], unknown: readonly number[] = []): boolean {
+	let index = 0;
+	while (isShellEnvironmentAssignment(argv[index] ?? "")) index++;
+	if (unknown.includes(index)) return true;
+	const executable = path.basename(argv[index++] ?? "");
+	if (!Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, executable)) return false;
+	if (/^(?:sh|bash|zsh|ash|dash|ksh)$/u.test(executable)) {
+		for (; index < argv.length; index++) {
+			const arg = argv[index]!;
+			if (unknown.includes(index)) return true;
+			if (arg === "--command" || /^-[^-]*c/u.test(arg)) {
+				const payload = argv[index + 1];
+				if (payload === undefined || unknown.includes(index + 1)) return true;
+				return approvalWrapperSourceNeedsPrompt(payload);
+			}
+			if (arg === "--") return index + 1 >= argv.length || unknown.includes(index + 1);
+			if (!arg.startsWith("-") && !arg.startsWith("+")) return false;
+			// Unmodeled interpreter options can change which argument is executable source.
+			if (!/^(?:-[lrxv]+|--noprofile|--norc)$/u.test(arg)) return true;
+		}
+		return true; // stdin is executable source, not a known script operand.
+	}
+	if (executable === "eval") {
+		if (unknown.some(position => position >= index)) return true;
+		return approvalWrapperSourceNeedsPrompt(argv.slice(index).join(" "));
+	}
+	for (; index < argv.length; index++) {
+		const arg = argv[index]!;
+		if (unknown.includes(index)) return true;
+		if (arg === "--") { index++; break; }
+		if (executable === "env" && isShellEnvironmentAssignment(arg)) continue;
+		if (!arg.startsWith("-")) break;
+		if ((executable === "command" && arg === "-p") ||
+			(executable === "env" && (arg === "-i" || arg === "--ignore-environment"))) continue;
+		return true;
+	}
+	if (executable === "timeout") {
+		if (unknown.includes(index) || !/^\d+(?:\.\d+)?[smhd]?$/u.test(argv[index++] ?? "")) return true;
+	}
+	if (index >= argv.length || unknown.includes(index)) return true;
+	const payload = path.basename(argv[index]!);
+	return payload === "git" || payload === "marut" || BASH_APPROVAL_CODE_INTERPRETERS.test(payload) ||
+		/^(?:sh|bash|zsh|ash|dash|ksh)$/u.test(payload) ||
+		requiresApprovalWrapperPrompt(argv.slice(index), unknown.filter(position => position >= index).map(position => position - index));
+}
+
+function approvalWrapperSourceNeedsPrompt(source: string): boolean {
+	const segments = extractApprovalShellSegments(source);
+	const simple = extractSimpleApprovalShellSegments(source);
+	if (!simple || !segments || simple.length !== segments.length) return true;
+	if (!segments?.length) return true;
+	return segments.some(segment => {
+		const argv = segment.argv ?? segment.literal?.argv;
+		if (!argv) return true;
+		if (!simple.some(candidate => candidate.text === segment.text &&
+			candidate.argv.length === argv.length && candidate.argv.every((arg, index) => arg === argv[index]))) return true;
+		let index = 0;
+		while (isShellEnvironmentAssignment(argv[index] ?? "")) index++;
+		const executable = path.basename(argv[index] ?? "");
+		return segment.shellStateUnknown || segment.unknownArgv?.includes(index) ||
+			executable === "git" || executable === "marut" ||
+			requiresApprovalWrapperPrompt(argv, segment.unknownArgv);
+	});
+}
+
+/** Skip Git's global options, not arbitrary options or path arguments after its subcommand. */
+function normalizeGitApprovalArgv(
+	argv: readonly string[],
+	unknown: readonly number[],
+	cwd: ApprovalDirectory,
+	searchPath: string | undefined = process.env.PATH,
+	trustedExecutable?: string,
+): GitApprovalCommand | undefined {
+	let start = 0;
+	while (isShellEnvironmentAssignment(argv[start] ?? "")) start++;
+	if (path.basename(argv[start] ?? "") !== "git") return undefined;
+	const executable = trustedExecutable ?? resolveTrustedApprovalExecutable(argv[start]!, searchPath, cwd.directory);
+	if (!executable) return undefined;
+	let location = cwd;
+	let configOverride = false;
+	let repositoryOverride = false;
+	const configArgv: string[] = [];
+	const result = (args: string[]): GitApprovalCommand => {
+		location = advanceApprovalDirectory(location, ".");
+		let directory: string | undefined;
+		if (!location.uncertain && location.directory) {
+			try {
+				directory = fs.realpathSync(location.directory);
+			} catch {
+				// No repository identity is available for an upstream lookup.
+				// Preserve plain rules unless traversal itself was uncertain.
+				directory = undefined;
+			}
+		}
+		return { argv: ["git", ...args], configArgv: ["git", ...configArgv, ...args], executable, searchPath,
+			directory, configOverride, repositoryOverride, pathUncertain: location.uncertain,
+			unknown: unknown.length > 0 };
+	};
+	let i = start + 1;
+	for (; i < argv.length; i++) {
+		const arg = argv[i]!;
+		if (/^(?:-[hv]|--help|--version|--exec-path|--html-path|--man-path|--info-path)$/u.test(arg) ||
+			arg.startsWith("--list-cmds=")) {
+			// Query/dispatch flags stop Git's global parsing. Do not reinterpret
+			// an ignored suffix as another command or grant it an operation exception.
+			if (i + 1 < argv.length) return undefined;
+			return result(argv.slice(i));
+		}
+		if (arg === "-C") {
+			const value = argv[++i];
+			if (value === undefined) return undefined;
+			location = unknown.includes(i)
+				? { ...location, directory: undefined, uncertain: true }
+				: advanceApprovalDirectory(location, value);
+		} else if (arg === "-c" || arg === "--config-env" || arg.startsWith("--config-env=")) {
+			configOverride = true;
+			if (arg === "-c" || arg === "--config-env") {
+				const value = argv[++i];
+				if (value === undefined) return undefined;
+				configArgv.push(arg, value);
+			} else configArgv.push("--config-env", arg.slice(13));
+		} else if (/^--(?:git-dir|work-tree|namespace|super-prefix|attr-source|shallow-file)$/u.test(arg)) {
+			if (argv[++i] === undefined) return undefined;
+			repositoryOverride = true;
+		} else if (/^--(?:git-dir|work-tree|namespace|super-prefix|attr-source)=/u.test(arg)) {
+			repositoryOverride = true;
+		} else if (arg.startsWith("--exec-path=")) {
+			configOverride = true;
+			repositoryOverride = true;
+			configArgv.push(arg);
+		} else if (arg === "--bare") {
+			repositoryOverride = true;
+		} else if (/^(?:-[pP]|--no-pager|--paginate|--no-optional-locks|--no-advice|--no-lazy-fetch|--literal-pathspecs|--no-literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-replace-objects)$/u.test(arg)) {
+			continue;
+		} else if (arg.startsWith("-")) return undefined;
+		else break;
+	}
+	if (unknown.includes(i)) return undefined;
+	return result(argv.slice(i));
+}
+
+// Approval is synchronous. Port the bounded, read-only Git query used by the
+// feature-push policy; never execute any text from the command being assessed.
+function approvalGitOutput(git: GitApprovalCommand, args: string[], rejectWarnings = false): string | undefined {
+	if (!git.directory) return undefined;
+	try {
+		const result = Bun.spawnSync({
+			cmd: [git.executable, "-C", git.directory, ...args],
+			stdin: "ignore", stdout: "pipe", stderr: rejectWarnings ? "pipe" : "ignore", timeout: 1000,
+			env: { ...Bun.env, PATH: git.searchPath, GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" },
+		});
+		return result.exitCode === 0 && (!rejectWarnings || !result.stderr?.length) ? result.stdout.toString().trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function approvalGitRefAbsent(git: GitApprovalCommand, ref: string): boolean {
+	if (!git.directory) return false;
+	try {
+		const result = Bun.spawnSync({
+			cmd: [git.executable, "-C", git.directory, "show-ref", "--verify", "--quiet", ref],
+			stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 1000,
+			env: { ...Bun.env, PATH: git.searchPath, GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" },
+		});
+		// Missing is distinct from an unreadable ref or failed Git invocation.
+		return result.exitCode === 1 && result.stderr.length === 0;
+	} catch {
+		return false;
+	}
+}
+
+function isProtectedPushRef(ref: string): boolean {
+	const branch = ref.replace(/^refs\/heads\//u, "");
+	return /^(?:main|master|trunk|staging|kstage|prod|production)$/u.test(branch) || branch.startsWith("release/");
+}
+
+function isFeaturePushRef(ref: string): boolean {
+	return ref.length > 0 && ref !== "HEAD" && !isProtectedPushRef(ref) &&
+		!ref.startsWith("refs/tags/") && !ref.startsWith("refs/remotes/") &&
+		(!ref.startsWith("refs/") || ref.startsWith("refs/heads/")) &&
+		!/[\s:$`*?[\]~^\\]|@\{|\.{2}/u.test(ref) && !ref.startsWith("+") && !ref.startsWith("-");
+}
+
+type FeaturePushAssessment = "safe" | "plain-policy" | "prompt";
+
+function assessFeaturePush(git: GitApprovalCommand): FeaturePushAssessment {
+	if (git.argv.some(arg => /^(?:--tags|--follow-tags|--mirror|--all)$/u.test(arg))) return "prompt";
+	if (git.configOverride || git.repositoryOverride || git.unknown || !git.directory) return "prompt";
+	const currentRef = approvalGitOutput(git, [
+		"rev-parse", "--verify", "--symbolic-full-name", "--end-of-options", "HEAD",
+	], true);
+	if (currentRef === undefined || currentRef !== "HEAD" && !currentRef.startsWith("refs/heads/")) return "prompt";
+	const currentBranch = currentRef === "HEAD" ? undefined : currentRef.slice(11);
+	const configOutput = approvalGitOutput(git, ["config", "--null", "--get-regexp", GIT_PUSH_CONFIG_PATTERN], true);
+	const config = configOutput === undefined ? undefined : parseGitPushConfig(configOutput);
+	if (!config || !isGitPushBranchConfigSafe(config, currentBranch)) return "prompt";
+	const positional: string[] = [];
+	let options = true;
+	let forced = false;
+	let semantic = true;
+	let unsupported = false;
+	for (const arg of git.argv.slice(2)) {
+		if (options && arg === "--") { options = false; continue; }
+		if (options && arg.startsWith("-")) {
+			if (/^--force-with-lease(?:=|$)/u.test(arg)) {
+				forced = true;
+				const lease = arg.split("=", 2)[1]?.split(":", 1)[0];
+				if (lease && !isFeaturePushRef(lease)) semantic = false;
+			} else if (/^(?:--force|--force-if-includes|-[uqvf]*f[uqvf]*)$/u.test(arg)) {
+				forced = true;
+				semantic = false;
+			} else if (!/^(?:-[uqv]+|--set-upstream|--quiet|--verbose|--porcelain|--dry-run|--atomic)$/u.test(arg)) {
+				unsupported = true;
+				semantic = false;
+			}
+		} else positional.push(arg);
+	}
+	if (unsupported) return forced || positional.some(arg => arg.startsWith("+")) ? "prompt" : "plain-policy";
+	const remote = positional.shift();
+	if (remote !== undefined && remote !== "origin") return "prompt";
+	const sourceBranch = (source: string): string | undefined => {
+		if (source === "HEAD") return currentBranch;
+		const name = source.replace(/^refs\/heads\//u, "");
+		if (!name || source.startsWith("refs/") && !source.startsWith("refs/heads/")) return undefined;
+		if (name === currentBranch) return name;
+		return approvalGitOutput(git, [
+			"-c", "core.warnAmbiguousRefs=true", "rev-parse", "--verify", "--symbolic-full-name", "--end-of-options", source,
+		], true) === `refs/heads/${name}` ? name : undefined;
+	};
+	const safeSourceBranch = (branch: string | undefined): boolean => {
+		const pushRemote = branch === undefined ? undefined : config.get(`branch.${branch}.pushremote`);
+		return pushRemote === undefined || pushRemote === "origin";
+	};
+	const hasOriginUpstream = (branch: string | undefined, destination: string): boolean =>
+		branch !== undefined && config.get(`branch.${branch}.remote`) === "origin" &&
+		config.get(`branch.${branch}.merge`) === `refs/heads/${destination.replace(/^refs\/heads\//u, "")}`;
+	const provesRefspec = (source: string, destination: string, branch: string | undefined): boolean => {
+		if (!isFeaturePushRef(destination)) return false;
+		const target = destination.replace(/^refs\/heads\//u, "");
+		const name = source === "HEAD" ? "HEAD" : source.replace(/^refs\/heads\//u, "");
+		if (source === "HEAD") {
+			if (approvalGitOutput(git, ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"], true) === undefined) return false;
+		} else if (branch === undefined) return false;
+		if (!approvalGitRefAbsent(git, `refs/tags/${name}`)) return false;
+		if (target !== name && !approvalGitRefAbsent(git, `refs/tags/${target}`)) return false;
+		return approvalGitOutput(git, ["check-ref-format", `refs/heads/${target}`]) !== undefined;
+	};
+	if (positional.length === 0) {
+		if (!currentBranch) return "prompt";
+		const branchRemote = config.get(`branch.${currentBranch}.remote`);
+		const effectiveRemote = remote ?? config.get(`branch.${currentBranch}.pushremote`) ??
+			config.get("remote.pushdefault") ?? branchRemote ?? "origin";
+		if (effectiveRemote !== "origin") return "prompt";
+		const pushDefault = config.get("push.default") ?? "simple";
+		const merge = config.get(`branch.${currentBranch}.merge`);
+		let destination = currentBranch;
+		if (pushDefault === "upstream") {
+			if (branchRemote !== "origin" || !merge?.startsWith("refs/heads/")) return "prompt";
+			destination = merge;
+		} else if (pushDefault === "simple" && (branchRemote ?? "origin") === "origin" &&
+			merge !== undefined && merge !== `refs/heads/${currentBranch}`) return "prompt";
+		// Only Git's configured upstream is authoritative for implicit force.
+		// An origin tracking ref can be stale or can name a remote-only tag.
+		if (forced && !hasOriginUpstream(currentBranch, destination)) return "prompt";
+		return semantic && provesRefspec(currentBranch, destination, currentBranch) ? "safe" : "plain-policy";
+	}
+	let feature = false;
+	for (const refspec of positional) {
+		if (refspec.startsWith(":")) return "plain-policy";
+		const forceRef = refspec.startsWith("+");
+		if (forceRef) semantic = false;
+		const parts = (forceRef ? refspec.slice(1) : refspec).split(":");
+		if (parts.length > 2) return "prompt";
+		if (parts.some(part => part.startsWith("refs/tags/"))) return "prompt";
+		const source = parts[0]!;
+		const branch = sourceBranch(source);
+		if (!safeSourceBranch(branch)) return "prompt";
+		const implicit = parts.length === 1;
+		const destination = parts[1] ?? (source === "HEAD" ? currentBranch : source);
+		if (!destination || destination === "HEAD") return "prompt";
+		// Explicit unqualified colon destinations do not consult branch.merge:
+		// even a matching upstream name must not disguise a remote-only tag.
+		if ((forced || forceRef) && !destination.startsWith("refs/heads/") &&
+			(!implicit || !hasOriginUpstream(branch, destination))) return "prompt";
+		if (!isFeaturePushRef(destination)) { semantic = false; continue; }
+		feature = true;
+		if (semantic && !provesRefspec(source, destination, branch)) return "prompt";
+	}
+	return feature && semantic ? "safe" : "plain-policy";
+}
+
+function isGitConfigRead(args: readonly string[]): boolean {
+	let read = false;
+	let show = false;
+	const operands: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		if (/^(?:--get(?:-all|-regexp|-urlmatch)?|--list|-l)$/u.test(arg)) read = true;
+		else if (/^--show-(?:origin|scope|names)$/u.test(arg)) show = true;
+		else if (/^(?:--global|--local|--system|--worktree|--includes|--no-includes|--null|-z|--name-only)$/u.test(arg)) continue;
+		else if (arg === "--file" || arg === "-f" || arg === "--blob" || arg === "--type") i++;
+		else if (/^--(?:file|blob|type)=/u.test(arg)) continue;
+		else if (arg.startsWith("-")) return false;
+		else operands.push(arg);
+	}
+	if (operands[0] === "get" || operands[0] === "list") return true;
+	return read ? operands.length <= 2 : operands.length === 1 || (show && operands.length === 0);
+}
+
+function isSafeWorktreeRemoval(git: GitApprovalCommand): boolean {
+	if (git.configOverride || git.repositoryOverride || git.unknown || !git.directory || git.argv[2] !== "remove") return false;
+	const targets = git.argv.slice(3).filter(arg => arg !== "--force" && arg !== "-f" && arg !== "--");
+	if (targets.length !== 1 || targets[0]!.startsWith("-")) return false;
+	let target: string;
+	try {
+		target = fs.realpathSync(path.resolve(git.directory, targets[0]!));
+	} catch {
+		return false;
+	}
+	if (!/^(?:\/private)?\/tmp\/[^/]+/u.test(target) && !target.includes("/.worktrees/")) return false;
+	// Compare filesystem identity, not the /tmp alias or a caller's symlink spelling.
+	const list = approvalGitOutput(git, ["worktree", "list", "--porcelain"]);
+	const entry = list?.split("\n\n").find(block => {
+		const registered = /^worktree (.+)$/mu.exec(block)?.[1];
+		if (!registered) return false;
+		try {
+			return fs.realpathSync(registered) === target;
+		} catch {
+			return false;
+		}
+	});
+	const head = entry && /^HEAD ([0-9a-f]+)$/mu.exec(entry)?.[1];
+	const branch = entry && /^branch (.+)$/mu.exec(entry)?.[1];
+	if (!head) return false;
+	const args = ["rev-list", "--max-count=1", head, "--not", "--single-worktree"];
+	if (branch) args.push(`--exclude=${branch}`);
+	args.push("--all");
+	return approvalGitOutput(git, args) === "";
+}
+
+interface LegacyBashRestriction {
+	rule: BashApprovalPatternRule;
+	/** Absent only for a restriction that matched across the whole source. */
+	segment?: ApprovalShellSegment;
+	criticalPattern?: RegExp;
+	/** Restriction belongs to an exact whole-line ordinary-env projection. */
+	innerEnvironment?: boolean;
+}
+
+interface LegacyBashAssessment {
+	restrictions: LegacyBashRestriction[];
+	matchedAllow: boolean;
+	/** Exact predecessor units; null means it could not establish a literal unit boundary. */
+	segments: { text: string; matchedAllow: boolean }[] | null;
+}
+
+const LEGACY_CRITICAL_RULE: BashApprovalPatternRule = { match: "Critical pattern detected", approval: "prompt" };
+
+/** Keep e540's ordered restriction pass, including its literal-argv retokenization. */
+function legacyBashAssessment(
+	command: string,
+	rules: readonly BashApprovalPatternRule[],
+	allowedEnvVars: readonly string[],
+	compoundEnabled: boolean,
+): LegacyBashAssessment {
+	const segments = compoundEnabled ? extractLegacyApprovalShellSegments(command) : null;
+	const restrictions: LegacyBashRestriction[] = [];
+	let matchedAllow = false;
+	let segmentAllows: LegacyBashAssessment["segments"] = segments ? [] : null;
+	if (!segments) {
+		if (!hasBashApprovalShellControl(command)) {
+			const rule = rules.find(rule => bashApprovalRuleMatches(command, rule, allowedEnvVars));
+			if (rule && rule.approval !== "allow") restrictions.push({ rule, segment: { text: command, literal: null } });
+			matchedAllow = rule?.approval === "allow";
+			segmentAllows = [{ text: command, matchedAllow }];
+		} else {
+			const spellings = bashCommandSegments(command);
+			for (const rule of rules) {
+				if (rule.approval !== "allow" && commandMatchesBashApprovalPattern(command, rule.match) &&
+					!spellings.some(text => commandMatchesBashApprovalPattern(text, rule.match))) restrictions.push({ rule });
+			}
+			for (const text of spellings) {
+				const rule = rules.find(rule => rule.approval !== "allow" && commandMatchesBashApprovalPattern(text, rule.match));
+				if (rule) restrictions.push({ rule, segment: { text, literal: null } });
+			}
+		}
+	} else {
+		const opaque = segments.some(segment => segment.literal === null);
+		for (const rule of rules) {
+			if (rule.approval !== "allow" &&
+				(rule.approval === "deny" || opaque || /[;&|]/u.test(rule.match)) &&
+				commandMatchesBashApprovalPattern(command, rule.match) &&
+				!segments.some(segment => commandMatchesBashApprovalPattern(segment.text, rule.match))) restrictions.push({ rule });
+		}
+		matchedAllow = true;
+		for (const segment of segments) {
+			const withoutEnv = withoutLeadingEnvironmentAssignments(segment.text);
+			const rule = rules.find(rule => rule.approval === "allow"
+				? segment.literal !== null && bashApprovalRuleMatches(segment.text, rule, allowedEnvVars, true)
+				: commandMatchesBashApprovalPattern(segment.text, rule.match) ||
+					(withoutEnv !== null && commandMatchesBashApprovalPattern(withoutEnv, rule.match)) ||
+					(segment.literal !== null && commandSegmentMatchesBashApprovalPattern(segment.literal.argv.join(" "), rule.match)));
+			if (rule && rule.approval !== "allow") restrictions.push({ rule, segment });
+			if (rule?.approval !== "allow" || segment.literal === null) matchedAllow = false;
+			segmentAllows!.push({ text: segment.text, matchedAllow: rule?.approval === "allow" && segment.literal !== null });
+		}
+	}
+	// The complete predecessor decision includes critical overrides, even when
+	// an ordered allow matched, and an exec floor for unmatched commands.
+	for (const criticalPattern of CRITICAL_BASH_PATTERNS) {
+		if (criticalPattern.test(command)) restrictions.push({ rule: LEGACY_CRITICAL_RULE, criticalPattern });
+		for (const segment of segments ?? []) {
+			if (criticalPattern.test(segment.literal?.argv.join(" ") ?? segment.text)) {
+				restrictions.push({ rule: LEGACY_CRITICAL_RULE, segment, criticalPattern });
+			}
+		}
+	}
+	return { restrictions, matchedAllow, segments: segmentAllows };
+}
+
+function cleanBashApprovalEnvironment(
+	argv: readonly string[],
+	firstCommand: number,
+	allowedEnvVars: readonly string[],
+	rule?: BashApprovalPatternRule,
+): boolean {
+	return argv.slice(0, firstCommand).every(assignment => {
+		const name = assignment.slice(0, assignment.indexOf("="));
+		return !name.startsWith("GIT_") && !name.startsWith("MARUT_") &&
+			(allowedEnvVars.includes(name) || rule?.env?.includes(name));
+	});
+}
+
+function restrictionMatches(text: string, restriction: LegacyBashRestriction, retokenize = false): boolean {
+	return restriction.criticalPattern ? restriction.criticalPattern.test(text) :
+		retokenize ? commandSegmentMatchesBashApprovalPattern(text, restriction.rule.match) :
+			commandMatchesBashApprovalPattern(text, restriction.rule.match);
+}
+
+function normalizedReadOnlyGit(
+	argv: readonly string[], searchPath: string | undefined, executable: string,
+): GitApprovalCommand | undefined {
+	const git = normalizeGitApprovalArgv(argv, [], { directory: undefined, sawSymlink: false, uncertain: false }, searchPath, executable);
+	return git && !git.unknown && !git.configOverride && !git.repositoryOverride && isReadOnlyGitApprovalArgv(git.argv)
+		? git : undefined;
+}
+
+/**
+ * Positive data positions only. An arbitrary executable or wrapper might evaluate
+ * its arguments; interpreter programs cannot borrow this class even when quoted.
+ */
+function isInertBashRestrictionData(
+	segment: ApprovalShellSegment, restriction: LegacyBashRestriction, searchPath: string | undefined,
+): boolean {
+	const argv = segment.argv;
+	if (!argv?.length || segment.unknownArgv?.length || segment.shellStateUnknown) return false;
+	let index = 0;
+	while (isShellEnvironmentAssignment(argv[index] ?? "")) index++;
+	if (index !== 0) return false;
+	const trusted = resolveTrustedApprovalExecutable(argv[index]!, searchPath);
+	if (!trusted || ((segment as ApprovalEnvSegment).envSourceArgv && !restriction.criticalPattern &&
+		(commandMatchesBashApprovalPattern(segment.text, restriction.rule.match) ||
+			/^(?:env|\/[^ ]*\/env)(?: |$)/u.test(restriction.rule.match)))) return false;
+	const executable = path.basename(trusted);
+	if (BASH_APPROVAL_CODE_INTERPRETERS.test(executable) ||
+		Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, executable)) return false;
+	if (executable === "git") {
+		const git = normalizedReadOnlyGit(argv, searchPath, trusted);
+		return !!git && !restrictionMatches(git.argv.join(" "), restriction);
+	}
+	if (argv.some(arg => /^(?:--pre|--pre-glob|--hostname-bin|--jq|--template)(?:=|$)/u.test(arg))) return false;
+	const dataCommand = /^(?:echo|printf|cat|tee|grep|rg)$/u.test(executable) ||
+		(executable === "perms" && argv[1] === "check") ||
+		(executable === "gh" && argv[1] === "pr" && /^(?:create|edit|view)$/u.test(argv[2] ?? ""));
+	if (!dataCommand) return false;
+	let word = 0;
+	const masked = lexShellCommand(segment.text).map(token => {
+		if (token.kind === "word" && ++word > 1 && /['"\\]/u.test(token.raw)) return "__omp_inert_argument__";
+		return token.raw;
+	}).join("");
+	return masked !== segment.text && !restrictionMatches(masked, restriction, true) &&
+		(restrictionMatches(segment.text, restriction) || restrictionMatches(argv.join(" "), restriction, true));
+}
+
+/**
+ * Project only parser-owned root heredoc bytes, and only in a data-only line.
+ * No text search may borrow a body from another command or hide a later
+ * interpreter that could consume a generated script.
+ */
+function projectInertHeredocData(
+	command: string, segments: readonly ApprovalShellSegment[] | null, searchPath: string | undefined,
+): string {
+	if (!segments?.length || segments.some(segment =>
+		segment.unknownArgv?.length || segment.shellStateUnknown ||
+		(segment.argv?.[0] !== "cd" && !resolveTrustedApprovalExecutable(segment.argv?.[0] ?? "", searchPath)) ||
+		!/^(?:cat|tee|echo|printf|cd)$/u.test(path.basename(segment.argv?.[0] ?? "")))) return command;
+	const bodies = new Map<number, QuotedHeredocBody>();
+	for (const segment of segments) {
+		if (!/^(?:cat|tee)$/u.test(path.basename(segment.argv?.[0] ?? ""))) continue;
+		for (const body of segment.quotedHeredocs ?? []) {
+			if (body.source === command && body.end > body.start) bodies.set(body.start, body);
+		}
+	}
+	if (!bodies.size) return command;
+	let projected = command;
+	let boundary = command.length;
+	for (const body of [...bodies.values()].sort((left, right) => right.start - left.start)) {
+		if (body.end > boundary) return command;
+		projected = projected.slice(0, body.start) + projected.slice(body.end);
+		boundary = body.start;
+	}
+	return projected;
+}
+
+type ApprovalEnvSegment = ApprovalShellSegment & { envSourceArgv?: readonly string[]; envInnerText?: string };
+
+/** Remove only validated literal prefix words; preserve the payload's exact quoting and expansions. */
+function ordinaryEnvInnerText(text: string, prefix: readonly string[]): string | undefined {
+	let words = 0;
+	let offset = 0;
+	for (const token of lexShellCommand(text)) {
+		if (token.kind === "word") {
+			if (token.value !== prefix[words]) return undefined;
+			words++;
+		} else if (!/^\s*$/u.test(token.raw)) {
+			return undefined;
+		}
+		offset += token.raw.length;
+		if (words === prefix.length) return text.slice(offset).trimStart();
+	}
+	return undefined;
+}
+
+/** Ordinary env values cannot select code/config/targets; unknown names stay wrapped. */
+function ordinaryEnvApprovalSegments(
+	segments: readonly ApprovalShellSegment[] | null, searchPath: string | undefined, cwd?: string,
+): readonly ApprovalShellSegment[] | null {
+	if (!segments) return null;
+	let prepared: ApprovalShellSegment[] | undefined;
+	for (let index = 0; index < segments.length; index++) {
+		const segment = segments[index]!;
+		const originalArgv = segment.argv;
+		if (!originalArgv) continue;
+		let argv: readonly string[] = originalArgv;
+		let unknown: readonly number[] = segment.unknownArgv ?? [];
+		while (path.basename(argv[0] ?? "") === "env" &&
+			resolveTrustedApprovalExecutable(argv[0]!, searchPath, segments.length === 1 ? cwd : undefined)) {
+			const ordinary = unwrapOrdinaryApprovalEnv(argv, unknown);
+			if (!ordinary) break;
+			argv = ordinary.argv;
+			unknown = ordinary.unknown;
+		}
+		if (argv === originalArgv) continue;
+		const envInnerText = ordinaryEnvInnerText(segment.text, originalArgv.slice(0, originalArgv.length - argv.length));
+		if (!envInnerText) continue;
+		const inner = [...argv];
+		const unwrapped: ApprovalEnvSegment = { ...segment, argv: inner, unknownArgv: [...unknown],
+			envSourceArgv: originalArgv, envInnerText, literal: segment.literal ? { ...segment.literal, argv: inner } : null };
+		(prepared ??= [...segments])[index] = unwrapped;
+	}
+	return prepared ?? segments;
+}
+
+/** Delete validated prefixes only when parser units cover the original source exactly. */
+function ordinaryEnvApprovalLine(command: string, segments: readonly ApprovalShellSegment[] | null): string {
+	if (!segments?.some(segment => (segment as ApprovalEnvSegment).envInnerText)) return command;
+	if (segments.some(segment => segment.quotedHeredocs?.length)) return command;
+	const removals: { start: number; end: number }[] = [];
+	let cursor = 0;
+	for (const segment of segments) {
+		const start = command.indexOf(segment.text, cursor);
+		if (start < 0 || !/^[\s;&|]*$/u.test(command.slice(cursor, start))) return command;
+		const inner = (segment as ApprovalEnvSegment).envInnerText;
+		if (inner) {
+			if (!segment.text.endsWith(inner)) return command;
+			removals.push({ start, end: start + segment.text.length - inner.length });
+		}
+		cursor = start + segment.text.length;
+	}
+	if (!/^[\s;&|]*$/u.test(command.slice(cursor))) return command;
+	const pieces: string[] = [];
+	cursor = 0;
+	for (const removal of removals) {
+		pieces.push(command.slice(cursor, removal.start));
+		cursor = removal.end;
+	}
+	pieces.push(command.slice(cursor));
+	return pieces.join("");
+}
+
 function resolveBashPatternDecision(
 	command: string,
 	compoundSegments: readonly ApprovalShellSegment[] | null,
 	patternRules: readonly BashApprovalPatternRule[],
 	allowedEnvVars: readonly string[],
+	cwd?: string,
+	compoundEnabled = true,
+	searchPath: string | undefined = process.env.PATH,
 ): BashPatternDecision {
-	if (compoundSegments) {
-		let promptRule: BashApprovalPatternRule | undefined;
-		for (const rule of patternRules) {
-			if (
-				rule.approval !== "allow" &&
-				(rule.approval === "deny" ||
-					compoundSegments.some(segment => segment.literal === null) ||
-					/[;&|]/u.test(rule.match)) &&
-				commandMatchesBashApprovalPattern(command, rule.match) &&
-				!compoundSegments.some(segment => commandMatchesBashApprovalPattern(segment.text, rule.match))
-			) {
-				if (rule.approval === "deny") return { kind: "deny", rule };
-				promptRule ??= rule;
+	const outer = legacyBashAssessment(command, patternRules, allowedEnvVars, compoundEnabled);
+	const segments = ordinaryEnvApprovalSegments(compoundSegments ?? extractApprovalShellSegments(command), searchPath, cwd);
+	const environmentLine = ordinaryEnvApprovalLine(command, segments);
+	const environmentProjected = environmentLine !== command;
+	const original = environmentProjected
+		? legacyBashAssessment(environmentLine, patternRules, allowedEnvVars, compoundEnabled) : outer;
+	const floorText = (segment: ApprovalShellSegment) => environmentProjected
+		? (segment as ApprovalEnvSegment).envInnerText ?? segment.text : segment.text;
+	const projected = projectInertHeredocData(command, segments, searchPath);
+	const legacy = projected === command ? original :
+		legacyBashAssessment(projected, patternRules, allowedEnvVars, compoundEnabled);
+	// Never assess env payloads independently: native whole-line argv
+	// retokenization can expose restrictions only after another unit is present.
+	// Explicit restrictions on the original wrapper spelling remain in force.
+	const restrictions = environmentProjected
+		? [...legacy.restrictions.map(restriction => ({ ...restriction, innerEnvironment: true })), ...outer.restrictions]
+		: legacy.restrictions;
+	const authorizations = original.restrictions.length || !original.matchedAllow
+		? new Map<ApprovalShellSegment, BashApprovalOverrideClass>() : undefined;
+	const decision = resolveArgvBashPatternDecision(command, compoundSegments, patternRules, allowedEnvVars, cwd, authorizations, segments, searchPath);
+	if (decision.kind === "deny") return decision;
+	let inertDataSegments: Set<ApprovalShellSegment> | undefined;
+	if (decision.kind === "prompt") {
+		const denied = restrictions.find(restriction => restriction.rule.approval === "deny");
+		return denied ? { kind: "deny", rule: denied.rule } : decision;
+	}
+	const classes = new Set<BashApprovalOverrideClass>();
+	const inertHeredocOverride = projected !== command && original.restrictions.some(before =>
+		!legacy.restrictions.some(after => before.rule === after.rule && before.criticalPattern === after.criticalPattern &&
+			before.segment?.text === after.segment?.text));
+	if (inertHeredocOverride) classes.add("inert-data");
+	let promptRule: BashApprovalPatternRule | undefined;
+	let criticalFloor = false;
+	const authorize = (segment: ApprovalShellSegment, restriction: LegacyBashRestriction): boolean => {
+		if (restriction.rule.approval === "deny") return false;
+		const semantic = !(segment as ApprovalEnvSegment).envSourceArgv || restriction.innerEnvironment
+			? authorizations?.get(segment) : undefined;
+		const authorization = semantic && (semantic !== "captain-scoped-exception" ||
+			!restriction.criticalPattern)
+			? semantic : isInertBashRestrictionData(segment, restriction, searchPath) ? "inert-data" : undefined;
+		if (authorization) {
+			classes.add(authorization);
+			if (authorization === "inert-data") (inertDataSegments ??= new Set()).add(segment);
+		}
+		return authorization !== undefined;
+	};
+	for (const restriction of restrictions) {
+		let justified = false;
+		if (restriction.criticalPattern) {
+			// Every actual matching unit must be safe; one quoted example cannot
+			// excuse an actual destructive command elsewhere in the line.
+			const affected = segments?.filter(segment =>
+				restrictionMatches(restriction.innerEnvironment ? floorText(segment) : segment.text, restriction) ||
+				restrictionMatches(segment.argv?.join(" ") ?? "", restriction)) ?? [];
+			justified = affected.length > 0 && affected.every(segment => authorize(segment, restriction));
+		} else if (restriction.segment) {
+			const affected = segments?.filter(segment =>
+				(restriction.innerEnvironment ? floorText(segment) : segment.text) === restriction.segment!.text ||
+				segment.argv?.join(" ") === restriction.segment!.text) ?? [];
+			justified = affected.length > 0 && affected.every(segment => authorize(segment, restriction));
+		} else {
+			const prefix = normalizeBashApprovalPattern(restriction.rule.match.split("*", 1)[0] ?? "");
+			for (const segment of segments ?? []) {
+				const authorization = authorizations?.get(segment);
+				if (authorization && (!(segment as ApprovalEnvSegment).envSourceArgv || restriction.innerEnvironment) &&
+					prefix && normalizeBashApprovalPattern(restriction.innerEnvironment ? floorText(segment) : segment.text).startsWith(prefix)) {
+					classes.add(authorization);
+					justified = true;
+					break;
+				}
+				if (isInertBashRestrictionData(segment, restriction, searchPath)) {
+					classes.add("inert-data");
+					(inertDataSegments ??= new Set()).add(segment);
+					justified = true;
+					break;
+				}
 			}
 		}
-		let hasUnmatchedSegment = false;
-		for (const segment of compoundSegments) {
-			// Ordered first-match semantics belong to each executable segment, not to
-			// the complete chain. Never split an opaque segment's heredoc body again.
-			const withoutEnv = withoutLeadingEnvironmentAssignments(segment.text);
-			const segmentRule = patternRules.find(rule =>
-				rule.approval === "allow"
-					? segment.literal !== null && bashApprovalRuleMatches(segment.text, rule, allowedEnvVars, true)
-					: commandMatchesBashApprovalPattern(segment.text, rule.match) ||
-						(withoutEnv !== null && commandMatchesBashApprovalPattern(withoutEnv, rule.match)) ||
-						(segment.literal !== null &&
-							commandSegmentMatchesBashApprovalPattern(segment.literal.argv.join(" "), rule.match)),
-			);
-			if (segmentRule?.approval === "deny") return { kind: "deny", rule: segmentRule };
-			if (segmentRule?.approval === "prompt") promptRule ??= segmentRule;
-			if (!segmentRule || segment.literal === null) hasUnmatchedSegment = true;
+		if (!justified) {
+			if (restriction.rule.approval === "deny") return { kind: "deny", rule: restriction.rule };
+			if (restriction.criticalPattern) {
+				criticalFloor = true;
+				continue;
+			}
+			promptRule ??= restriction.rule;
 		}
-		if (promptRule) return { kind: "prompt", rule: promptRule };
-		return hasUnmatchedSegment ? { kind: "unmatched" } : { kind: "allow" };
 	}
-	const patternRule = findBashApprovalPatternRule(command, patternRules, allowedEnvVars);
-	if (patternRule?.approval === "deny") return { kind: "deny", rule: patternRule };
-	if (patternRule?.approval === "prompt") return { kind: "prompt", rule: patternRule };
-	if (patternRule?.approval === "allow") return { kind: "allow" };
-	return { kind: "unmatched" };
+	if (promptRule) return { kind: "prompt", rule: promptRule };
+	if (criticalFloor) return { kind: "critical", rule: LEGACY_CRITICAL_RULE,
+		...(classes.size ? { overrideClasses: [...classes] } : {}) };
+	if (original.matchedAllow && decision.kind === "unmatched" && segments?.every(segment =>
+		!segment.unknownArgv?.length && !segment.resolvedExpansion)) {
+		return classes.size ? { kind: "allow", overrideClasses: [...classes] } : { kind: "allow" };
+	}
+	if (!original.matchedAllow) {
+		const simple = extractSimpleApprovalShellSegments(command);
+		const target = simple?.length === segments?.length ? segments?.at(-1) : undefined;
+		const targetAuthorization = target && (authorizations?.get(target) ??
+			(inertDataSegments?.has(target) ? "inert-data" : undefined));
+		let complete = !!segments?.length;
+		let legacyIndex = 0;
+		for (const segment of segments ?? []) {
+			let authorization = authorizations?.get(segment) ??
+				(inertDataSegments?.has(segment) ? "inert-data" : undefined);
+			if (!authorization && inertHeredocOverride &&
+				segment.quotedHeredocs?.some(body => body.source === command)) authorization = "inert-data";
+			// A verified semantic target owns its strictly literal initial cd
+			// chain. It cannot authorize any unrelated preceding/following unit.
+			if (!authorization && targetAuthorization && segment !== target && segment.argv?.[0] === "cd") {
+				authorization = targetAuthorization;
+			}
+			const before = original.segments?.[legacyIndex];
+			const sameUnit = before?.text === floorText(segment);
+			if (sameUnit) legacyIndex++;
+			const oldAllow = sameUnit && before?.matchedAllow &&
+				!segment.unknownArgv?.length && !segment.resolvedExpansion && !segment.shellStateUnknown;
+			if (authorization) classes.add(authorization);
+			else if (!oldAllow) complete = false;
+		}
+		// The exec tier is a separate floor for EVERY predecessor unit. One
+		// config read or feature push may never carry an unmatched mutation.
+		if (!complete) return classes.size ? { kind: "unmatched", overrideClasses: [...classes] } : { kind: "unmatched" };
+		if (decision.kind === "unmatched" && targetAuthorization && targetAuthorization !== "inert-data") {
+			return { kind: "allow", overrideClasses: [...classes] };
+		}
+	}
+	return classes.size ? { ...decision, overrideClasses: [...classes] } : decision;
+}
+
+function resolveArgvBashPatternDecision(
+	command: string,
+	compoundSegments: readonly ApprovalShellSegment[] | null,
+	patternRules: readonly BashApprovalPatternRule[],
+	allowedEnvVars: readonly string[],
+	cwd?: string,
+	authorizations?: Map<ApprovalShellSegment, BashApprovalOverrideClass>,
+	parsedSegments?: readonly ApprovalShellSegment[] | null,
+	searchPath: string | undefined = process.env.PATH,
+): BashPatternDecision {
+	const segments = parsedSegments ?? compoundSegments ?? extractApprovalShellSegments(command);
+	// Structural eligibility is independent of the flattened parser's inferred bindings.
+	// Match both original bytes and argv so loop expansion can never borrow this exception.
+	const simpleSegments = extractSimpleApprovalShellSegments(command);
+	if (!segments) {
+		const rule = findNonCompoundBashRestrictionRule(command, patternRules);
+		if (rule) return { kind: rule.approval === "deny" ? "deny" : "prompt", rule };
+		if (tokenizeShellSegments(command).some(argv => {
+			const executable = argv.find(word => !isShellEnvironmentAssignment(word));
+			const program = path.basename(executable ?? "");
+			return program === "git" || (Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, program) &&
+				requiresApprovalWrapperPrompt(argv));
+		})) return { kind: "prompt", rule: { match: "git or command wrapper (unparsed shell syntax)", approval: "prompt" } };
+		return { kind: "unmatched" };
+	}
+	let promptRule: BashApprovalPatternRule | undefined;
+	let unmatched = false;
+	let allowRule: BashApprovalPatternRule | undefined;
+	const initialDirectory: ApprovalDirectory = { directory: cwd, sawSymlink: false, uncertain: false };
+	const directories = new Map<number, ApprovalDirectory & { allowContext: boolean }>();
+	directories.set(0, { ...initialDirectory, allowContext: true });
+	for (const rule of segments.length > 1 ? patternRules : []) {
+		if (rule.approval !== "allow" && /&&|\|\||;|\|/u.test(rule.match) &&
+			!/^\*(?:&&|;|\|) /u.test(rule.match) &&
+			commandMatchesBashApprovalPattern(command, rule.match)) {
+			if (rule.approval === "deny") return { kind: "deny", rule };
+			promptRule ??= rule;
+		}
+	}
+	let segmentIndex = 0;
+	let simpleDirectory = initialDirectory;
+	for (const segment of segments) {
+		const simpleCandidate = simpleSegments?.[segmentIndex++];
+		const scope = segment.cwdScope ?? 0;
+		if (!directories.has(scope)) {
+			const inherited = directories.get(segment.cwdParentScope ?? 0) ?? directories.get(0)!;
+			directories.set(scope, { ...inherited });
+		}
+		const context = directories.get(scope)!;
+		if (segment.cwdUnknown) context.directory = undefined;
+		const directory = context.directory;
+		const allowContext = context.allowContext;
+		const argv = segment.argv ?? segment.literal?.argv ?? tokenizeShellSegments(segment.text)[0] ?? [];
+		if (argv.length > 0 && argv.every(isShellEnvironmentAssignment)) {
+			unmatched = true;
+			continue;
+		}
+		let firstCommand = 0;
+		while (isShellEnvironmentAssignment(argv[firstCommand] ?? "")) firstCommand++;
+		const sourceArgv = (segment as ApprovalEnvSegment).envSourceArgv ?? argv;
+		const simple = !!simpleCandidate && scope === 0 && !segment.unknownArgv?.length &&
+			simpleCandidate.text === segment.text && simpleCandidate.argv.length === sourceArgv.length &&
+			simpleCandidate.argv.every((arg, index) => arg === sourceArgv[index]);
+		if (simple && argv[0] === "cd") simpleDirectory = advanceApprovalDirectory(simpleDirectory, argv[1]!);
+		const trustedExecutable = resolveTrustedApprovalExecutable(argv[firstCommand] ?? "", searchPath, directory);
+		const trustedProgram = trustedExecutable ? path.basename(trustedExecutable) : "";
+		const program = (argv[firstCommand] ?? "").includes("/") ? trustedProgram : argv[firstCommand] ?? "";
+		const git = trustedProgram === "git"
+			? normalizeGitApprovalArgv(argv, segment.unknownArgv ?? [], simple ? simpleDirectory : context, searchPath, trustedExecutable)
+			: undefined;
+		// Profile names and registry boot seeds do not prove a Marut kernel's
+		// current backend. Marut writes therefore keep their configured guard.
+		const semanticEnvironment = cleanBashApprovalEnvironment(argv, firstCommand, allowedEnvVars);
+		const semanticEligible = simple && semanticEnvironment && !!trustedExecutable;
+		const spelling = git ? [...argv.slice(0, firstCommand), ...git.argv].join(" ") : argv.join(" ");
+		const stripped = withoutLeadingEnvironmentAssignments(spelling);
+		const candidates = stripped === null ? [spelling] : [spelling, stripped];
+		if (firstCommand > 0) candidates.push(argv.slice(firstCommand).join(" "));
+		if (git?.configOverride) candidates.push(git.configArgv.join(" "));
+		if (git?.argv[1] === "worktree" && git.argv[2] === "remove" && git.directory && !git.unknown && !git.repositoryOverride) {
+			const targets = git.argv.slice(3).filter(arg => arg !== "--force" && arg !== "-f" && arg !== "--");
+			if (targets.length === 1 && !targets[0]!.startsWith("-")) {
+				try {
+					const canonical = fs.realpathSync(path.resolve(git.directory, targets[0]!));
+					candidates.push(git.argv.map((arg, index) => index >= 3 && arg === targets[0] ? canonical : arg).join(" "));
+				} catch {
+					// Missing or unreadable targets cannot acquire a semantic exception.
+				}
+			}
+		}
+		const matches = (rule: BashApprovalPatternRule) => {
+			const match = rule.match.replace(/^\*(?:&&|;|\|) /u, "");
+			if (/&&|\|\||;|\|/u.test(match)) return false;
+			return candidates.some(text => commandMatchesBashApprovalPattern(text, match)) ||
+				(git?.directory !== undefined && /^git -C (?!\* )/u.test(match) &&
+					commandMatchesBashApprovalPattern(`git -C ${git.directory} ${git.argv.slice(1).join(" ")}`, match)) ||
+				(rule.approval !== "allow" && (rule.approval === "deny" || /[<>]/u.test(match) || segment.text.includes("\n")) &&
+					commandMatchesBashApprovalPattern(segment.text, match));
+		};
+		if ((segment as ApprovalEnvSegment).envSourceArgv) {
+			let rawPrompt: BashApprovalPatternRule | undefined;
+			for (const rule of patternRules) {
+				if (rule.approval === "allow" || !commandMatchesBashApprovalPattern(segment.text, rule.match)) continue;
+				if (rule.approval === "deny") return { kind: "deny", rule };
+				rawPrompt ??= rule;
+			}
+			if (rawPrompt) {
+				promptRule ??= rawPrompt;
+				continue;
+			}
+		}
+		if (segment.approvalGrouped && /^(?:git|marut)$/u.test(program)) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= patternRules.find(rule => rule.approval === "prompt" && matches(rule)) ??
+				{ match: "grouped Git or Marut command (unresolved execution context)", approval: "prompt" };
+			continue;
+		}
+		if (program === "env" || (Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, program) &&
+			requiresApprovalWrapperPrompt(argv, segment.unknownArgv))) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= patternRules.find(rule => rule.approval === "prompt" && matches(rule)) ??
+				{ match: "command wrapper (unresolved execution context)", approval: "prompt" };
+			continue;
+		}
+		if (trustedProgram === "git" && !git) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= { match: "git (unresolved global options)", approval: "prompt" };
+			continue;
+		}
+		if (git && ((git.unknown && /^(?:config|push|worktree)$/u.test(git.argv[1] ?? "")) ||
+			(git.pathUncertain && /^(?:config|push|worktree)$/u.test(git.argv[1] ?? "")) ||
+			(git.argv[1] === "push" && (git.repositoryOverride || git.configOverride)))) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= { match: "git (uncertain arguments or repository selection)", approval: "prompt" };
+			continue;
+		}
+		const pushAssessment = git?.argv[1] === "push" ? assessFeaturePush(git) : undefined;
+		if (git?.argv[1] === "push" && (pushAssessment === "prompt" ||
+			argv.slice(0, firstCommand).some(assignment => /^(?:GIT_|MARUT_)/u.test(assignment)))) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= { match: "git push (unproven branch or tag selection)", approval: "prompt" };
+			continue;
+		}
+		let safeGit = false;
+		let authorization: BashApprovalOverrideClass | undefined;
+		if (semanticEligible) {
+			if (git?.argv[1] === "config" && !git.configOverride && !git.unknown) safeGit = isGitConfigRead(git.argv.slice(2));
+			if (git?.argv[1] === "push") safeGit = pushAssessment === "safe";
+			if (git?.argv[1] === "worktree" && git.argv[2] === "remove") safeGit = isSafeWorktreeRemoval(git);
+		}
+		if (safeGit) authorization = git?.argv[1] === "config" ? "config-read" :
+			git?.argv[1] === "push" ? "feature-push" : "scratch-worktree-remove";
+		// Like the live opaque-shell fallback, derived argv cannot acquire a
+		// literal allow. Otherwise a saved feature glob can hide loop state.
+		const guardedOperation = (git && (git.argv[1] === "push" || git.argv[1] === "config" ||
+			(git.argv[1] === "worktree" && git.argv[2] === "remove"))) ||
+			(argv[firstCommand] === "marut" && argv.includes("--allow-write"));
+		const literalOperation = !guardedOperation || simple || extractSimpleApprovalShellSegments(segment.text) !== null;
+		const writtenRule = patternRules.find(rule =>
+			commandMatchesBashApprovalPattern(segment.text, rule.match) ||
+			(withoutLeadingEnvironmentAssignments(segment.text) !== null &&
+				commandMatchesBashApprovalPattern(withoutLeadingEnvironmentAssignments(segment.text)!, rule.match)));
+		const reviewedWrittenAllow = semanticEligible && git?.directory && !git.pathUncertain &&
+			!git.unknown && !git.repositoryOverride && !git.configOverride && writtenRule &&
+			isCaptainBashException(writtenRule) && segment.literal !== null && !segment.allowUnsafe &&
+			cleanBashApprovalEnvironment(argv, firstCommand, allowedEnvVars, writtenRule) ? writtenRule : undefined;
+		const preservedWrittenAllow = literalOperation && git && !git.unknown && !git.repositoryOverride && !git.configOverride &&
+			writtenRule?.approval === "allow" && /^git -C (?!\* )/u.test(writtenRule.match) &&
+			cleanBashApprovalEnvironment(argv, firstCommand, allowedEnvVars, writtenRule) &&
+			bashApprovalRuleMatches(segment.text, writtenRule, allowedEnvVars, true) &&
+			segment.literal !== null && !segment.allowUnsafe && allowContext ? writtenRule : undefined;
+		if (authorization) authorizations?.set(segment, authorization);
+		const rule = reviewedWrittenAllow ?? preservedWrittenAllow ?? patternRules.find(rule => {
+			if (!matches(rule)) return false;
+			if (rule.approval === "allow") {
+				if (/^git -C (?!\* )/u.test(rule.match) &&
+					!cleanBashApprovalEnvironment(argv, firstCommand, allowedEnvVars, rule)) return false;
+				if (!literalOperation) return false;
+				if (!allowContext || !(compoundSegments !== null || segments.length === 1) || segment.literal === null || segment.allowUnsafe) return false;
+				if (git?.argv[1] === "push" && git.unknown) return false;
+				const env = rule.env ? [...allowedEnvVars, ...rule.env] : allowedEnvVars;
+				if (firstCommand > 0 && !isShellEnvironmentAssignment(rule.match) &&
+					!argv.slice(0, firstCommand).every(value => env.includes(value.slice(0, value.indexOf("="))))) return false;
+				return git || (segment as ApprovalEnvSegment).envSourceArgv
+					? matches(rule) : bashApprovalRuleMatches(segment.text, rule, allowedEnvVars, true);
+			}
+			// Only the operation's broad guard gets a semantic read/safe-target
+			// exception. Independent restrictions (eg egress approval) still win.
+			if (safeGit && rule.approval === "prompt" &&
+				(/^(?:git config(?: \*)?|git push(?: \*)?|git worktree remove(?: .*)?)$/u.test(rule.match) ||
+					/^git push --force-with-lease(?:=\*:\*)? origin \*$/u.test(rule.match))) return false;
+			return true;
+		});
+		if (reviewedWrittenAllow) {
+			authorizations?.set(segment, "captain-scoped-exception");
+		}
+		if (git?.argv[1] === "push" && !safeGit &&
+			!(rule?.approval === "allow" && !rule.match.includes("*"))) {
+			const positional = git.argv.slice(2).filter(arg => !arg.startsWith("-"));
+			if (positional.length === 0 || (positional[0] === "origin" &&
+				(positional.length === 1 || (positional.length === 2 && positional[1] === "HEAD")))) {
+				promptRule ??= { match: "git push (unresolved destination)", approval: "prompt" };
+			}
+		}
+		if (rule?.approval === "deny") return { kind: "deny", rule };
+		if (rule?.approval === "prompt") promptRule ??= rule;
+		if (rule?.approval === "allow") allowRule ??= rule;
+		if (!rule && !safeGit) unmatched = true;
+		if (argv[0] === "cd") {
+			context.allowContext = false;
+			if (argv.length === 2 && !segment.unknownArgv?.length) {
+				Object.assign(context, advanceApprovalDirectory(context, argv[1]!));
+			} else {
+				context.directory = undefined;
+				context.uncertain = true;
+			}
+		}
+		if (segment.cwdUnknownAfter) {
+			context.directory = undefined;
+			const parent = directories.get(segment.cwdParentScope ?? scope);
+			if (parent) parent.directory = undefined;
+		}
+	}
+	if (promptRule) return { kind: "prompt", rule: promptRule };
+	return unmatched ? { kind: "unmatched" } : { kind: "allow", rule: allowRule };
 }
 
 async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
@@ -875,14 +1911,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const shell = cfgBashAllowCompoundCommands.get(this.session.settings)
 			? this.session.settings.getShellConfig().shell
 			: undefined;
-		const compoundSegments = shell && isPosixShell(shell) ? extractApprovalShellSegments(command) : null;
-		const decision = resolveBashPatternDecision(command, compoundSegments, policy.rules, policy.allowedEnvVars);
+		const compoundEnabled = !!shell && isPosixShell(shell);
+		const compoundSegments = compoundEnabled ? extractApprovalShellSegments(command) : null;
+		const base = input.cwd ? resolveToCwd(input.cwd, this.session.cwd) : this.session.cwd;
+		// Sync approval sees configured/process PATH, not persistent-shell/direnv exports.
+		// Execution has the latter via #sessionSeed; this snapshot limitation is deliberate.
+		const searchPath = this.session.settings.getShellConfig().env?.PATH ?? process.env.PATH;
+		const decision = resolveBashPatternDecision(command, compoundSegments, policy.rules, policy.allowedEnvVars, base, compoundEnabled, searchPath);
 		// Project layers may tighten the operator's `bash.patterns`, never loosen
 		// them: an operator deny or prompt still applies under a project allow.
 		const authorityDecision =
 			authority === policy
 				? decision
-				: resolveBashPatternDecision(command, compoundSegments, authority.rules, authority.allowedEnvVars);
+				: resolveBashPatternDecision(command, compoundSegments, authority.rules, authority.allowedEnvVars, base, compoundEnabled, searchPath);
 		const denied =
 			authorityDecision.kind === "deny" ? authorityDecision : decision.kind === "deny" ? decision : undefined;
 		if (denied) {
@@ -896,6 +1937,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const prompted =
 			authorityDecision.kind === "prompt" ? authorityDecision : decision.kind === "prompt" ? decision : undefined;
 		if (prompted) {
+			if (prompted.rule === LEGACY_CRITICAL_RULE || isCriticalBashCommand(command) || compoundSegments?.some(segment =>
+				isCriticalBashCommand(segment.literal?.argv.join(" ") ?? segment.text))) {
+				return { tier: "exec", override: true, policy: "prompt", reason: "Critical pattern detected" };
+			}
 			return {
 				tier: "exec",
 				override: true,
@@ -903,22 +1948,27 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				reason: `Prompt required by bash pattern: ${prompted.rule.match}`,
 			};
 		}
-		const criticalCommand = command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command));
+		if (decision.kind === "critical" || authorityDecision.kind === "critical") {
+			return { tier: "exec", override: true, reason: "Critical pattern detected" };
+		}
+		const criticalCommand = command !== "" && isCriticalBashCommand(command);
 		if (!compoundSegments && criticalCommand) {
 			return { tier: "exec", override: true, reason: "Critical pattern detected" };
 		}
 		if (compoundSegments) {
 			for (const segment of compoundSegments) {
 				const literalCommand = segment.literal?.argv.join(" ") ?? segment.text;
-				if (criticalCommand || CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(literalCommand))) {
+				if (criticalCommand || isCriticalBashCommand(literalCommand)) {
 					return { tier: "exec", override: true, reason: "Critical pattern detected" };
 				}
 			}
 		}
 		// Each tool command passes its own approval when it runs; the line itself only reads.
 		if (isToolCommandLine(command, toolCommands)) return "read";
-		if (decision.kind === "allow") return { tier: "write", policy: "allow" };
-		return "exec";
+		const reason = decision.overrideClasses?.length
+			? `P0 approval override: ${decision.overrideClasses.join(", ")}` : undefined;
+		if (decision.kind === "allow") return { tier: "write", policy: "allow", ...(reason ? { reason } : {}) };
+		return reason ? { tier: "exec", reason } : "exec";
 	};
 	/**
 	 * `bash.patterns` rules and env allowlist for the session (`session`) and for the operator layers
@@ -1008,10 +2058,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			if (covered && segmentRule) {
 				rows.push(`  ✓ ${truncateForPrompt(segment.text)} (allowed: ${segmentRule.match})`);
 			} else {
-				const reason = promptRule
-					? `prompt: ${promptRule.match}`
-					: isCritical
-						? "critical pattern"
+				const reason = promptRule === LEGACY_CRITICAL_RULE || isCritical
+					? "critical pattern"
+					: promptRule
+						? `prompt: ${promptRule.match}`
 						: "requires approval";
 				rows.push(`  ? ${truncateForPrompt(segment.text)} (${reason})`);
 			}

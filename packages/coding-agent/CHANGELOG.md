@@ -19,7 +19,14 @@
 
 ### Fixed
 
-- Opt-in bash compound approval now evaluates lists, pipelines, subshells, and simple loops per command, while keeping heredoc bodies attached to their command and sensitive argument expansions conservative.
+- Bash approvals keep flags and quoted data command-local, explicitly gate grouped/negated Git and Marut targets and wrappers, and limit safe-target exceptions to literal top-level commands with only success-only `cd … &&` prefixes and harmless output redirections.
+- Git approval target lookup now resolves physical repository identity and rejects parent traversal after symlinks. Marut profile names and registry boot seeds no longer bypass configured write prompts.
+- Bash approvals preserve the complete e540 decision floor per command, including mode-dependent critical overrides and unmatched exec tiers. One semantic exception cannot authorize another unmatched command; captain additions require an explicit review identity bound to the exact written rule.
+- Feature-push exceptions require clean effective Git push configuration and unambiguous local branch sources. Forced destinations need explicit `refs/heads/…`, or the configured origin upstream when Git actually uses it; stale tracking refs and unqualified colon destinations do not prove a branch namespace.
+- Git read-data exceptions use finite per-subcommand option allowlists; output-writing, executable, unknown and global configuration options retain the original approval floor.
+- Heredoc authorization uses parser-owned quoted-body offsets in data-only command lines. Data from one source unit cannot excuse a different restricted command or a generated script's interpreter.
+- Semantic and inert-data exceptions require executable provenance from approved system/package-manager directories, resolved through configured shell/process PATH. Persistent-shell and direnv export changes are not visible in the synchronous approval snapshot.
+- Literal `env` prefixes unwrap only an ordinary presentation/locale variable allowlist. Unwrapping grants no authorization: the complete native whole-line prompt/deny, critical and exec floor is assessed after exact prefix removal, preserving quoting and retokenization across commands; ambiguous source retains the original floor.
 - Resuming or rewinding a session with an aborted task result no longer throws while the transcript renders; the card shows the cancellation text ([#20533](https://github.com/can1357/oh-my-pi/pull/20533) by [@g0spel](https://github.com/g0spel))
 - Save in Plan Review now accepts a custom path and shows where the plan was saved without requiring you to dismiss the review ([#20539](https://github.com/can1357/oh-my-pi/issues/20539)).
 - The focused diff in Tern's native `/git` preview now scrolls with the arrow keys, Page Up/Page Down, and Home/End ([#20537](https://github.com/can1357/oh-my-pi/issues/20537)).
