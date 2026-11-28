@@ -583,6 +583,18 @@ describe("argv-aware bash approval regressions", () => {
 					] });
 					expect(resolveApproval(semanticDeny, { command: `env ${inner}`, cwd }, mode).policy).toBe("deny");
 				}
+				const retokenizedRules = [
+					{ match: "git reset*--hard*", approval: "prompt" as const },
+					{ match: "awk *", approval: "allow" as const }, { match: "echo *", approval: "allow" as const },
+				];
+				const retokenized = createBashTool({ "bash.allowCompoundCommands": true, "bash.patterns": retokenizedRules });
+				for (const joiner of ["&&", "|"]) {
+					for (const suffix of ["echo done", "env NO_COLOR=1 echo done"]) {
+						const command = `env awk 'BEGIN {system("git reset --hard")}' ${joiner} ${suffix}`;
+						expect(resolveApproval(retokenized, { command, cwd }, mode).policy, command).toBe("prompt");
+						expect(getBashApprovalOverrideClasses(command, retokenizedRules, [], cwd)).toEqual([]);
+					}
+				}
 			});
 		});
 
@@ -2713,7 +2725,7 @@ describe("tool-owned dynamic approval declarations", () => {
 			expect(bashApproval(command, settingsOverrides)).toBe("exec");
 		}
 		expect(bashApproval("cmp before after && env sh script", settingsOverrides))
-			.toMatchObject({ tier: "write", policy: "allow" });
+			.toBe("exec");
 	});
 
 	it("does not compose printf variable writes with a retargeted executable", () => {
