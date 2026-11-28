@@ -564,6 +564,75 @@ describe("argv-aware bash approval regressions", () => {
 		});
 	}
 
+	const groupedCommands: Array<[string, (payload: string) => string]> = [
+		["brace group", payload => `{ ${payload}; }`],
+		["negation", payload => `! ${payload}`],
+		["double negation", payload => `! ! ${payload}`],
+		["subshell", payload => `(${payload})`],
+		["negated brace body", payload => `{ ! ${payload}; }`],
+	];
+	for (const [name, group] of groupedCommands) {
+		it(`prompts for Git and Marut ${name} commands even with broad allows in yolo`, () => {
+			const bash = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [{ match: "*", approval: "allow" }, ...patterns],
+			});
+			for (const payload of [
+				"git push",
+				"git push --force-with-lease",
+				"git push origin main",
+				"git push origin feature/topic",
+				"git status --short",
+				"git config user.name",
+				"marut --profile kstage api POST /fixture --allow-write",
+				"marut --profile prod api POST /fixture --allow-write",
+				"marut --profile kstage api GET /fixture",
+				"marut --profile prod api GET /fixture",
+				"command git push origin feature/topic",
+				"env marut --profile kstage api POST /fixture --allow-write",
+			]) {
+				const command = group(payload);
+				expect(resolveApproval(bash, { command }, "yolo", { bash: "allow" }).policy, command).toBe("prompt");
+			}
+		});
+	}
+
+	it("preserves matching denies before grouped-command prompts and later in the command", () => {
+		for (const [, group] of groupedCommands) {
+			for (const [payload, match] of [
+				["git push origin feature/topic", "git push *"],
+				["marut --profile kstage api POST /fixture --allow-write", "marut *"],
+			] as const) {
+				const bash = createBashTool({
+					"bash.allowCompoundCommands": true,
+					"bash.patterns": [{ match: "*", approval: "allow" }, { match, approval: "deny" }],
+				});
+				expect(resolveApproval(bash, { command: group(payload) }, "yolo", { bash: "allow" })).toMatchObject({
+					policy: "deny",
+					reason: `Blocked by bash pattern: ${match}`,
+				});
+			}
+			const bash = createBashTool({
+				"bash.allowCompoundCommands": true,
+				// Plain segments retain ordered first-match policy.
+				"bash.patterns": [{ match: "echo blocked", approval: "deny" }, { match: "*", approval: "allow" }],
+			});
+			expect(resolveApproval(bash, { command: `${group("git status")}; echo blocked` }, "yolo").policy).toBe("deny");
+		}
+	});
+
+	it("does not promote grouped quoted arguments or heredoc Git data into commands", () => {
+		for (const [, group] of groupedCommands) {
+			for (const payload of [
+				"echo '!' '{' '}' '(git push)' '! git push' '{ git push; }'",
+				"cat <<'EOF'\ngit push\n! git push\n{ git push origin main; }\nmarut --profile prod api POST /fixture --allow-write\nEOF\necho done",
+			]) {
+				const command = group(payload);
+				expect(policy(command), command).toBe("allow");
+			}
+		}
+	});
+
 	it("does not add wrapper prompts to known non-Git and non-Marut payloads", () => {
 		for (const [, wrap] of wrappers) {
 			const command = wrap("echo harmless");
@@ -790,8 +859,19 @@ describe("argv-aware bash approval regressions", () => {
 				expect(policy(command, repo), `${command}: origin protected upstream`).toBe("prompt");
 			}
 			expect(policy(`cd ${feature} && git push`, repo)).toBe("allow");
-			expect(policy(`cd ${feature}; git push`, repo)).toBe("allow");
-			expect(policy(`"cd" ${feature}; git push`, repo)).toBe("allow");
+			expect(policy(`cd ${feature}; git push`, repo)).toBe("prompt");
+			expect(policy(`"cd" ${feature}; git push`, repo)).toBe("prompt");
+			fs.writeFileSync(path.join(feature, "README.md"), "approval fixture\n");
+			const bin = path.join(repo, "bin");
+			fs.mkdirSync(bin);
+			for (const push of ["git push --force-with-lease", "git push"]) {
+				// The first cd targets a file and fails; cd .. then lands in the main repository.
+				// Assess approval inputs only: never execute the push being checked.
+				const command = `cd ${feature}/README.md; cd ..; ${push}`;
+				expect(policy(command, bin), command).toBe("prompt");
+				expect(policy(`cd ${feature} && ${push}`, bin)).toBe("allow");
+				expect(policy(`cd ${feature}\n${push}`, bin)).toBe("prompt");
+			}
 			git(["config", "branch.feature-review.merge", "refs/heads/main"], repo);
 			git(["config", "push.default", "upstream"], repo);
 			for (const command of ["git push --force-with-lease", "git push"]) {

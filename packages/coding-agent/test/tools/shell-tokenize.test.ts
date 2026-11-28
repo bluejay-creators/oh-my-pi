@@ -28,7 +28,7 @@ describe("lexShellCommand", () => {
 
 describe("extractSimpleApprovalShellSegments", () => {
 	it("returns only the initial literal cd chain and first target, preserving their source", () => {
-		const command = "'cd' '/repo one' && cd /repo-two; git push origin feature; git push origin main";
+		const command = "'cd' '/repo one' && cd /repo-two && git push origin feature; git push origin main";
 		expect(extractSimpleApprovalShellSegments(command)).toEqual([
 			{ text: "'cd' '/repo one'", argv: ["cd", "/repo one"] },
 			{ text: "cd /repo-two", argv: ["cd", "/repo-two"] },
@@ -37,10 +37,8 @@ describe("extractSimpleApprovalShellSegments", () => {
 		expect(extractSimpleApprovalShellSegments("git status; cd /other; git push origin feature")).toEqual([
 			{ text: "git status", argv: ["git", "status"] },
 		]);
-		expect(extractSimpleApprovalShellSegments('cd /repo; git push origin "feature/topic"')).toEqual([
-			{ text: "cd /repo", argv: ["cd", "/repo"] },
-			{ text: 'git push origin "feature/topic"', argv: ["git", "push", "origin", "feature/topic"] },
-		]);
+		expect(extractSimpleApprovalShellSegments('cd /repo; git push origin "feature/topic"')).toBeNull();
+		expect(extractSimpleApprovalShellSegments("cd /one && cd /two; git push origin feature")).toBeNull();
 	});
 
 	it("keeps literal environment overrides visible for Bash policy rather than approving their names", () => {
@@ -304,6 +302,80 @@ describe("readShellWord", () => {
 });
 
 describe("segment-aware shell approval extraction", () => {
+	it("exposes brace and parenthesis commands with structural approval provenance", () => {
+		for (const command of [
+			"{ git push origin main; }",
+			"(git push origin main)",
+			"! git push origin main",
+			"! ! git push origin main",
+			"! (git push origin main)",
+			"! ! { git push origin main; }",
+			"{ (git push origin main); }",
+			"for b in main; do ! { git push origin \"$b\"; }; done",
+			"while ! git push origin main; do echo done; done",
+		]) {
+			const segments = extractApprovalShellSegments(command);
+			const push = segments?.find(segment => segment.argv?.[0] === "git");
+			expect(push?.argv).toEqual(["git", "push", "origin", "main"]);
+			expect(push?.approvalGrouped).toBe(true);
+		}
+	});
+
+	it("keeps braces and exclamation marks in quoted or argument data out of structural provenance", () => {
+		for (const command of [
+			`echo '{' '}' '!'`,
+			`echo "{" "}" "!"`,
+			String.raw`echo \{ \} \!`,
+			`echo ! '{ "command": "git push" }'`,
+			`'!' git push origin main`,
+			`echo '{"command":"git push"}'`,
+			"echo ${branch:-feature}",
+		]) {
+			const segments = extractApprovalShellSegments(command);
+			expect(segments).not.toBeNull();
+			expect(segments?.every(segment => segment.approvalGrouped === undefined)).toBe(true);
+		}
+		for (const command of ["echo ok | cat", 'echo "$(git push origin main)"']) {
+			expect(extractApprovalShellSegments(command)?.every(segment => segment.approvalGrouped === undefined)).toBe(true);
+		}
+	});
+
+	it("quarantines heredoc bodies inside brace groups and negated commands", () => {
+		for (const command of [
+			"{ cat <<'EOF'\ngit push\nEOF\n}",
+			"! cat <<'EOF'\n! { git push; }\nEOF",
+			"! { cat <<'EOF'\n} ! (git push)\nEOF\n}",
+		]) {
+			const segments = extractApprovalShellSegments(command);
+			expect(segments?.map(segment => segment.argv)).toEqual([["cat"]]);
+			expect(segments?.[0]?.approvalGrouped).toBe(true);
+			expect(segments?.[0]?.text).toContain("git push");
+			expect(segments?.[0]?.literal).toBeNull();
+		}
+	});
+
+	it("shares brace cwd state with its parent but not a subshell and leaves outside commands ungrouped", () => {
+		const segments = extractApprovalShellSegments("{ cd /feature && git push; }; git push");
+		expect(segments?.map(segment => segment.cwdScope)).toEqual([0, 0, 0]);
+		expect(segments?.map(segment => segment.approvalGrouped)).toEqual([true, true, undefined]);
+		const subshell = extractApprovalShellSegments("(cd /feature && git push); git push");
+		expect(subshell?.[0]?.cwdScope).not.toBe(subshell?.[2]?.cwdScope);
+		expect(extractApprovalShellSegments("! cd /feature && git push")?.[1]?.cwdUnknown).toBe(true);
+		expect(extractApprovalShellSegments("while ! cd /feature; do git push; done")?.at(-1)?.cwdUnknown).toBe(true);
+	});
+
+	it("does not confuse brace frames with loop delimiters or accept incomplete negation", () => {
+		for (const command of ["{ echo ok; done", "{ do echo ok; }", "{ echo ok;", "{ }", "! ", "! ; echo ok"]) {
+			expect(extractApprovalShellSegments(command)).toBeNull();
+		}
+		const loop = extractApprovalShellSegments("for b in feature main; do { git push origin \"$b\"; }; done");
+		expect(loop?.map(segment => segment.argv)).toEqual([
+			["git", "push", "origin", "feature"],
+			["git", "push", "origin", "main"],
+		]);
+		expect(loop?.every(segment => segment.approvalGrouped)).toBe(true);
+	});
+
 	it("keeps heredoc source attached to its interpreter and never parses its body as commands", () => {
 		const body = "python3 <<'PY'\nslack_write('hello; world')\nPY";
 		const segments = extractApprovalShellSegments(`echo before; ${body}\necho after`);

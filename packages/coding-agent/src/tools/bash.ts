@@ -814,6 +814,13 @@ function resolveBashPatternDecision(
 				(rule.approval !== "allow" && (rule.approval === "deny" || /[<>]/u.test(match) || segment.text.includes("\n")) &&
 					commandMatchesBashApprovalPattern(segment.text, match));
 		};
+		if (segment.approvalGrouped && /^(?:git|marut)$/u.test(path.basename(argv[firstCommand] ?? ""))) {
+			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));
+			if (denied) return { kind: "deny", rule: denied };
+			promptRule ??= patternRules.find(rule => rule.approval === "prompt" && matches(rule)) ??
+				{ match: "grouped Git or Marut command (unresolved execution context)", approval: "prompt" };
+			continue;
+		}
 		if (Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, path.basename(argv[firstCommand] ?? "")) &&
 			requiresApprovalWrapperPrompt(argv, segment.unknownArgv)) {
 			const denied = patternRules.find(rule => rule.approval === "deny" && matches(rule));

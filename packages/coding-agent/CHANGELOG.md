@@ -19,7 +19,7 @@
 
 ### Fixed
 
-- Bash approvals keep flags and quoted data command-local, fail closed on Git/Marut wrappers, and limit safe-target exceptions to literal top-level commands with only literal `cd` prefixes and harmless output redirections.
+- Bash approvals keep flags and quoted data command-local, explicitly gate grouped/negated Git and Marut targets and wrappers, and limit safe-target exceptions to literal top-level commands with only success-only `cd … &&` prefixes and harmless output redirections.
 - Resuming or rewinding a session with an aborted task result no longer throws while the transcript renders; the card shows the cancellation text ([#20533](https://github.com/can1357/oh-my-pi/pull/20533) by [@g0spel](https://github.com/g0spel))
 - Save in Plan Review now accepts a custom path and shows where the plan was saved without requiring you to dismiss the review ([#20539](https://github.com/can1357/oh-my-pi/issues/20539)).
 - The focused diff in Tern's native `/git` preview now scrolls with the arrow keys, Page Up/Page Down, and Home/End ([#20537](https://github.com/can1357/oh-my-pi/issues/20537)).

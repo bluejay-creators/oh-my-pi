@@ -351,7 +351,7 @@ export function extractLiteralAndChainSegments(command: string): LiteralShellCom
 
 /**
  * The semantic-exception boundary: only an initial literal `cd <path>` chain
- * and its first non-cd command are eligible. Later commands cannot affect an
+ * connected by `&&` and its first non-cd command are eligible. Later commands cannot affect an
  * earlier target; an OR-list anywhere still invalidates destination certainty.
  * Environment assignments stay in argv for the caller's environment policy.
  */
@@ -508,11 +508,8 @@ function extractStrictLiteralShellSegments(
 		}
 		if (simpleApproval && ch === ";") {
 			if (!pushSegment(i)) return null;
-			if (simpleApproval && segments.at(-1)?.argv[0] !== "cd") {
-				return command.slice(i + 1).trim() ? segments : null;
-			}
-			segmentStart = i + 1;
-			continue;
+			if (segments.at(-1)?.argv[0] === "cd") return null;
+			return command.slice(i + 1).trim() ? segments : null;
 		}
 		if (ch === "&" && command[i + 1] === "&") {
 			if (!pushSegment(i)) return null;
@@ -857,6 +854,8 @@ export interface ApprovalShellSegment {
 	unknownArgv?: number[];
 	/** Shell mutation or file redirection makes command-local allows insufficient. */
 	allowUnsafe?: boolean;
+	/** Command is inside a structural shell group or introduced by reserved shell negation. */
+	approvalGrouped?: boolean;
 	/** Executable lookup or shell interpretation may have been retargeted. Semantic allows must not override this. */
 	shellStateUnknown?: boolean;
 	/** Execution context whose cwd applies to this command; zero identifies the top-level shell. */
@@ -977,11 +976,19 @@ function extractApprovalShellSegmentsInScope(
 		}
 		// Process substitution and arithmetic/group syntax outside the supported subshell grammar.
 		if ((ch === "<" || ch === ">") && command[i + 1] === "(") return null;
-		if ((ch === "{" && command[i - 1] !== "$") || ch === "\r") return null;
+		if (ch === "\r") return null;
+		const structuralCandidate = ch === "{" || ch === "}" || ch === "!";
+		const prefix = structuralCandidate ? command.slice(start, i).trim() : "";
+		const structuralBrace = (ch === "{" || ch === "}") &&
+			(i === start || /[ \t\n;&|()]/u.test(command[i - 1]!)) &&
+			(i + 1 === command.length || /[ \t\n;&|()]/u.test(command[i + 1]!)) &&
+			(prefix === "" || (ch === "{" && /^(?:do|while|until)$/u.test(prefix)));
+		const negation = ch === "!" && (prefix === "" || prefix === "do") &&
+			(i + 1 === command.length || /[ \t\n;&|()]/u.test(command[i + 1]!));
 		const redirect =
 			(ch === "&" && (command[i - 1] === ">" || command[i - 1] === "<" || command[i + 1] === ">")) ||
 			(ch === "|" && command[i - 1] === ">");
-		if (!redirect && /[\n;&|()]/u.test(ch)) {
+		if (!redirect && (/[\n;&|()]/u.test(ch) || structuralBrace || negation)) {
 			push(i);
 			let operator = ch;
 			if ((ch === "&" || ch === "|") && (command[i + 1] === ch || (ch === "|" && command[i + 1] === "&"))) {
@@ -1024,7 +1031,7 @@ function extractApprovalShellSegmentsInScope(
 
 	const segments: ApprovalShellSegment[] = [];
 	const stack: {
-		kind: "for" | "while" | "until" | "(";
+		kind: "for" | "while" | "until" | "(" | "{";
 		body: boolean;
 		variable?: string;
 		values?: string[];
@@ -1038,6 +1045,7 @@ function extractApprovalShellSegmentsInScope(
 	let expectCommand = true;
 	let needsCommand = false;
 	let conditionalAssignment = false;
+	let pendingNegation = false;
 	let cwdScope = initialScope;
 	let cwdParentScope = initialParentScope;
 	// A successful cd is known only along its success-only && continuation.
@@ -1046,14 +1054,23 @@ function extractApprovalShellSegmentsInScope(
 	cwdStates.set(initialScope, { unknown: initialCwdUnknown, successOnly: false, conditional: false });
 	const cwdState = () => cwdStates.get(cwdScope)!;
 	const loopMayChangeCwd = pieces.some(piece => {
-		const words = parseApprovalWords(piece.replace(/^(?:do|while|until)[ \t]+/u, ""), variables);
+		const words = parseApprovalWords(
+			piece.replace(/^(?:do|while|until)[ \t]+/u, "").replace(/^(?:![ \t]+)+/u, ""),
+			variables,
+		);
 		let commandIndex = 0;
 		while (words?.[commandIndex] && isShellEnvironmentAssignment(words[commandIndex]!.value)) commandIndex++;
 		return /^(?:cd|pushd|popd)$/u.test(words?.[commandIndex]?.value.split("/").pop() ?? "");
 	});
 	for (let index = 0; index < pieces.length; index++) {
 		const piece = pieces[index]!;
-		if (piece === "\n" && expectCommand) continue;
+		if (piece === "!") {
+			if (!expectCommand) return null;
+			pendingNegation = true;
+			needsCommand = true;
+			continue;
+		}
+		if (piece === "\n" && expectCommand && !pendingNegation) continue;
 		if (/^(?:;|&|&&|\|\|?|\|&|\n)$/u.test(piece)) {
 			if (expectCommand) return null;
 			conditionalAssignment ||= piece !== ";" && piece !== "\n";
@@ -1067,10 +1084,14 @@ function extractApprovalShellSegmentsInScope(
 			needsCommand = piece !== ";" && piece !== "&" && piece !== "\n";
 			continue;
 		}
-		if (piece === "(") {
-			if (!expectCommand || pieces[index + 1] === "(") return null;
+		if (piece === "(" || piece === "{") {
+			if (!expectCommand || (piece === "(" && pieces[index + 1] === "(")) return null;
+			if (pendingNegation) cwdState().conditional = true;
+			pendingNegation = false;
+			needsCommand = false;
+			stack.push({ kind: piece, body: false, previousScope: cwdScope, previousParentScope: cwdParentScope });
+			if (piece === "{") continue;
 			conditionalAssignment = true;
-			stack.push({ kind: "(", body: false, previousScope: cwdScope, previousParentScope: cwdParentScope });
 			cwdParentScope = cwdScope;
 			cwdScope = scopes.next++;
 			cwdStates.set(cwdScope, {
@@ -1080,10 +1101,11 @@ function extractApprovalShellSegmentsInScope(
 			});
 			continue;
 		}
-		if (piece === ")") {
-			if (expectCommand && (needsCommand || pieces[index - 1] === "(")) return null;
+		if (piece === ")" || piece === "}") {
+			if (expectCommand && (needsCommand || pieces[index - 1] === "(" || pieces[index - 1] === "{")) return null;
+			if (piece === "}" && !expectCommand) return null;
 			const frame = stack.pop();
-			if (frame?.kind !== "(") return null;
+			if (frame?.kind !== (piece === ")" ? "(" : "{")) return null;
 			cwdScope = frame.previousScope!;
 			cwdParentScope = frame.previousParentScope;
 			expectCommand = false;
@@ -1095,7 +1117,7 @@ function extractApprovalShellSegmentsInScope(
 		if (/^(?:if|then|elif|else|fi|case|esac|function)(?:[ \t]|$)/u.test(text)) return null;
 		const top = stack[stack.length - 1];
 		if (text === "done") {
-			if (!top || top.kind === "(" || !top.body || needsCommand) return null;
+			if (!top || top.kind === "(" || top.kind === "{" || !top.body || needsCommand) return null;
 			stack.pop();
 			if (top.variable && top.values?.length !== 0) {
 				variables.delete(top.variable);
@@ -1108,20 +1130,34 @@ function extractApprovalShellSegmentsInScope(
 			continue;
 		}
 		if (/^do(?:[ \t]|$)/u.test(text)) {
-			if (!top || top.kind === "(" || top.body || needsCommand) return null;
+			if (!top || top.kind === "(" || top.kind === "{" || top.body || needsCommand) return null;
 			top.body = true;
 			text = text.slice(2).trimStart();
 			if (!text) continue;
 		}
+		const conditionLoop = /^(while|until)[ \t]+(.+)$/u.exec(text);
+		if (conditionLoop) {
+			stack.push({ kind: conditionLoop[1] as "while" | "until", body: false });
+			text = conditionLoop[2]!;
+		}
+		let negated = pendingNegation;
+		pendingNegation = false;
+		while (/^!(?:[ \t]|$)/u.test(text)) {
+			negated = true;
+			text = text.slice(1).trimStart();
+		}
+		if (!text) return null;
+		if (negated) cwdState().conditional = true;
 		const pipelineBefore = /^(?:\||\|&)$/u.test(pieces[index - 1] ?? "");
 		const pipelineAfter = /^(?:\||\|&)$/u.test(pieces[index + 1] ?? "");
 		const childProcess = pipelineBefore || pipelineAfter || pieces[index + 1] === "&";
 		const executionScope = childProcess ? scopes.next++ : cwdScope;
 		const executionParentScope = childProcess ? cwdScope : cwdParentScope;
 		const loopCwdUnknown = loopMayChangeCwd &&
-			(stack.some(frame => frame.kind !== "(") || /^(?:while|until)[ \t]/u.test(text));
+			(stack.some(frame => frame.kind !== "(" && frame.kind !== "{") || /^(?:while|until)[ \t]/u.test(text));
 		const provenance = {
 			cwdScope: executionScope,
+			...(negated || stack.some(frame => frame.kind === "(" || frame.kind === "{") ? { approvalGrouped: true } : {}),
 			...(loopCwdUnknown || cwdState().unknown ? { cwdUnknown: true } : {}),
 			...(executionParentScope !== undefined ? { cwdParentScope: executionParentScope } : {}),
 		};
@@ -1146,11 +1182,6 @@ function extractApprovalShellSegmentsInScope(
 			stack.push({ kind: "for", body: false, variable, values: values.some(value => value.unknown) ? undefined : values.map(value => value.value) });
 			expectCommand = false;
 			continue;
-		}
-		const conditionLoop = /^(while|until)[ \t]+(.+)$/u.exec(text);
-		if (conditionLoop) {
-			stack.push({ kind: conditionLoop[1] as "while" | "until", body: false });
-			text = conditionLoop[2]!;
 		}
 		let contexts: Map<string, string>[] = [new Map(variables)];
 		const loopContextValues = new Map<Map<string, string>, Map<string, string>>();
@@ -1187,7 +1218,7 @@ function extractApprovalShellSegmentsInScope(
 					}
 					const name = match[1]!;
 					const unconditional = !conditionalAssignment &&
-						!stack.some(frame => frame.kind !== "for") &&
+						!stack.some(frame => frame.kind !== "for" && frame.kind !== "{") &&
 						!/^(?:\||\|&|&)$/u.test(pieces[index + 1] ?? "");
 					const value = word.unknown || !unconditional ? undefined : match[2]!;
 					const loop = stack.at(-1);
