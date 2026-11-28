@@ -1,11 +1,16 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, spyOn, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { bubbleEvent } from "@oh-my-pi/pi-tui/dispatch";
 import type { TestTerminal } from "@oh-my-pi/pi-tui/testing/terminal";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
 import type { ExtensionAskDialogQuestion, ExtensionUIContext } from "../../../src/extensibility/extensions";
 import type { ExtensionRows } from "../../../src/extensibility/extensions/render-types";
 import { isSettingsInitialized, Settings } from "../../../src/config/settings";
+import { ModelRegistry } from "../../../src/config/model-registry";
+import { AgentSession } from "../../../src/session/agent-session";
+import { SessionManager } from "../../../src/session/session-manager";
 import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
 import { InputController } from "../../../src/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "../../../src/modes/types";
@@ -20,6 +25,7 @@ import {
 } from "../../../src/utils/run-status";
 import * as titleGenerator from "../../../src/utils/title-generator";
 import { attachTerminal, createInteractiveModeContext } from "../../helpers/interactive-mode-context";
+import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
 
 beforeAll(() => {
 	initTheme();
@@ -37,6 +43,7 @@ function makeHarness(approvalTimeout?: number) {
 			: {}),
 		session: {
 			agent,
+			isStreaming: true,
 			setUsageFallbackConfirmer: vi.fn(),
 			prompt: vi.fn(async (text: string, options?: PromptOptions) => {
 				const message = { role: "user" as const, content: text, timestamp: Date.now() };
@@ -769,6 +776,86 @@ describe("ExtensionUiController tool approval", () => {
 		expect(harness.approvalSlot()).toBe(true);
 		harness.term.press("escape");
 		expect(await nextTurn).toBe("deny");
+	});
+
+	it("denies every pending approval even when steering delivery never finishes", async () => {
+		const harness = makeHarness(120);
+		const delivery = Promise.withResolvers<boolean>();
+		spyOn(harness.ctx.session, "prompt").mockReturnValue(delivery.promise);
+		vi.useFakeTimers();
+		const first = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		const second = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(120_000);
+		for (const error of await Promise.all([first, second])) {
+			expect(error.message).toContain("Tool approval timed out");
+		}
+		expect(harness.approvalSlot()).toBe(false);
+		delivery.resolve(false);
+	});
+
+	it("denies idle real-session approvals before delivering the timeout as a follow-up", async () => {
+		const auth = createInMemoryAuthStorage();
+		auth.keys.setRuntime("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: { content: ["continued after timeout"] } });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "tools.approvalTimeout": 0.01 });
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(auth, "/nonexistent-approval-timeout-models.yml"),
+			toolRegistry: new Map(),
+		});
+		const ctx = createInteractiveModeContext({ settings, session });
+		attachTerminal(ctx);
+		const controller = new ExtensionUiController(ctx);
+		const ended = Promise.withResolvers<void>();
+		let approvalVisibleWhenFollowUpArrived: boolean | undefined;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "user") {
+				approvalVisibleWhenFollowUpArrived = ctx.shell.dock.slot("approval").occupied();
+			}
+			if (event.type === "agent_end") ended.resolve();
+		});
+		try {
+			expect(session.isStreaming).toBe(false);
+			vi.useFakeTimers();
+			const first = controller.showCollabAwareApproval(prompt).catch(error => error);
+			const second = controller.showCollabAwareApproval(prompt).catch(error => error);
+			vi.advanceTimersByTime(10);
+			for (const error of await Promise.all([first, second])) {
+				expect(error.message).toContain("Tool approval timed out");
+			}
+			expect(ctx.shell.dock.slot("approval").occupied()).toBe(false);
+			vi.useRealTimers();
+			await ended.promise;
+			expect(approvalVisibleWhenFollowUpArrived).toBe(false);
+			expect(session.messages.filter(message => message.role === "user")).toMatchObject([
+				{
+					content: [
+						{
+							type: "text",
+							text: "Not approved in time. Do not work around it. Send Inbox a durable ask with the exact command and why, then continue other work.",
+						},
+					],
+				},
+			]);
+			expect(session.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "continued after timeout" }],
+			});
+		} finally {
+			controller.cancelToolApprovals();
+			vi.useRealTimers();
+			unsubscribe();
+			await session.dispose();
+			auth.close();
+		}
 	});
 
 	it("does not label a human's identical steering text as a timeout", async () => {
