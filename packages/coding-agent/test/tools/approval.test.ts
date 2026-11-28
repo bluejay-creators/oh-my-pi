@@ -842,6 +842,19 @@ describe("argv-aware bash approval regressions", () => {
 			}
 		}
 	});
+	it("attributes grep count flags as data but never its executable pager program", () => {
+		const rules = [{ match: "git -C * -c *", approval: "prompt" }] as const;
+		const tool = createBashTool({ "bash.allowCompoundCommands": true, "bash.patterns": rules });
+		const count = "git -C /tmp/fixture-repo grep -c -w -i example";
+		expect(resolveApproval(tool, { command: count }, "yolo").policy).toBe("allow");
+		expect(getBashApprovalOverrideClasses(count, rules)).toContain("inert-data");
+		for (const pager of ["-O'(sudo true)'", "--open-files-in-pager='(sudo true)'"]) {
+			const command = `git -C /tmp/fixture-repo grep -c ${pager} example`;
+			expect(resolveApproval(tool, { command }, "yolo").policy, command).toBe("prompt");
+			expect(getBashApprovalOverrideClasses(command, rules), command).toEqual([]);
+		}
+	});
+
 	it("never classifies argument-selected programs as inert quoted data", () => {
 		const rules = [
 			{ match: "sudo *", approval: "prompt" },

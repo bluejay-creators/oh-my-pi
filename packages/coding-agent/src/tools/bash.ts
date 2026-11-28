@@ -843,9 +843,15 @@ function isInertBashRestrictionData(segment: ApprovalShellSegment, rule: BashApp
 	if (argv.some(arg => /^(?:--pre|--pre-glob|--hostname-bin|--jq|--template)(?:=|$)/u.test(arg))) return false;
 	if (executable === "git") {
 		const git = normalizeGitApprovalArgv(argv, [], { directory: undefined, sawSymlink: false, uncertain: false });
+		if (git?.argv[1] === "grep") {
+			for (const arg of git.argv.slice(2)) {
+				if (arg === "--") break;
+				if (/^--open-files-in-pager(?:=|$)|^-[^-]*O/u.test(arg)) return false;
+			}
+		}
 		// In particular, a log path named `config` is not the config subcommand.
 		return !!git && !git.unknown && !git.configOverride && !git.repositoryOverride &&
-			/^(?:log|show|status|diff|rev-parse|rev-list|ls-files|ls-tree|cat-file|for-each-ref)$/u.test(git.argv[1] ?? "") &&
+			/^(?:log|show|status|diff|rev-parse|rev-list|ls-files|ls-tree|cat-file|for-each-ref|grep)$/u.test(git.argv[1] ?? "") &&
 			!commandMatchesBashApprovalPattern(git.argv.join(" "), rule.match);
 	}
 	const dataCommand = /^(?:echo|printf|cat|tee|grep|rg)$/u.test(executable) ||
