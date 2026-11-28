@@ -6849,6 +6849,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		// mutex deny on arrival instead of prompting a torn-down UI. `init`
 		// installs a fresh one.
 		this.#dialogLifetime.abort();
+		this.#extensionUiController.cancelToolApprovals();
+		this.#extensionUiController.disposeApprovalRecovery();
 		this.#streamPublisher?.dispose();
 		this.#streamPublisher = undefined;
 		void this.#recorder?.stop();
@@ -7852,6 +7854,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async prepareSessionSwitch(): Promise<void> {
+		this.#extensionUiController.cancelToolApprovals();
 		this.#clearJudgmentBatchProgress();
 		await this.#btwController.dispose();
 		this.#omfgController.dispose();

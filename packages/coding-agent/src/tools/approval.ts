@@ -39,6 +39,14 @@ export type { ToolApproval, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-
 
 export type ApprovalPolicy = "allow" | "deny" | "prompt";
 
+/** A host timed out an unanswered approval, rather than receiving a human denial. */
+export class ToolApprovalTimeoutError extends Error {
+	constructor(readonly details: string) {
+		super(`Tool approval timed out (tools.approvalTimeout).\n${details}`);
+		this.name = "ToolApprovalTimeoutError";
+	}
+}
+
 /** Every approval mode: the type below and `isApprovalMode` read from one list. */
 const APPROVAL_MODES = ["always-ask", "always-ask-cached", "write", "yolo"] as const;
 export type ApprovalMode = (typeof APPROVAL_MODES)[number];

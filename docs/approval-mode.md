@@ -148,6 +148,36 @@ In the interactive UI the prompt docks above the composer until answered with a 
 
 An Ask and remember prompt with grants lists the **Remember across sessions** toggle and the grant choices above **Approve Once**, which is highlighted on mount. `Enter` on the toggle flips it, and the grant labels switch to their **Always …** forms. `Ctrl+Enter` still approves only this call.
 
+### Unanswered approvals
+
+`tools.approvalTimeout` sets an interactive approval deadline in seconds. It defaults to `0` (no deadline); leaving it unset also preserves the unlimited wait. For unattended fleet panes:
+
+```yaml
+tools:
+   approvalTimeout: 120
+```
+
+When an approval remains unanswered past its deadline, OMP directly denies every pending approval, then delivers this fixed message through the existing user-message path (as steering during a turn, or a follow-up when idle):
+
+> Not approved in time. Do not work around it. Send Inbox a durable ask with the exact command and why, then continue other work.
+
+Automatic recovery is limited to one message per session until a genuine human message or a human approval answer resets it. Recovery messages carry agent attribution, so consuming the automatic message never replenishes that budget. If another approval times out first, OMP denies it without another steer or follow-up, stops the active turn after its native tool results settle, and displays/logs: `Approval timed out again; idle until a human responds.` Switching conversations does not replenish a session's recovery budget.
+
+The timeout closes all pending approvals, including requests queued behind another dialog, even if message delivery fails. During a tool turn, the queued steering also denies later requests in the same batch. Each affected call reports an explicit approval timeout with its prompt and the policy or reason that required approval. Answering before the deadline behaves normally. Answering, aborting, switching sessions, and shutting down clear the timers. This setting applies to the interactive terminal/Tern approval controller (including idle extension prompts and collab answers); headless, RPC, ACP, and subagent approval behavior is unchanged.
+
+This deadline belongs only to the tool-approval component, including plain **Approve**, session approvals, **Approve Once** with remembered grants, and expanded details. It never applies to the `ask` tool, AskDialog, forms, selectors, input dialogs, or other user-question UI.
+
+The schema default remains unlimited (`0`). A fleet can set its global `~/.omp/agent/config.yml` value to `120`, while individual sessions use normal settings overlays or project configuration to override it. Unlike restrictive bash rules, this scalar setting can be lowered by the project layer.
+
+For an Inbox session launched in `/Users/jubin/roles/inbox`, exempt it in `/Users/jubin/roles/inbox/.omp/config.yml`:
+
+```yaml
+tools:
+   approvalTimeout: 0
+```
+
+That project value stays effective even when the global fleet timeout reloads. No environment override or hard-coded role detection is needed. If Inbox launches from a different project directory, put the same exemption in that directory's `.omp/config.yml` before enabling the fleet timeout. Settings changes affect newly requested approvals; an already pending approval keeps the deadline it started with.
+
 ## Defining approval on tools
 
 Built-in and custom tools share the same shape:

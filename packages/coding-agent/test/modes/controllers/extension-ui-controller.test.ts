@@ -1,14 +1,21 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, spyOn, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Type } from "@oh-my-pi/omptype/typebox";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { bubbleEvent } from "@oh-my-pi/pi-tui/dispatch";
 import type { TestTerminal } from "@oh-my-pi/pi-tui/testing/terminal";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
 import type { ExtensionAskDialogQuestion, ExtensionUIContext } from "../../../src/extensibility/extensions";
 import type { ExtensionRows } from "../../../src/extensibility/extensions/render-types";
 import { isSettingsInitialized, Settings } from "../../../src/config/settings";
+import { ModelRegistry } from "../../../src/config/model-registry";
+import { AgentSession } from "../../../src/session/agent-session";
+import { SessionManager } from "../../../src/session/session-manager";
 import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
 import { InputController } from "../../../src/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "../../../src/modes/types";
+import type { PromptOptions } from "../../../src/session/agent-session-types";
 import { initTheme } from "../../../src/ui/theme/service";
 import * as externalEditor from "../../../src/utils/external-editor";
 import {
@@ -19,21 +26,37 @@ import {
 } from "../../../src/utils/run-status";
 import * as titleGenerator from "../../../src/utils/title-generator";
 import { attachTerminal, createInteractiveModeContext } from "../../helpers/interactive-mode-context";
+import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
 
 beforeAll(() => {
 	initTheme();
 });
 
-function makeHarness() {
+function makeHarness(approvalTimeout?: number) {
 	let uiContext: ExtensionUIContext | undefined;
 	// A real agent-core queue: approvals track and reorder its steering messages.
 	const agent = new Agent();
 	const steeringChips = () =>
 		agent.peekSteeringQueue().map(message => (message.role === "user" ? String(message.content) : ""));
 	const ctx: InteractiveModeContext = createInteractiveModeContext({
+		...(approvalTimeout !== undefined
+			? { settings: Settings.isolated({ "tools.approvalTimeout": approvalTimeout }) }
+			: {}),
 		session: {
 			agent,
+			isStreaming: true,
 			setUsageFallbackConfirmer: vi.fn(),
+			prompt: vi.fn(async (text: string, options?: PromptOptions) => {
+				const message = {
+					role: "user" as const,
+					content: text,
+					timestamp: Date.now(),
+					attribution: options?.attribution ?? ("user" as const),
+				};
+				agent.steer(message);
+				options?.onPromptQueued?.([message]);
+				return true;
+			}),
 			getQueuedMessages: () => ({ steering: steeringChips(), followUp: [], liveSteered: 0 }),
 			subscribe: ((listener: (event: { type: string; steering?: string[] }) => void) =>
 				agent.onQueueChange(() =>
@@ -233,6 +256,45 @@ describe("ExtensionUiController ask dialog", () => {
 		expect(prompt.closed).toBe(true);
 		expect(harness.ctx.shell.focused()).toBe(ask);
 	});
+
+	it.each(["ask", "form", "selector", "input"])(
+		"leaves the %s question UI pending beyond the tool approval deadline",
+		async kind => {
+			const harness = makeHarness(0.01);
+			const abort = new AbortController();
+			vi.useFakeTimers();
+			try {
+				let pending: Promise<unknown>;
+				if (kind === "ask") pending = harness.controller.showAskDialog(questions, { signal: abort.signal });
+				else if (kind === "form") {
+					pending = harness.controller.showFormDialog(
+						'<form><label>Name <input name="name"></label></form>',
+						{ signal: abort.signal },
+					);
+				} else if (kind === "selector") {
+					pending = harness.controller.showHookSelector("Choose", ["Yes", "No"], { signal: abort.signal });
+				} else pending = harness.controller.showHookInput("Answer", undefined, { signal: abort.signal });
+				let settled = false;
+				void pending.then(() => {
+					settled = true;
+				});
+				vi.advanceTimersByTime(1_000);
+				await flushMicrotasks();
+				expect(settled).toBe(false);
+				expect(harness.approvalSlot()).toBe(false);
+				if (kind === "ask" || kind === "form") expect(harness.askSlot()).toBe(true);
+				else if (kind === "selector") expect(harness.ctx.hookSelector).toBeDefined();
+				else expect(harness.ctx.hookInput).toBeDefined();
+				expect(harness.ctx.session.prompt).not.toHaveBeenCalled();
+				expect(harness.agent.peekSteeringQueue()).toHaveLength(0);
+				abort.abort();
+				expect(await pending).toBeUndefined();
+			} finally {
+				abort.abort();
+				vi.useRealTimers();
+			}
+		},
+	);
 });
 
 describe("ExtensionUiController image paste into prompts", () => {
@@ -518,6 +580,7 @@ describe("ExtensionUiController tool approval", () => {
 		spyOn(Date, "now").mockImplementation(() => now);
 	});
 	afterEach(() => {
+		vi.useRealTimers();
 		vi.restoreAllMocks();
 	});
 
@@ -686,6 +749,350 @@ describe("ExtensionUiController tool approval", () => {
 		const answer = await harness.controller.showCollabAwareApproval(prompt, { timeout: 10, onTimeout });
 		expect(answer).toBe("deny");
 		expect(onTimeout).toHaveBeenCalledTimes(1);
+		expect(harness.approvalSlot()).toBe(false);
+	});
+
+	it("times out through steering with the exact instruction and retains the prompting reason", async () => {
+		const harness = makeHarness(120);
+		vi.useFakeTimers();
+		const detailed = { ...prompt, full: `${prompt.full}\nReason: Matched prompt pattern: rm *` };
+		const pending = harness.controller.showCollabAwareApproval(detailed).catch(error => error);
+		vi.advanceTimersByTime(119_999);
+		await flushMicrotasks();
+		expect(harness.approvalSlot()).toBe(true);
+		expect(harness.ctx.session.prompt).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		const error = await pending;
+		expect(error).toBeInstanceOf(Error);
+		expect(error.message).toContain("Tool approval timed out (tools.approvalTimeout)");
+		expect(error.message).toContain("Reason: Matched prompt pattern: rm *");
+		expect(harness.ctx.session.prompt).toHaveBeenCalledTimes(1);
+		expect(harness.ctx.session.prompt).toHaveBeenCalledWith(
+			"Not approved in time. Do not work around it. Send Inbox a durable ask with the exact command and why, then continue other work.",
+			expect.objectContaining({ streamingBehavior: "steer", expandPromptTemplates: false, runCommands: false }),
+		);
+		expect(harness.agent.peekSteeringQueue()).toHaveLength(1);
+		expect(harness.approvalSlot()).toBe(false);
+	});
+
+	it.each(["plain", "session", "grants", "remembered grants", "expanded"])(
+		"times out the %s tool approval layout",
+		async variant => {
+			const harness = makeHarness(0.01);
+			const hasGrants = variant === "grants" || variant === "remembered grants";
+			const approval = {
+				...prompt,
+				...(variant === "expanded" ? { full: `${prompt.full}\nFull approval detail` } : {}),
+				...(variant === "session" ? { session: "Approve bash for this session" } : {}),
+				...(hasGrants
+					? {
+							grants: [
+								{ scope: "target" as const, label: "Approve File", alwaysLabel: "Always Approve File" },
+							],
+						}
+					: {}),
+			};
+			vi.useFakeTimers();
+			const pending = harness.controller.showCollabAwareApproval(approval).catch(error => error);
+			expect(harness.screen()).toContain(hasGrants ? "Approve Once" : "Approve");
+			if (variant === "remembered grants") {
+				const dialog = harness.ctx.shell.focused()!;
+				const choices = dialog.children().find(node => node.key() === "choices")!;
+				bubbleEvent([dialog, choices], { type: "select", key: "choices", item: "remember" });
+				expect(harness.screen()).toContain("Always Approve File");
+			} else if (variant === "expanded") {
+				const dialog = harness.ctx.shell.focused()!;
+				bubbleEvent([dialog], { type: "action", key: "actions/expand", act: "expand", mods: [] });
+				expect(harness.screen()).toContain("Full approval detail");
+			}
+			vi.advanceTimersByTime(10);
+			expect((await pending).message).toContain("Tool approval timed out");
+			expect(harness.approvalSlot()).toBe(false);
+			expect(harness.ctx.session.prompt).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it("keeps a human answer before the deadline and cancels its timeout", async () => {
+		const harness = makeHarness(120);
+		vi.useFakeTimers();
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		vi.advanceTimersByTime(1_000);
+		now = 2_000;
+		harness.term.press("enter");
+		expect(await pending).toBe("once");
+		vi.advanceTimersByTime(120_000);
+		await flushMicrotasks();
+		expect(harness.ctx.session.prompt).not.toHaveBeenCalled();
+		expect(harness.agent.peekSteeringQueue()).toHaveLength(0);
+	});
+
+	it.each([0, undefined])("waits indefinitely with approvalTimeout %s", async timeout => {
+		const harness = makeHarness(timeout);
+		vi.useFakeTimers();
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		vi.advanceTimersByTime(86_400_000);
+		await flushMicrotasks();
+		expect(harness.approvalSlot()).toBe(true);
+		expect(harness.ctx.session.prompt).not.toHaveBeenCalled();
+		harness.term.press("escape");
+		expect(await pending).toBe("deny");
+	});
+
+	it("one timeout denies all pending approvals and later approvals of the same batch", async () => {
+		const harness = makeHarness(120);
+		vi.useFakeTimers();
+		const first = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		const second = harness.controller
+			.showCollabAwareApproval({ ...prompt, full: "Allow tool: write\nPath: config.yml" })
+			.catch(error => error);
+		vi.advanceTimersByTime(120_000);
+		for (const error of await Promise.all([first, second])) {
+			expect(error).toBeInstanceOf(Error);
+			expect(error.message).toContain("Tool approval timed out");
+		}
+		expect(harness.ctx.session.prompt).toHaveBeenCalledTimes(1);
+		expect(harness.approvalSlot()).toBe(false);
+		await expect(harness.controller.showCollabAwareApproval(prompt)).rejects.toThrow("Tool approval timed out");
+		harness.deliverSteering();
+		const nextTurn = harness.controller.showCollabAwareApproval(prompt);
+		expect(harness.approvalSlot()).toBe(true);
+		harness.term.press("escape");
+		expect(await nextTurn).toBe("deny");
+	});
+
+	it("denies every pending approval even when steering delivery never finishes", async () => {
+		const harness = makeHarness(120);
+		const delivery = Promise.withResolvers<boolean>();
+		spyOn(harness.ctx.session, "prompt").mockReturnValue(delivery.promise);
+		vi.useFakeTimers();
+		const first = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		const second = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(120_000);
+		for (const error of await Promise.all([first, second])) {
+			expect(error.message).toContain("Tool approval timed out");
+		}
+		expect(harness.approvalSlot()).toBe(false);
+		delivery.resolve(false);
+	});
+
+	it("denies idle real-session approvals before delivering the timeout as a follow-up", async () => {
+		const auth = createInMemoryAuthStorage();
+		auth.keys.setRuntime("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: { content: ["continued after timeout"] } });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "tools.approvalTimeout": 0.01 });
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(auth, "/nonexistent-approval-timeout-models.yml"),
+			toolRegistry: new Map(),
+		});
+		const ctx = createInteractiveModeContext({ settings, session });
+		attachTerminal(ctx);
+		const controller = new ExtensionUiController(ctx);
+		const ended = Promise.withResolvers<void>();
+		let approvalVisibleWhenFollowUpArrived: boolean | undefined;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "user") {
+				approvalVisibleWhenFollowUpArrived = ctx.shell.dock.slot("approval").occupied();
+			}
+			if (event.type === "agent_end") ended.resolve();
+		});
+		try {
+			expect(session.isStreaming).toBe(false);
+			vi.useFakeTimers();
+			const first = controller.showCollabAwareApproval(prompt).catch(error => error);
+			const second = controller.showCollabAwareApproval(prompt).catch(error => error);
+			vi.advanceTimersByTime(10);
+			for (const error of await Promise.all([first, second])) {
+				expect(error.message).toContain("Tool approval timed out");
+			}
+			expect(ctx.shell.dock.slot("approval").occupied()).toBe(false);
+			vi.useRealTimers();
+			await ended.promise;
+			expect(approvalVisibleWhenFollowUpArrived).toBe(false);
+			expect(session.messages.filter(message => message.role === "user")).toMatchObject([
+				{
+					content: [
+						{
+							type: "text",
+							text: "Not approved in time. Do not work around it. Send Inbox a durable ask with the exact command and why, then continue other work.",
+						},
+					],
+				},
+			]);
+			expect(session.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "continued after timeout" }],
+			});
+		} finally {
+			controller.cancelToolApprovals();
+			vi.useRealTimers();
+			unsubscribe();
+			await session.dispose();
+			auth.close();
+		}
+	});
+
+	it.each(["message", "approval answer"])("a genuine human %s restores the automatic recovery budget", async kind => {
+		const harness = makeHarness(0.01);
+		vi.useFakeTimers();
+		const first = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(10);
+		await first;
+		harness.deliverSteering();
+		if (kind === "message") {
+			harness.queueSteer("I am here; continue");
+			harness.deliverSteering();
+		} else {
+			const answered = harness.controller.showCollabAwareApproval(prompt);
+			harness.term.press("escape");
+			expect(await answered).toBe("deny");
+		}
+		const next = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(10);
+		expect((await next).message).toContain("Tool approval timed out");
+		expect(harness.ctx.session.prompt).toHaveBeenCalledTimes(2);
+		harness.controller.disposeApprovalRecovery();
+	});
+
+	it("does not replenish recovery when a dialog's own countdown denies without a human", async () => {
+		const harness = makeHarness(120);
+		vi.useFakeTimers();
+		const first = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(120_000);
+		await first;
+		harness.deliverSteering();
+		const countdown = harness.controller.showCollabAwareApproval(prompt, { timeout: 10 });
+		vi.advanceTimersByTime(10);
+		expect(await countdown).toBe("deny");
+		const repeated = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(120_000);
+		expect((await repeated).message).toContain("Tool approval timed out");
+		expect(harness.ctx.session.prompt).toHaveBeenCalledTimes(1);
+		expect(harness.ctx.showStatus).toHaveBeenCalledWith("Approval timed out again; idle until a human responds.");
+		harness.controller.disposeApprovalRecovery();
+	});
+
+	it.each(["idle", "active"])("bounds the %s timeout recovery chain to one automatic message", async origin => {
+		const auth = createInMemoryAuthStorage();
+		auth.keys.setRuntime("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({
+			handler: { content: [{ type: "toolCall", name: "needs_approval", arguments: {} }] },
+		});
+		let requests = 0;
+		let controller: ExtensionUiController;
+		const tool = {
+			name: "needs_approval",
+			label: "Needs Approval",
+			description: "A recovery action that also requires approval",
+			parameters: Type.Object({}),
+			execute: async () => {
+				requests++;
+				await controller.showCollabAwareApproval(prompt);
+				return { content: [{ type: "text" as const, text: "approved" }] };
+			},
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [tool] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "tools.approvalTimeout": 0.01 });
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(auth, "/nonexistent-approval-recovery-models.yml"),
+			toolRegistry: new Map([[tool.name, tool]]),
+		});
+		const ctx = createInteractiveModeContext({ settings, session, sessionManager: session.sessionManager });
+		attachTerminal(ctx);
+		controller = new ExtensionUiController(ctx);
+		const ended = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_end") ended.resolve();
+		});
+		try {
+			vi.useFakeTimers();
+			const initial =
+				origin === "idle"
+					? controller.showCollabAwareApproval(prompt).catch(error => error)
+					: session.prompt("Human starts a tool turn").catch(error => error);
+			if (origin === "active") {
+				for (let i = 0; i < 1_000 && requests < 1; i++) {
+					vi.advanceTimersByTime(1);
+					await flushMicrotasks();
+				}
+				expect(requests).toBe(1);
+			}
+			vi.advanceTimersByTime(10);
+			if (origin === "idle") await initial;
+			const expectedRequests = origin === "idle" ? 1 : 2;
+			for (let i = 0; i < 1_000 && requests < expectedRequests; i++) {
+				vi.advanceTimersByTime(1);
+				await flushMicrotasks();
+			}
+			expect(requests).toBe(expectedRequests);
+			vi.advanceTimersByTime(10);
+			vi.useRealTimers();
+			await ended.promise;
+			await initial;
+			await agent.waitForIdle();
+			expect(session.isStreaming).toBe(false);
+			expect(ctx.shell.dock.slot("approval").occupied()).toBe(false);
+			expect(mock.calls).toHaveLength(origin === "idle" ? 1 : 2);
+			expect(
+				session.messages.filter(message => message.role === "user" && message.attribution === "agent"),
+			).toHaveLength(1);
+			expect(session.messages.filter(message => message.role === "toolResult").at(-1)).toMatchObject({
+				isError: true,
+				content: [{ type: "text", text: expect.stringContaining("Tool approval timed out") }],
+			});
+			expect(ctx.showStatus).toHaveBeenCalledWith("Approval timed out again; idle until a human responds.");
+		} finally {
+			controller.cancelToolApprovals();
+			controller.disposeApprovalRecovery();
+			vi.useRealTimers();
+			unsubscribe();
+			await session.dispose();
+			auth.close();
+		}
+	});
+
+	it("does not label a human's identical steering text as a timeout", async () => {
+		const harness = makeHarness(120);
+		vi.useFakeTimers();
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		harness.queueSteer(
+			"Not approved in time. Do not work around it. Send Inbox a durable ask with the exact command and why, then continue other work.",
+		);
+		expect(await pending).toBe("deny");
+		vi.advanceTimersByTime(120_000);
+		expect(harness.ctx.session.prompt).not.toHaveBeenCalled();
+	});
+
+	it.each(["abort", "session switch or shutdown"])("cancels pending deadlines on %s", async how => {
+		const harness = makeHarness(120);
+		const abort = new AbortController();
+		vi.useFakeTimers();
+		const first = harness.controller.showCollabAwareApproval(prompt, { signal: abort.signal });
+		const second = harness.controller.showCollabAwareApproval(prompt, { signal: abort.signal });
+		vi.advanceTimersByTime(119_999);
+		if (how === "abort") abort.abort();
+		else harness.controller.cancelToolApprovals();
+		expect(await first).toBe("deny");
+		expect(await second).toBe("deny");
+		vi.advanceTimersByTime(120_000);
+		await flushMicrotasks();
+		expect(harness.ctx.session.prompt).not.toHaveBeenCalled();
 		expect(harness.approvalSlot()).toBe(false);
 	});
 });
