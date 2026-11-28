@@ -10,6 +10,7 @@ import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } f
 import { cfgEditModelVariants } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { cfgCompactionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { cfgProvidersMaxInFlightRequests, cfgTemperature } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { cfgToolsApprovalTimeout } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
 describe("Settings layer refresh", () => {
 	let state: SettingsTestState | undefined;
@@ -44,6 +45,28 @@ describe("Settings layer refresh", () => {
 		fs.mkdirSync(getProjectAgentDir(project), { recursive: true });
 		fs.writeFileSync(path.join(getProjectAgentDir(project), "settings.json"), JSON.stringify(settings));
 	}
+
+	it("keeps Inbox's project timeout exemption over fleet config and isolates per-session overrides", async () => {
+		await writeConfig({ tools: { approvalTimeout: 120 } });
+		fs.writeFileSync(
+			path.join(getProjectAgentDir(scopedProject), "config.yml"),
+			"tools:\n  approvalTimeout: 0\n",
+		);
+		const fleet = await Settings.loadIsolated({ cwd: startProject, agentDir });
+		const inbox = await Settings.loadIsolated({ cwd: scopedProject, agentDir });
+		const sessionOverride = fleet.overlay({ "tools.approvalTimeout": 30 });
+		expect(cfgToolsApprovalTimeout.get(fleet)).toBe(120);
+		expect(cfgToolsApprovalTimeout.get(inbox)).toBe(0);
+		expect(cfgToolsApprovalTimeout.get(sessionOverride)).toBe(30);
+		expect(cfgToolsApprovalTimeout.get(fleet)).toBe(120);
+
+		await writeConfig({ tools: { approvalTimeout: 180 } });
+		await fleet.reloadFromDisk();
+		await inbox.reloadFromDisk();
+		expect(cfgToolsApprovalTimeout.get(fleet)).toBe(180);
+		expect(cfgToolsApprovalTimeout.get(inbox)).toBe(0);
+		expect(cfgToolsApprovalTimeout.get(sessionOverride)).toBe(30);
+	});
 
 	it("rejects an on-disk value that fails validation and keeps the previous layers", async () => {
 		await writeConfig({ providers: { maxInFlightRequests: { openai: 2 } } });

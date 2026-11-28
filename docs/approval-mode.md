@@ -163,6 +163,19 @@ When an approval remains unanswered past its deadline, OMP directly denies every
 
 The timeout closes all pending approvals, including requests queued behind another dialog, even if message delivery fails. During a tool turn, the queued steering also denies later requests in the same batch. Each affected call reports an explicit approval timeout with its prompt and the policy or reason that required approval. Answering before the deadline behaves normally. Answering, aborting, switching sessions, and shutting down clear the timers. This setting applies to the interactive terminal/Tern approval controller (including idle extension prompts and collab answers); headless, RPC, ACP, and subagent approval behavior is unchanged.
 
+This deadline belongs only to the tool-approval component, including plain **Approve**, session approvals, **Approve Once** with remembered grants, and expanded details. It never applies to the `ask` tool, AskDialog, forms, selectors, input dialogs, or other user-question UI.
+
+The schema default remains unlimited (`0`). A fleet can set its global `~/.omp/agent/config.yml` value to `120`, while individual sessions use normal settings overlays or project configuration to override it. Unlike restrictive bash rules, this scalar setting can be lowered by the project layer.
+
+For an Inbox session launched in `/Users/jubin/roles/inbox`, exempt it in `/Users/jubin/roles/inbox/.omp/config.yml`:
+
+```yaml
+tools:
+   approvalTimeout: 0
+```
+
+That project value stays effective even when the global fleet timeout reloads. No environment override or hard-coded role detection is needed. If Inbox launches from a different project directory, put the same exemption in that directory's `.omp/config.yml` before enabling the fleet timeout. Settings changes affect newly requested approvals; an already pending approval keeps the deadline it started with.
+
 ## Defining approval on tools
 
 Built-in and custom tools share the same shape:

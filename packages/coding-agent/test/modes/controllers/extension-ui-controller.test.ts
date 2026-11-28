@@ -250,6 +250,45 @@ describe("ExtensionUiController ask dialog", () => {
 		expect(prompt.closed).toBe(true);
 		expect(harness.ctx.shell.focused()).toBe(ask);
 	});
+
+	it.each(["ask", "form", "selector", "input"])(
+		"leaves the %s question UI pending beyond the tool approval deadline",
+		async kind => {
+			const harness = makeHarness(0.01);
+			const abort = new AbortController();
+			vi.useFakeTimers();
+			try {
+				let pending: Promise<unknown>;
+				if (kind === "ask") pending = harness.controller.showAskDialog(questions, { signal: abort.signal });
+				else if (kind === "form") {
+					pending = harness.controller.showFormDialog(
+						'<form><label>Name <input name="name"></label></form>',
+						{ signal: abort.signal },
+					);
+				} else if (kind === "selector") {
+					pending = harness.controller.showHookSelector("Choose", ["Yes", "No"], { signal: abort.signal });
+				} else pending = harness.controller.showHookInput("Answer", undefined, { signal: abort.signal });
+				let settled = false;
+				void pending.then(() => {
+					settled = true;
+				});
+				vi.advanceTimersByTime(1_000);
+				await flushMicrotasks();
+				expect(settled).toBe(false);
+				expect(harness.approvalSlot()).toBe(false);
+				if (kind === "ask" || kind === "form") expect(harness.askSlot()).toBe(true);
+				else if (kind === "selector") expect(harness.ctx.hookSelector).toBeDefined();
+				else expect(harness.ctx.hookInput).toBeDefined();
+				expect(harness.ctx.session.prompt).not.toHaveBeenCalled();
+				expect(harness.agent.peekSteeringQueue()).toHaveLength(0);
+				abort.abort();
+				expect(await pending).toBeUndefined();
+			} finally {
+				abort.abort();
+				vi.useRealTimers();
+			}
+		},
+	);
 });
 
 describe("ExtensionUiController image paste into prompts", () => {
@@ -729,6 +768,43 @@ describe("ExtensionUiController tool approval", () => {
 		expect(harness.agent.peekSteeringQueue()).toHaveLength(1);
 		expect(harness.approvalSlot()).toBe(false);
 	});
+
+	it.each(["plain", "session", "grants", "remembered grants", "expanded"])(
+		"times out the %s tool approval layout",
+		async variant => {
+			const harness = makeHarness(0.01);
+			const hasGrants = variant === "grants" || variant === "remembered grants";
+			const approval = {
+				...prompt,
+				...(variant === "expanded" ? { full: `${prompt.full}\nFull approval detail` } : {}),
+				...(variant === "session" ? { session: "Approve bash for this session" } : {}),
+				...(hasGrants
+					? {
+							grants: [
+								{ scope: "target" as const, label: "Approve File", alwaysLabel: "Always Approve File" },
+							],
+						}
+					: {}),
+			};
+			vi.useFakeTimers();
+			const pending = harness.controller.showCollabAwareApproval(approval).catch(error => error);
+			expect(harness.screen()).toContain(hasGrants ? "Approve Once" : "Approve");
+			if (variant === "remembered grants") {
+				const dialog = harness.ctx.shell.focused()!;
+				const choices = dialog.children().find(node => node.key() === "choices")!;
+				bubbleEvent([dialog, choices], { type: "select", key: "choices", item: "remember" });
+				expect(harness.screen()).toContain("Always Approve File");
+			} else if (variant === "expanded") {
+				const dialog = harness.ctx.shell.focused()!;
+				bubbleEvent([dialog], { type: "action", key: "actions/expand", act: "expand", mods: [] });
+				expect(harness.screen()).toContain("Full approval detail");
+			}
+			vi.advanceTimersByTime(10);
+			expect((await pending).message).toContain("Tool approval timed out");
+			expect(harness.approvalSlot()).toBe(false);
+			expect(harness.ctx.session.prompt).toHaveBeenCalledTimes(1);
+		},
+	);
 
 	it("keeps a human answer before the deadline and cancels its timeout", async () => {
 		const harness = makeHarness(120);
