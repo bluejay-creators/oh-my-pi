@@ -471,7 +471,7 @@ describe("argv-aware bash approval regressions", () => {
 		{ match: "git *", approval: "allow" },
 		{ match: "gh pr create *", approval: "allow" },
 		{ match: "echo *", approval: "allow" },
-	];
+	] as const;
 	function policy(command: string, cwd?: string) {
 		return resolveApproval(createBashTool({
 			"bash.allowCompoundCommands": true, "bash.patterns": patterns,
