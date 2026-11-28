@@ -9,6 +9,8 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { GIT_PUSH_CONFIG_PATTERN, isGitPushBranchConfigSafe, parseGitPushConfig } from "./bash-git-push-config";
+import { isReadOnlyGitApprovalArgv } from "./bash-git-readonly";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -673,22 +675,30 @@ function normalizeGitApprovalArgv(
 // Approval is synchronous. Port the bounded, read-only Git query used by the
 // feature-push policy; never execute any text from the command being assessed.
 function approvalGitOutput(directory: string, args: string[], rejectWarnings = false): string | undefined {
-	const result = Bun.spawnSync({
-		cmd: ["git", "-C", directory, ...args],
-		stdin: "ignore", stdout: "pipe", stderr: rejectWarnings ? "pipe" : "ignore", timeout: 1000,
-		env: { ...Bun.env, GIT_OPTIONAL_LOCKS: "0" },
-	});
-	return result.exitCode === 0 && (!rejectWarnings || !result.stderr?.length) ? result.stdout.toString().trim() : undefined;
+	try {
+		const result = Bun.spawnSync({
+			cmd: ["git", "-C", directory, ...args],
+			stdin: "ignore", stdout: "pipe", stderr: rejectWarnings ? "pipe" : "ignore", timeout: 1000,
+			env: { ...Bun.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" },
+		});
+		return result.exitCode === 0 && (!rejectWarnings || !result.stderr?.length) ? result.stdout.toString().trim() : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function approvalGitRefAbsent(directory: string, ref: string): boolean {
-	const result = Bun.spawnSync({
-		cmd: ["git", "-C", directory, "show-ref", "--verify", "--quiet", ref],
-		stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 1000,
-		env: { ...Bun.env, GIT_OPTIONAL_LOCKS: "0" },
-	});
-	// Missing is distinct from an unreadable ref or failed Git invocation.
-	return result.exitCode === 1 && result.stderr.length === 0;
+	try {
+		const result = Bun.spawnSync({
+			cmd: ["git", "-C", directory, "show-ref", "--verify", "--quiet", ref],
+			stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 1000,
+			env: { ...Bun.env, GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" },
+		});
+		// Missing is distinct from an unreadable ref or failed Git invocation.
+		return result.exitCode === 1 && result.stderr.length === 0;
+	} catch {
+		return false;
+	}
 }
 
 function isProtectedPushRef(ref: string): boolean {
@@ -697,18 +707,26 @@ function isProtectedPushRef(ref: string): boolean {
 }
 
 function isFeaturePushRef(ref: string): boolean {
-	return ref.length > 0 && !isProtectedPushRef(ref) &&
+	return ref.length > 0 && ref !== "HEAD" && !isProtectedPushRef(ref) &&
 		!ref.startsWith("refs/tags/") && !ref.startsWith("refs/remotes/") &&
 		(!ref.startsWith("refs/") || ref.startsWith("refs/heads/")) &&
-		!/[\s$`*?[\]~^\\]|@\{|\.{2}/u.test(ref) && !ref.startsWith("+") && !ref.startsWith("-");
+		!/[\s:$`*?[\]~^\\]|@\{|\.{2}/u.test(ref) && !ref.startsWith("+") && !ref.startsWith("-");
 }
 
 type FeaturePushAssessment = "safe" | "plain-policy" | "prompt";
 
 function assessFeaturePush(git: GitApprovalCommand): FeaturePushAssessment {
 	if (git.argv.some(arg => /^(?:--tags|--follow-tags|--mirror|--all)$/u.test(arg))) return "prompt";
-	if (git.configOverride || git.repositoryOverride || git.unknown) return "plain-policy";
+	if (git.configOverride || git.repositoryOverride || git.unknown || !git.directory) return "prompt";
 	const directory = git.directory;
+	const currentRef = approvalGitOutput(directory, [
+		"rev-parse", "--verify", "--symbolic-full-name", "--end-of-options", "HEAD",
+	], true);
+	if (currentRef === undefined || currentRef !== "HEAD" && !currentRef.startsWith("refs/heads/")) return "prompt";
+	const currentBranch = currentRef === "HEAD" ? undefined : currentRef.slice(11);
+	const configOutput = approvalGitOutput(directory, ["config", "--null", "--get-regexp", GIT_PUSH_CONFIG_PATTERN], true);
+	const config = configOutput === undefined ? undefined : parseGitPushConfig(configOutput);
+	if (!config || !isGitPushBranchConfigSafe(config, currentBranch)) return "prompt";
 	const positional: string[] = [];
 	let options = true;
 	let forced = false;
@@ -732,66 +750,52 @@ function assessFeaturePush(git: GitApprovalCommand): FeaturePushAssessment {
 	}
 	if (unsupported) return forced || positional.some(arg => arg.startsWith("+")) ? "prompt" : "plain-policy";
 	const remote = positional.shift();
-	if (remote !== undefined && remote !== "origin") return "plain-policy";
-	// Namespace proof also constrains historical force permissions, but does
-	// not turn those permissions into new feature grants or require their source
-	// to be a branch (an explicit baseline may approve another commitish).
-	const provesBranchDestination = (destination: string): boolean =>
-		destination.startsWith("refs/heads/") || !!directory && approvalGitOutput(directory, [
-			"rev-parse", "--verify", "--end-of-options", `refs/remotes/origin/${destination}^{commit}`,
-		], true) !== undefined;
-	const provesRefspec = (source: string, destination: string): boolean => {
-		if (!directory || !isFeaturePushRef(destination)) return false;
-		const target = destination.replace(/^refs\/heads\//u, "");
+	if (remote !== undefined && remote !== "origin") return "prompt";
+	const sourceBranch = (source: string): string | undefined => {
+		if (source === "HEAD") return currentBranch;
 		const name = source.replace(/^refs\/heads\//u, "");
-		if (source !== "HEAD" && (!name || source.startsWith("refs/") && !source.startsWith("refs/heads/"))) return false;
-		const resolved = approvalGitOutput(directory, [
-			"-c", "core.warnAmbiguousRefs=true", "rev-parse", "--verify",
-			...(source === "HEAD" ? [] : ["--symbolic-full-name"]), "--end-of-options",
-			source === "HEAD" ? "HEAD^{commit}" : source,
-		], true);
-		if (!resolved || (source !== "HEAD" && resolved !== `refs/heads/${name}`)) return false;
+		if (!name || source.startsWith("refs/") && !source.startsWith("refs/heads/")) return undefined;
+		if (name === currentBranch) return name;
+		return approvalGitOutput(directory, [
+			"-c", "core.warnAmbiguousRefs=true", "rev-parse", "--verify", "--symbolic-full-name", "--end-of-options", source,
+		], true) === `refs/heads/${name}` ? name : undefined;
+	};
+	const safeSourceBranch = (branch: string | undefined): boolean => {
+		const pushRemote = branch === undefined ? undefined : config.get(`branch.${branch}.pushremote`);
+		return pushRemote === undefined || pushRemote === "origin";
+	};
+	const hasOriginUpstream = (branch: string | undefined, destination: string): boolean =>
+		branch !== undefined && config.get(`branch.${branch}.remote`) === "origin" &&
+		config.get(`branch.${branch}.merge`) === `refs/heads/${destination.replace(/^refs\/heads\//u, "")}`;
+	const provesRefspec = (source: string, destination: string, branch: string | undefined): boolean => {
+		if (!isFeaturePushRef(destination)) return false;
+		const target = destination.replace(/^refs\/heads\//u, "");
+		const name = source === "HEAD" ? "HEAD" : source.replace(/^refs\/heads\//u, "");
+		if (source === "HEAD") {
+			if (approvalGitOutput(directory, ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"], true) === undefined) return false;
+		} else if (branch === undefined) return false;
 		if (!approvalGitRefAbsent(directory, `refs/tags/${name}`)) return false;
 		if (target !== name && !approvalGitRefAbsent(directory, `refs/tags/${target}`)) return false;
 		return approvalGitOutput(directory, ["check-ref-format", `refs/heads/${target}`]) !== undefined;
 	};
-	if (positional.length === 0 || positional.length === 1 && positional[0] === "HEAD") {
-		if (!directory) return "plain-policy";
-		const branch = approvalGitOutput(directory, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
-		if (!branch) return "plain-policy";
-		if (positional[0] === "HEAD") {
-			if (forced && isFeaturePushRef(branch) && !provesBranchDestination(branch)) return "prompt";
-			return semantic && provesRefspec(branch, branch) ? "safe" : "plain-policy";
-		}
-		const config = approvalGitOutput(directory, [
-			"config", "--get-regexp", "^(push\\.default|remote\\..*\\.push|remote\\.pushdefault|branch\\..*\\.(remote|pushremote|merge))$",
-		]);
-		const entries = new Map<string, string>(config?.split("\n").map(line => {
-			const space = line.indexOf(" ");
-			return space < 0 ? [line, ""] as const : [line.slice(0, space), line.slice(space + 1)] as const;
-		}) ?? []);
-		if ([...entries.keys()].some(key => /^remote\..*\.push$/u.test(key))) return "plain-policy";
-		const pushDefault = entries.get("push.default") ?? "simple";
-		if (!/^(?:simple|current|upstream|tracking)$/u.test(pushDefault)) return "plain-policy";
-		const merge = entries.get(`branch.${branch}.merge`);
-		const upstream = approvalGitOutput(directory, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"], true);
-		if (upstream) {
-			if (!upstream.startsWith("origin/")) return "plain-policy";
-			// A fetch mapping can disguise main as origin/feature/x. The remote
-			// destination comes from push.default/merge, never that local alias.
-			const destination = pushDefault === "current" ? branch : merge?.startsWith("refs/heads/") ? merge.slice(11) : undefined;
-			if (!destination || !isFeaturePushRef(destination) || pushDefault === "simple" && destination !== branch) return "plain-policy";
-			if (forced && !provesBranchDestination(destination)) return "prompt";
-			return semantic && provesRefspec(branch, destination) ? "safe" : "plain-policy";
-		}
-		if (pushDefault !== "simple" && pushDefault !== "current") return "plain-policy";
-		const configuredRemote = entries.get(`branch.${branch}.pushremote`) ?? entries.get("remote.pushdefault") ??
-			entries.get(`branch.${branch}.remote`) ?? "origin";
-		if (configuredRemote !== "origin" ||
-			(pushDefault === "simple" && merge !== undefined && merge !== `refs/heads/${branch}`)) return "plain-policy";
-		if (approvalGitOutput(directory, ["remote", "get-url", "origin"]) === undefined) return "plain-policy";
-		if (forced && isFeaturePushRef(branch) && !provesBranchDestination(branch)) return "prompt";
-		return semantic && provesRefspec(branch, branch) ? "safe" : "plain-policy";
+	if (positional.length === 0) {
+		if (!currentBranch) return "prompt";
+		const branchRemote = config.get(`branch.${currentBranch}.remote`);
+		const effectiveRemote = remote ?? config.get(`branch.${currentBranch}.pushremote`) ??
+			config.get("remote.pushdefault") ?? branchRemote ?? "origin";
+		if (effectiveRemote !== "origin") return "prompt";
+		const pushDefault = config.get("push.default") ?? "simple";
+		const merge = config.get(`branch.${currentBranch}.merge`);
+		let destination = currentBranch;
+		if (pushDefault === "upstream") {
+			if (branchRemote !== "origin" || !merge?.startsWith("refs/heads/")) return "prompt";
+			destination = merge;
+		} else if (pushDefault === "simple" && (branchRemote ?? "origin") === "origin" &&
+			merge !== undefined && merge !== `refs/heads/${currentBranch}`) return "prompt";
+		// Only Git's configured upstream is authoritative for implicit force.
+		// An origin tracking ref can be stale or can name a remote-only tag.
+		if (forced && !hasOriginUpstream(currentBranch, destination)) return "prompt";
+		return semantic && provesRefspec(currentBranch, destination, currentBranch) ? "safe" : "plain-policy";
 	}
 	let feature = false;
 	for (const refspec of positional) {
@@ -799,13 +803,21 @@ function assessFeaturePush(git: GitApprovalCommand): FeaturePushAssessment {
 		const forceRef = refspec.startsWith("+");
 		if (forceRef) semantic = false;
 		const parts = (forceRef ? refspec.slice(1) : refspec).split(":");
-		if (parts.length > 2) return forced || forceRef ? "prompt" : "plain-policy";
+		if (parts.length > 2) return "prompt";
 		if (parts.some(part => part.startsWith("refs/tags/"))) return "prompt";
-		const destination = parts[1] ?? parts[0]!;
+		const source = parts[0]!;
+		const branch = sourceBranch(source);
+		if (!safeSourceBranch(branch)) return "prompt";
+		const implicit = parts.length === 1;
+		const destination = parts[1] ?? (source === "HEAD" ? currentBranch : source);
+		if (!destination || destination === "HEAD") return "prompt";
+		// Explicit unqualified colon destinations do not consult branch.merge:
+		// even a matching upstream name must not disguise a remote-only tag.
+		if ((forced || forceRef) && !destination.startsWith("refs/heads/") &&
+			(!implicit || !hasOriginUpstream(branch, destination))) return "prompt";
 		if (!isFeaturePushRef(destination)) { semantic = false; continue; }
 		feature = true;
-		if ((forced || forceRef) && !provesBranchDestination(destination)) return "prompt";
-		if (semantic && !provesRefspec(parts[0]!, destination)) return "prompt";
+		if (semantic && !provesRefspec(source, destination, branch)) return "prompt";
 	}
 	return feature && semantic ? "safe" : "plain-policy";
 }
@@ -958,15 +970,8 @@ function restrictionMatches(text: string, restriction: LegacyBashRestriction, re
 
 function normalizedReadOnlyGit(argv: readonly string[]): GitApprovalCommand | undefined {
 	const git = normalizeGitApprovalArgv(argv, [], { directory: undefined, sawSymlink: false, uncertain: false });
-	if (!git || git.unknown || git.configOverride || git.repositoryOverride ||
-		!/^(?:log|show|status|diff|rev-parse|rev-list|ls-files|ls-tree|cat-file|for-each-ref|grep)$/u.test(git.argv[1] ?? "")) return undefined;
-	if (git.argv[1] === "grep") {
-		for (const arg of git.argv.slice(2)) {
-			if (arg === "--") break;
-			if (/^--open-files-in-pager(?:=|$)|^-[^-]*O/u.test(arg)) return undefined;
-		}
-	}
-	return git;
+	return git && !git.unknown && !git.configOverride && !git.repositoryOverride && isReadOnlyGitApprovalArgv(git.argv)
+		? git : undefined;
 }
 
 /**
@@ -982,11 +987,11 @@ function isInertBashRestrictionData(segment: ApprovalShellSegment, restriction: 
 	const executable = path.basename(argv[index]!);
 	if (BASH_APPROVAL_CODE_INTERPRETERS.test(executable) ||
 		Object.hasOwn(BASH_APPROVAL_COMMAND_WRAPPERS, executable)) return false;
-	if (argv.some(arg => /^(?:--pre|--pre-glob|--hostname-bin|--jq|--template)(?:=|$)/u.test(arg))) return false;
 	if (executable === "git") {
 		const git = normalizedReadOnlyGit(argv);
 		return !!git && !restrictionMatches(git.argv.join(" "), restriction);
 	}
+	if (argv.some(arg => /^(?:--pre|--pre-glob|--hostname-bin|--jq|--template)(?:=|$)/u.test(arg))) return false;
 	const dataCommand = /^(?:echo|printf|cat|tee|grep|rg)$/u.test(executable) ||
 		(executable === "perms" && argv[1] === "check") ||
 		(executable === "gh" && argv[1] === "pr" && /^(?:create|edit|view)$/u.test(argv[2] ?? ""));
