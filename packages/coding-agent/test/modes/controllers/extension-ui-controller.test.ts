@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, spyOn, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Type } from "@oh-my-pi/omptype/typebox";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { bubbleEvent } from "@oh-my-pi/pi-tui/dispatch";
@@ -46,7 +47,12 @@ function makeHarness(approvalTimeout?: number) {
 			isStreaming: true,
 			setUsageFallbackConfirmer: vi.fn(),
 			prompt: vi.fn(async (text: string, options?: PromptOptions) => {
-				const message = { role: "user" as const, content: text, timestamp: Date.now() };
+				const message = {
+					role: "user" as const,
+					content: text,
+					timestamp: Date.now(),
+					attribution: options?.attribution ?? ("user" as const),
+				};
 				agent.steer(message);
 				options?.onPromptQueued?.([message]);
 				return true;
@@ -927,6 +933,115 @@ describe("ExtensionUiController tool approval", () => {
 			});
 		} finally {
 			controller.cancelToolApprovals();
+			vi.useRealTimers();
+			unsubscribe();
+			await session.dispose();
+			auth.close();
+		}
+	});
+
+	it.each(["message", "approval answer"])("a genuine human %s restores the automatic recovery budget", async kind => {
+		const harness = makeHarness(0.01);
+		vi.useFakeTimers();
+		const first = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(10);
+		await first;
+		harness.deliverSteering();
+		if (kind === "message") {
+			harness.queueSteer("I am here; continue");
+			harness.deliverSteering();
+		} else {
+			const answered = harness.controller.showCollabAwareApproval(prompt);
+			harness.term.press("escape");
+			expect(await answered).toBe("deny");
+		}
+		const next = harness.controller.showCollabAwareApproval(prompt).catch(error => error);
+		vi.advanceTimersByTime(10);
+		expect((await next).message).toContain("Tool approval timed out");
+		expect(harness.ctx.session.prompt).toHaveBeenCalledTimes(2);
+		harness.controller.disposeApprovalRecovery();
+	});
+
+	it.each(["idle", "active"])("bounds the %s timeout recovery chain to one automatic message", async origin => {
+		const auth = createInMemoryAuthStorage();
+		auth.keys.setRuntime("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({
+			handler: { content: [{ type: "toolCall", name: "needs_approval", arguments: {} }] },
+		});
+		let requests = 0;
+		let controller: ExtensionUiController;
+		const tool = {
+			name: "needs_approval",
+			label: "Needs Approval",
+			description: "A recovery action that also requires approval",
+			parameters: Type.Object({}),
+			execute: async () => {
+				requests++;
+				await controller.showCollabAwareApproval(prompt);
+				return { content: [{ type: "text" as const, text: "approved" }] };
+			},
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [tool] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "tools.approvalTimeout": 0.01 });
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(auth, "/nonexistent-approval-recovery-models.yml"),
+			toolRegistry: new Map([[tool.name, tool]]),
+		});
+		const ctx = createInteractiveModeContext({ settings, session, sessionManager: session.sessionManager });
+		attachTerminal(ctx);
+		controller = new ExtensionUiController(ctx);
+		const ended = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_end") ended.resolve();
+		});
+		try {
+			vi.useFakeTimers();
+			const initial =
+				origin === "idle"
+					? controller.showCollabAwareApproval(prompt).catch(error => error)
+					: session.prompt("Human starts a tool turn").catch(error => error);
+			if (origin === "active") {
+				for (let i = 0; i < 1_000 && requests < 1; i++) {
+					vi.advanceTimersByTime(1);
+					await flushMicrotasks();
+				}
+				expect(requests).toBe(1);
+			}
+			vi.advanceTimersByTime(10);
+			if (origin === "idle") await initial;
+			const expectedRequests = origin === "idle" ? 1 : 2;
+			for (let i = 0; i < 1_000 && requests < expectedRequests; i++) {
+				vi.advanceTimersByTime(1);
+				await flushMicrotasks();
+			}
+			expect(requests).toBe(expectedRequests);
+			vi.advanceTimersByTime(10);
+			vi.useRealTimers();
+			await ended.promise;
+			await initial;
+			await agent.waitForIdle();
+			expect(session.isStreaming).toBe(false);
+			expect(ctx.shell.dock.slot("approval").occupied()).toBe(false);
+			expect(mock.calls).toHaveLength(origin === "idle" ? 1 : 2);
+			expect(
+				session.messages.filter(message => message.role === "user" && message.attribution === "agent"),
+			).toHaveLength(1);
+			expect(session.messages.filter(message => message.role === "toolResult").at(-1)).toMatchObject({
+				isError: true,
+				content: [{ type: "text", text: expect.stringContaining("Tool approval timed out") }],
+			});
+			expect(ctx.showStatus).toHaveBeenCalledWith("Approval timed out again; idle until a human responds.");
+		} finally {
+			controller.cancelToolApprovals();
+			controller.disposeApprovalRecovery();
 			vi.useRealTimers();
 			unsubscribe();
 			await session.dispose();

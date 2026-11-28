@@ -6850,6 +6850,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// installs a fresh one.
 		this.#dialogLifetime.abort();
 		this.#extensionUiController.cancelToolApprovals();
+		this.#extensionUiController.disposeApprovalRecovery();
 		this.#streamPublisher?.dispose();
 		this.#streamPublisher = undefined;
 		void this.#recorder?.stop();

@@ -21,6 +21,7 @@
 
 - Opt-in bash compound approval now evaluates lists, pipelines, subshells, and simple loops per command, while keeping heredoc bodies attached to their command and sensitive argument expansions conservative.
 - Interactive tool approvals can now use `tools.approvalTimeout` to deny unanswered calls and steer the agent to ask Inbox instead of waiting indefinitely (fm-ftb4t).
+- Approval timeout recovery now sends at most one automatic message per session until human input; a repeated timeout denies the call and leaves the session idle instead of looping on an approval needed for recovery (fm-ftb4t).
 - Resuming or rewinding a session with an aborted task result no longer throws while the transcript renders; the card shows the cancellation text ([#20533](https://github.com/can1357/oh-my-pi/pull/20533) by [@g0spel](https://github.com/g0spel))
 - Save in Plan Review now accepts a custom path and shows where the plan was saved without requiring you to dismiss the review ([#20539](https://github.com/can1357/oh-my-pi/issues/20539)).
 - The focused diff in Tern's native `/git` preview now scrolls with the arrow keys, Page Up/Page Down, and Home/End ([#20537](https://github.com/can1357/oh-my-pi/issues/20537)).

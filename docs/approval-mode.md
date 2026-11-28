@@ -161,6 +161,8 @@ When an approval remains unanswered past its deadline, OMP directly denies every
 
 > Not approved in time. Do not work around it. Send Inbox a durable ask with the exact command and why, then continue other work.
 
+Automatic recovery is limited to one message per session until a genuine human message or a human approval answer resets it. Recovery messages carry agent attribution, so consuming the automatic message never replenishes that budget. If another approval times out first, OMP denies it without another steer or follow-up, stops the active turn after its native tool results settle, and displays/logs: `Approval timed out again; idle until a human responds.` Switching conversations does not replenish a session's recovery budget.
+
 The timeout closes all pending approvals, including requests queued behind another dialog, even if message delivery fails. During a tool turn, the queued steering also denies later requests in the same batch. Each affected call reports an explicit approval timeout with its prompt and the policy or reason that required approval. Answering before the deadline behaves normally. Answering, aborting, switching sessions, and shutting down clear the timers. This setting applies to the interactive terminal/Tern approval controller (including idle extension prompts and collab answers); headless, RPC, ACP, and subagent approval behavior is unchanged.
 
 This deadline belongs only to the tool-approval component, including plain **Approve**, session approvals, **Approve Once** with remembered grants, and expanded details. It never applies to the `ask` tool, AskDialog, forms, selectors, input dialogs, or other user-question UI.
