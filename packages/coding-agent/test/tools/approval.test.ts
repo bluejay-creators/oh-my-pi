@@ -56,6 +56,37 @@ function bashApproval(command: string, settingsOverrides: Record<string, unknown
 	return approval({ command });
 }
 
+function withPushFixture(run: (cwd: string) => void): void {
+	const cwd = fs.realpathSync(fs.mkdtempSync("/tmp/omp-push-approval-"));
+	const git = (args: string[], stdin?: string): string => {
+		const result = Bun.spawnSync(["git", ...args], {
+			cwd,
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "Approval fixture", GIT_AUTHOR_EMAIL: "approval@example.invalid",
+				GIT_COMMITTER_NAME: "Approval fixture", GIT_COMMITTER_EMAIL: "approval@example.invalid",
+			},
+			stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
+			stdout: "pipe", stderr: "pipe",
+		});
+		if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		return result.stdout.toString().trim();
+	};
+	try {
+		git(["init", "-q", "-b", "main"]);
+		const tree = git(["hash-object", "-t", "tree", "-w", "--stdin"], "");
+		const commit = git(["commit-tree", tree], "approval fixture\n");
+		for (const ref of [
+			"refs/heads/main", "refs/heads/feature/topic", "refs/heads/collision",
+			"refs/tags/v1.2.3", "refs/tags/collision",
+		]) git(["update-ref", ref, commit]);
+		git(["remote", "add", "origin", "https://example.invalid/approval"]);
+		run(cwd);
+	} finally {
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+}
+
 describe("resolveApproval tier matrix", () => {
 	const cases: Array<[ApprovalMode, "read" | "write" | "exec", "allow" | "prompt"]> = [
 		["always-ask", "read", "allow"],
@@ -442,6 +473,88 @@ describe("argv-aware bash approval regressions", () => {
 		}), { command, cwd }, "yolo").policy;
 	}
 
+	for (const mode of ["yolo", "write"] as const) {
+		it(`does not grant a literal checkout allow to unknown argv in ${mode}`, () => {
+			const bash = createBashTool({
+				"bash.patterns": [{ match: "git checkout *", approval: "allow" }],
+			});
+			expect(bashApproval('git checkout "$option" main', {
+				"bash.patterns": [{ match: "git checkout *", approval: "allow" }],
+			})).toBe("exec");
+			const result = resolveApproval(bash, { command: 'git checkout "$option" main' }, mode);
+			expect(result).toMatchObject({ policy: mode === "write" ? "prompt" : "allow", tier: "exec" });
+			expect(result.reason ?? "").not.toContain("Allowed by bash pattern");
+		});
+
+		it(`preserves critical scratch removal prompts over ordinary rm allows in ${mode}`, () => {
+			for (const rules of [[], [{ match: "rm *", approval: "allow" }]]) {
+				const bash = createBashTool({ "bash.patterns": rules });
+				expect(resolveApproval(bash, { command: "rm -rf /tmp/skills-review" }, mode).policy).toBe("prompt");
+			}
+		});
+
+		it(`resolves feature push sources as local branches rather than tags in ${mode}`, () => {
+			withPushFixture(cwd => {
+				const bash = createBashTool({
+					"bash.patterns": [
+						{ match: "git push *", approval: "prompt" },
+						{ match: "git *", approval: "allow" },
+					],
+				});
+				for (const source of [
+					"v1.2.3", "collision", "missing", "refs/tags/v1.2.3",
+					"refs/tags/v1.2.3:refs/heads/feature/topic",
+					"feature/topic:refs/tags/new-tag",
+				]) {
+					const command = `git --no-pager push origin ${source}`;
+					expect(resolveApproval(bash, { command, cwd }, mode).policy, command).toBe("prompt");
+				}
+				for (const flag of ["--tags", "--follow-tags", "--mirror", "--all"]) {
+					const command = `git --no-pager push ${flag} origin feature/topic`;
+					expect(resolveApproval(bash, { command, cwd }, mode).policy, command).toBe("prompt");
+				}
+				for (const source of ["feature/topic", "refs/heads/feature/topic", "HEAD:feature/topic"]) {
+					const command = `git --no-pager push origin ${source}`;
+					expect(resolveApproval(bash, { command, cwd }, mode).policy, command).toBe("allow");
+				}
+				const declaredFeature = createBashTool({
+					"bash.patterns": [
+						{ match: "git push origin feature/*", approval: "allow" },
+						{ match: "git *", approval: "allow" },
+					],
+				});
+				const missing = `git --no-pager -C ${path.join(cwd, "missing-repository")} push origin feature/topic`;
+				expect(resolveApproval(declaredFeature, { command: missing, cwd }, mode).policy).toBe("prompt");
+			});
+		});
+
+		it(`does not borrow heredoc data to launder an unknown execution carrier in ${mode}`, () => {
+			const bash = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [
+					{ match: "sudo *", approval: "prompt" },
+					{ match: "cat *", approval: "allow" },
+					{ match: "xargs *", approval: "allow" },
+				],
+			});
+			const command = "{ cat <<'EOF'\nxargs unknown-runner '(sudo true)'\nsudo true\nEOF\nxargs unknown-runner '(sudo true)'; }";
+			expect(resolveApproval(bash, { command }, mode).policy).toBe("prompt");
+		});
+
+		it(`preserves source sudo restrictions when a heredoc script is later executed in ${mode}`, () => {
+			const bash = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [
+					{ match: "sudo *", approval: "prompt" },
+					{ match: "cat *", approval: "allow" },
+					{ match: "bash *", approval: "allow" },
+				],
+			});
+			const command = "{ cat > /tmp/approval-script.sh <<'EOF'\nsudo true\nEOF\nbash /tmp/approval-script.sh; }";
+			expect(resolveApproval(bash, { command }, mode).policy).toBe("prompt");
+		});
+	}
+
 	it("uses plain prompt rules for config reads outside the simple target boundary", () => {
 		expect(policy("cd /tmp && ls; git status --short | head -5; git config core.sparseCheckout")).toBe("prompt");
 		for (const command of [
@@ -472,9 +585,12 @@ describe("argv-aware bash approval regressions", () => {
 				{ match: "git config *", approval: "prompt" },
 			],
 		});
-		expect(resolveApproval(tool, {
-			command: "git push -u origin HEAD:1353/grant-requests && gh pr create --repo example/project --body \"$(printf '%s' 'git config key value')\"",
-		}, "yolo").policy).toBe("allow");
+		withPushFixture(cwd => {
+			expect(resolveApproval(tool, {
+				command: "git push -u origin HEAD:1353/grant-requests && gh pr create --repo example/project --body \"$(printf '%s' 'git config key value')\"",
+				cwd,
+			}, "yolo").policy).toBe("allow");
+		});
 		expect(resolveApproval(tool, { command: "perms check 'git config core.sparseCheckout'" }, "yolo").policy).toBe("allow");
 	});
 
@@ -667,10 +783,13 @@ describe("argv-aware bash approval regressions", () => {
 			'b=feature/topic; for item in one two; do git push origin "$b"; b=main; done',
 			'for item in feature/topic; do git push origin "$item"; done',
 		]) expect(resolveApproval(bash, { command }, "yolo").policy, command).toBe("prompt");
-		expect(resolveApproval(bash, { command: "git push origin feature/topic" }, "yolo").policy).toBe("allow");
-		expect(resolveApproval(bash, {
-			command: 'git push -u origin HEAD:feature/topic && gh pr create --body "$(printf safe)"',
-		}, "yolo").policy).toBe("allow");
+		withPushFixture(cwd => {
+			expect(resolveApproval(bash, { command: "git push origin feature/topic", cwd }, "yolo").policy).toBe("allow");
+			expect(resolveApproval(bash, {
+				command: 'git push -u origin HEAD:feature/topic && gh pr create --body "$(printf safe)"',
+				cwd,
+			}, "yolo").policy).toBe("allow");
+		});
 		expect(policy("git config user.name; git config user.name")).toBe("prompt");
 	});
 
@@ -2025,15 +2144,19 @@ describe("tool-owned dynamic approval declarations", () => {
 			"echo before |& tail -3",
 			"echo before & echo after",
 			"echo before\necho after",
-			'cmp "$BEFORE" after; echo done',
 			"(echo before; echo after) && echo done",
 			"for b in one two; do echo done; done",
 			"while false; do echo done; done",
 			"until true; do echo done; done",
-			'git push -q origin mac/a mac/b mac/c 2>&1 | tail -3; for b in mac/a mac/b mac/c; do echo "$b"; done',
 		]) {
 			expect(bashApproval(command, settingsOverrides)).toEqual({ tier: "write", policy: "allow" });
 		}
+		// Expanded arguments are not literal allow candidates, even when a loop
+		// propagates known values. Main's full-verdict ruling supersedes that allowance.
+		for (const command of [
+			'cmp "$BEFORE" after; echo done',
+			'git push -q origin mac/a mac/b mac/c 2>&1 | tail -3; for b in mac/a mac/b mac/c; do echo "$b"; done',
+		]) expect(bashApproval(command, settingsOverrides)).toMatchObject({ policy: "prompt" });
 	});
 
 	it("combines segment-aware prompts and denies without borrowing an allow from an adjacent command", () => {
@@ -2058,14 +2181,18 @@ describe("tool-owned dynamic approval declarations", () => {
 			"for b in one two; do curl https://example.com; rm scratch; done",
 		]) expect(bashApproval(command, settingsOverrides)).toMatchObject({ policy: "deny" });
 		// Quotes in the next stage are not arguments to git push.
-		expect(bashApproval('git push origin feature | echo "remote:"', {
-			"bash.allowCompoundCommands": true,
-			"bash.patterns": [
-				{ match: 'git push*"*', approval: "prompt" },
-				{ match: "git push *", approval: "allow" },
-				{ match: "echo *", approval: "allow" },
-			],
-		})).toMatchObject({ policy: "allow" });
+		withPushFixture(cwd => {
+			const bash = createBashTool({
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [
+					{ match: 'git push*"*', approval: "prompt" },
+					{ match: "git push *", approval: "allow" },
+					{ match: "echo *", approval: "allow" },
+				],
+			});
+			expect(resolveApproval(bash, { command: 'git push origin feature/topic | echo "remote:"', cwd }, "write"))
+				.toMatchObject({ policy: "allow" });
+		});
 	});
 
 	it("keeps segment-aware heredoc interpreter bodies under the complete command restriction", () => {

@@ -425,12 +425,13 @@ describe("segment-aware shell approval extraction", () => {
 		]);
 	});
 
-	it("keeps lease pushes to each literal feature branch independently approvable", () => {
+	it("retains literal-list argv values without granting expanded arguments literal eligibility", () => {
 		const segments = extractApprovalShellSegments('for b in feature/one feature/two; do git push --force-with-lease origin "$b"; done');
-		expect(segments?.map(segment => segment.literal?.argv)).toEqual([
+		expect(segments?.map(segment => segment.argv)).toEqual([
 			["git", "push", "--force-with-lease", "origin", "feature/one"],
 			["git", "push", "--force-with-lease", "origin", "feature/two"],
 		]);
+		expect(segments?.map(segment => segment.literal)).toEqual([null, null]);
 	});
 
 	it("expands a literal directory assignment without resolving ambient directory variables", () => {

@@ -596,6 +596,7 @@ function segmentMutatesShellState(segmentText: string, literal: LiteralShellComm
 interface ApprovalWord {
 	value: string;
 	unknown: boolean;
+	expanded?: boolean;
 	splits?: boolean;
 }
 
@@ -692,14 +693,16 @@ function parseApprovalWords(text: string, variables: ReadonlyMap<string, string>
 	let unknown = false;
 	let redirectTarget = false;
 	let splits = false;
+	let expanded = false;
 	let quote: "'" | '"' | undefined;
 	const push = () => {
-		if (started && !redirectTarget) words.push({ value, unknown, ...(splits ? { splits: true } : {}) });
+		if (started && !redirectTarget) words.push({ value, unknown, ...(splits ? { splits: true } : {}), ...(expanded ? { expanded: true } : {}) });
 		if (started) redirectTarget = false;
 		value = "";
 		started = false;
 		unknown = false;
 		splits = false;
+		expanded = false;
 	};
 	for (let i = 0; i < text.length; i++) {
 		const ch = text[i]!;
@@ -743,6 +746,7 @@ function parseApprovalWords(text: string, variables: ReadonlyMap<string, string>
 		}
 		started = true;
 		if (text.startsWith("$((", i) || (text.startsWith("${", i) && !/^\$\{[A-Za-z_][A-Za-z0-9_]*\}/u.test(text.slice(i)))) {
+			expanded = true;
 			const expansion = readApprovalUnknownExpansion(text, i);
 			if (!expansion) return null;
 			value += text.slice(i, expansion.end);
@@ -752,6 +756,7 @@ function parseApprovalWords(text: string, variables: ReadonlyMap<string, string>
 			continue;
 		}
 		if (ch === "`" || (ch === "$" && text[i + 1] === "(")) {
+			expanded = true;
 			const substitution = readApprovalSubstitution(text, i);
 			if (!substitution) return null;
 			value += text.slice(i, substitution.end);
@@ -761,6 +766,7 @@ function parseApprovalWords(text: string, variables: ReadonlyMap<string, string>
 			continue;
 		}
 		if (ch === "$") {
+			expanded = true;
 			const variable = /^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})/u.exec(text.slice(i));
 			if (variable) {
 				const resolved = variables.get(variable[1] ?? variable[2]!);
@@ -803,11 +809,12 @@ const APPROVAL_EXPANSION_SENSITIVE_COMMANDS: Record<string, true> = {
 function parseApprovalShellSegment(
 	text: string,
 	variables: ReadonlyMap<string, string>,
-): { argv: string[]; unknownArgv: number[]; literal: LiteralShellCommandSegment | null; stateful: boolean; changesCwd: boolean; unsafeExpansion: boolean } | null {
+): { argv: string[]; unknownArgv: number[]; literal: LiteralShellCommandSegment | null; stateful: boolean; changesCwd: boolean; unsafeExpansion: boolean; resolvedExpansion: boolean } | null {
 	const words = parseApprovalWords(text, variables);
 	if (!words?.length) return null;
 	const argv = words.map(word => word.value);
 	const unknownArgv = words.flatMap((word, index) => word.unknown ? [index] : []);
+	const expanded = words.some(word => word.expanded);
 	let commandIndex = 0;
 	while (commandIndex < argv.length && isShellEnvironmentAssignment(argv[commandIndex]!)) commandIndex++;
 	const executable = argv[commandIndex]?.split("/").pop() ?? "";
@@ -833,7 +840,8 @@ function parseApprovalShellSegment(
 		}
 		return `'${((safePrintf || safeSet) && index === commandIndex ? "echo" : word).replaceAll("'", "'\\''")}'`;
 	}).join(" ");
-	const literal = stateful || expansionSensitive ? null : parseLiteralShellCommandSegment(quoted);
+	const literal = stateful || expansionSensitive || unknownArgv.length > 0 || expanded
+		? null : parseLiteralShellCommandSegment(quoted);
 	if (literal) {
 		literal.text = text;
 		literal.argv = argv;
@@ -841,8 +849,16 @@ function parseApprovalShellSegment(
 	}
 	return {
 		argv, unknownArgv, literal, stateful, changesCwd,
+		resolvedExpansion: expanded && unknownArgv.length === 0,
 		unsafeExpansion: expansionSensitive || words.some(word => word.splits),
 	};
+}
+
+/** Exact body bytes owned by a syntactically quoted heredoc, not inferred from its contents. */
+export interface QuotedHeredocBody {
+	readonly source: string;
+	readonly start: number;
+	readonly end: number;
 }
 
 /** An approval unit; opaque units retain their complete source, including heredoc bodies. */
@@ -866,6 +882,10 @@ export interface ApprovalShellSegment {
 	cwdUnknown?: boolean;
 	/** Invalidate the enclosing cwd after an uncertain final-pipeline or loop cwd change. */
 	cwdUnknownAfter?: boolean;
+	/** A resolved value is still an expansion, never a literal allow candidate. */
+	resolvedExpansion?: boolean;
+	/** Offsets are relative to `source`; nested parser inputs are never silently rebased. */
+	quotedHeredocs?: readonly QuotedHeredocBody[];
 }
 
 /** Shell interpreters read stdin as source unless -c or a script operand selects another source. */
@@ -1108,7 +1128,8 @@ function extractApprovalShellSegmentsInScope(
 	const pieces: string[] = [];
 	const heredocs = new Set<number>();
 	const heredocSources = new Map<number, string[]>();
-	const pending: { delimiter: string; stripTabs: boolean; owner: number; stdin: boolean }[] = [];
+	const pending: { delimiter: string; stripTabs: boolean; owner: number; stdin: boolean; quoted: boolean }[] = [];
+	let quotedHeredocs: Map<number, QuotedHeredocBody[]> | undefined;
 	const substitutions = new Map<number, string[]>();
 	let start = 0;
 	let quote: "'" | '"' | undefined;
@@ -1167,6 +1188,7 @@ function extractApprovalShellSegmentsInScope(
 				stripTabs: !!match[1],
 				owner: pieces.length,
 				stdin: descriptor === undefined || descriptor === "0",
+				quoted: match[2] !== undefined || match[3] !== undefined || /^<<-?[ \t]*\\/u.test(match[0]),
 			});
 			i += match[0].length - 1;
 			continue;
@@ -1210,6 +1232,12 @@ function extractApprovalShellSegmentsInScope(
 						}
 					}
 					if (!found || !pieces[doc.owner]) return null;
+					if (doc.quoted) {
+						quotedHeredocs ??= new Map();
+						const bodies = quotedHeredocs.get(doc.owner) ?? [];
+						bodies.push({ source: command, start: bodyStart, end: bodyEnd });
+						quotedHeredocs.set(doc.owner, bodies);
+					}
 					if (doc.stdin) {
 						const body = command.slice(bodyStart, bodyEnd);
 						// Only the last stdin heredoc supplies interpreter source.
@@ -1481,6 +1509,8 @@ function extractApprovalShellSegmentsInScope(
 					literal: unsafe ? null : parsed?.literal ?? null,
 					...(parsed ? { argv: parsed.argv } : {}),
 					...(parsed?.unknownArgv.length ? { unknownArgv: parsed.unknownArgv } : {}),
+					...(parsed?.resolvedExpansion ? { resolvedExpansion: true } : {}),
+					...(quotedHeredocs?.has(index) ? { quotedHeredocs: quotedHeredocs.get(index) } : {}),
 					...(unsafe || parsed?.stateful || parsed?.changesCwd ? { allowUnsafe: true } : {}),
 					...(shellStateUnknown || parsed?.stateful ? { shellStateUnknown: true } : {}),
 				});
