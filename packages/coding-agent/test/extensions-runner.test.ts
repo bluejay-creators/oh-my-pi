@@ -42,6 +42,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createEvalCustomTools, describeEvalTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ToolApprovalTimeoutError } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -3323,6 +3324,34 @@ describe("ExtensionRunner", () => {
 				{ type: "tool_approval_resolved", approved: false, reason: "dialog aborted" },
 			]);
 			delete globalState.__thrownApprovalEvents;
+		});
+
+		it("reports the timeout and the policy requiring approval without executing the call", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			initializeRunner(runner, async title => {
+				throw new ToolApprovalTimeoutError(title);
+			});
+			const executed = vi.fn(approvalTool.execute);
+			for (const reason of [undefined, "Matched prompt pattern: deploy *"]) {
+				const wrapper = new ExtensionToolWrapper(
+					{
+						...approvalTool,
+						parameters: Type.Object({}),
+						execute: executed,
+						...(reason ? { approval: { tier: "exec" as const, policy: "prompt" as const, reason } } : {}),
+					},
+					runner,
+				);
+				const error = await wrapper
+					.execute("call-timeout", {}, undefined, undefined, {
+						settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+					} as AgentToolContext)
+					.catch(error => error);
+				expect(error).toBeInstanceOf(ToolApprovalTimeoutError);
+				expect(error.message).toContain("Tool approval timed out (tools.approvalTimeout)");
+				expect(error.message).toContain(`Approval required by: ${reason ?? "mode policy (always-ask mode)"}`);
+			}
+			expect(executed).not.toHaveBeenCalled();
 		});
 		it("closes the open approval prompt and rejects when the tool call is aborted", async () => {
 			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
